@@ -1,0 +1,787 @@
+//! 基于 `vello_cpu` 的栅格化后端。
+//!
+//! 将 [`Scene`] 渲染为 `vello_cpu::Pixmap`，可进一步导出 PNG。
+//! 文本优先使用调用者提供的 [`text::TextLayout`]；若未提供则现场用 [`text::measure_text`] 排版。
+//!
+//! 说明：
+//! - 填充统一走 [`paint_path`](VelloPixmapRenderer::paint_path)，支持 `Solid` / 线性渐变 /
+//!   径向渐变；描边支持虚线（`dash_pattern`）与 `miter_limit`。
+//! - 变换用独立栈维护（`push_transform` 与父变换复合，`pop_transform` 恢复），支持嵌套 Group。
+//! - 节点透明度通过把当前 `opacity` 乘入颜色 alpha 实现。
+
+use kurbo::{BezPath, Circle, Point as VPoint, Rect as VRect, Shape, Stroke as KurboStroke};
+use vello_cpu::peniko::color::AlphaColor;
+use vello_cpu::{Pixmap, RenderContext, Resources};
+
+use crate::geometry::{Color, Point, Rect, Transform};
+use crate::render::Renderer;
+use crate::scene::{
+    Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene, Stroke,
+};
+use crate::text::TextStyle;
+
+/// vello_cpu 栅格化渲染器。
+#[derive(Debug)]
+pub struct VelloPixmapRenderer {
+    ctx: RenderContext,
+    resources: Resources,
+    width: u32,
+    height: u32,
+    background: Option<Color>,
+    /// 变换栈：栈顶为当前生效的复合变换。
+    transform_stack: Vec<vello_cpu::kurbo::Affine>,
+    /// 透明度栈：栈顶为当前生效的复合透明度（各层相乘）。
+    opacity_stack: Vec<f64>,
+}
+
+impl VelloPixmapRenderer {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            ctx: RenderContext::new(width as u16, height as u16),
+            resources: Resources::new(),
+            width,
+            height,
+            background: None,
+            transform_stack: Vec::new(),
+            opacity_stack: Vec::new(),
+        }
+    }
+
+    pub fn with_background(mut self, color: Color) -> Self {
+        self.background = Some(color);
+        self
+    }
+
+    /// 渲染场景并返回 Pixmap。
+    ///
+    /// 复用同一 `RenderContext` / `Resources`（字形、图集缓存跨帧保留）；
+    /// 每次渲染前 `reset()` 清空上一帧场景，因此同一渲染器可重复渲染多帧。
+    pub fn render_scene_to_pixmap(&mut self, scene: &Scene) -> Pixmap {
+        // 清空上一帧场景与状态（含变换/透明度栈，防止上一帧异常中断后残留）。
+        self.ctx.reset();
+        self.transform_stack.clear();
+        self.opacity_stack.clear();
+
+        if let Some(bg) = self.background {
+            let rect = VRect::new(0.0, 0.0, self.width as f64, self.height as f64);
+            self.ctx.set_paint(self.to_vello(&bg));
+            self.ctx.fill_rect(&rect);
+        }
+        // 委托默认遍历（排序 + Group 递归 + 节点属性 + 局部变换）。
+        self.render_scene(scene);
+
+        let mut pixmap = Pixmap::new(self.width as u16, self.height as u16);
+        self.ctx.render(&mut pixmap, &mut self.resources);
+        pixmap
+    }
+
+    /// 渲染场景并导出 PNG 字节（依赖 `image` 的 PNG 编码，常驻依赖）。
+    pub fn render_png(&mut self, scene: &Scene) -> Vec<u8> {
+        let pixmap = self.render_scene_to_pixmap(scene);
+        pixmap_to_png(&pixmap)
+    }
+
+    /// 当前生效的复合透明度（默认 1.0）。
+    fn current_opacity(&self) -> f64 {
+        self.opacity_stack.last().copied().unwrap_or(1.0)
+    }
+
+    /// 转为 vello 颜色；乘入当前透明度。
+    fn to_vello(&self, color: &Color) -> AlphaColor<vello_cpu::color::Srgb> {
+        let a = (color.a * self.current_opacity()).clamp(0.0, 1.0);
+        AlphaColor::from_rgba8(
+            (color.r.clamp(0.0, 1.0) * 255.0) as u8,
+            (color.g.clamp(0.0, 1.0) * 255.0) as u8,
+            (color.b.clamp(0.0, 1.0) * 255.0) as u8,
+            (a * 255.0) as u8,
+        )
+    }
+
+    fn kurbo_stroke(stroke: &Stroke) -> KurboStroke {
+        let cap = match stroke.line_cap {
+            LineCap::Butt => kurbo::Cap::Butt,
+            LineCap::Round => kurbo::Cap::Round,
+            LineCap::Square => kurbo::Cap::Square,
+        };
+        let join = match stroke.line_join {
+            LineJoin::Miter => kurbo::Join::Miter,
+            LineJoin::Round => kurbo::Join::Round,
+            LineJoin::Bevel => kurbo::Join::Bevel,
+        };
+        let mut k = KurboStroke {
+            width: stroke.width,
+            join,
+            start_cap: cap,
+            end_cap: cap,
+            miter_limit: stroke.miter_limit,
+            ..Default::default()
+        };
+        if !stroke.dash_array.is_empty() {
+            k.dash_pattern = stroke.dash_array.iter().copied().collect();
+            k.dash_offset = stroke.dash_offset;
+        }
+        k
+    }
+
+    /// 构造带当前透明度的 peniko 色标。
+    fn peniko_stops(&self, stops: &[GradientStop]) -> Vec<vello_cpu::peniko::ColorStop> {
+        stops
+            .iter()
+            .map(|s| vello_cpu::peniko::ColorStop {
+                offset: s.offset as f32,
+                color: vello_cpu::peniko::color::DynamicColor::from_alpha_color(
+                    self.to_vello(&s.color),
+                ),
+            })
+            .collect()
+    }
+
+    /// 设置渐变填充（保持用户空间坐标，抵消节点/图层变换）。
+    fn paint_gradient(&mut self, kind: vello_cpu::peniko::GradientKind, stops: &[GradientStop]) {
+        use vello_cpu::peniko::{
+            ColorStops, Extend, Gradient, InterpolationAlphaSpace, color::ColorSpaceTag,
+            color::HueDirection,
+        };
+        let stops_vec = self.peniko_stops(stops);
+        let gradient = Gradient {
+            kind,
+            extend: Extend::Pad,
+            interpolation_cs: ColorSpaceTag::Srgb,
+            hue_direction: HueDirection::default(),
+            interpolation_alpha_space: InterpolationAlphaSpace::Premultiplied,
+            stops: ColorStops::from(stops_vec.as_slice()),
+        };
+        self.set_user_space_paint();
+        self.ctx.set_paint(gradient);
+    }
+
+    /// 当前生效的场景（复合）变换：栈顶，未变换时为单位矩阵。
+    fn current_transform(&self) -> vello_cpu::kurbo::Affine {
+        self.transform_stack
+            .last()
+            .copied()
+            .unwrap_or(vello_cpu::kurbo::Affine::IDENTITY)
+    }
+
+    /// 设置 paint transform，使渐变坐标保持在用户（根）坐标空间，
+    /// 抵消节点/图层已应用的 `set_transform`（与 SVG `gradientUnits="userSpaceOnUse"` 一致）。
+    /// 奇异变换（det=0）下逆无意义，回退单位矩阵（渐变随图形走）。
+    fn set_user_space_paint(&mut self) {
+        use vello_cpu::kurbo::Affine;
+        let scene = self.current_transform();
+        if scene.determinant().abs() > 1e-12 {
+            self.ctx.set_paint_transform(scene.inverse());
+        } else {
+            self.ctx.set_paint_transform(Affine::IDENTITY);
+        }
+    }
+
+    /// 依据 `Fill` 设置当前画笔（Solid / 线性 / 径向渐变）。
+    fn set_fill(&mut self, fill: &Fill) {
+        use vello_cpu::peniko::{GradientKind, LinearGradientPosition, RadialGradientPosition};
+        match fill {
+            Fill::Solid(c) => self.ctx.set_paint(self.to_vello(c)),
+            Fill::LinearGradient(g) => {
+                let kind = GradientKind::Linear(LinearGradientPosition::new(
+                    VPoint::new(g.start.x, g.start.y),
+                    VPoint::new(g.end.x, g.end.y),
+                ));
+                self.paint_gradient(kind, &g.stops);
+            }
+            Fill::RadialGradient(g) => {
+                let kind = GradientKind::Radial(RadialGradientPosition::new(
+                    VPoint::new(g.center.x, g.center.y),
+                    g.radius as f32,
+                ));
+                self.paint_gradient(kind, &g.stops);
+            }
+        }
+    }
+
+    /// 统一绘制：填充（任意类型）+ 可选描边（含虚线）。
+    fn paint_path(&mut self, path: &BezPath, style: &FillStrokeStyle) {
+        if let Some(fill) = &style.fill {
+            self.set_fill(fill);
+            self.ctx.fill_path(path);
+            // 渐变 fill 设置了 user-space paint transform，绘制后复位。
+            self.ctx.reset_paint_transform();
+        }
+        if let Some(s) = &style.stroke {
+            self.ctx.set_paint(self.to_vello(&s.color));
+            self.ctx.set_stroke(Self::kurbo_stroke(s));
+            self.ctx.stroke_path(path);
+        }
+    }
+}
+
+impl Renderer for VelloPixmapRenderer {
+    fn draw_rect(&mut self, rect: Rect, style: &FillStrokeStyle) {
+        // 统一转路径绘制，以支持渐变填充与虚线描边。
+        let mut path = BezPath::new();
+        path.move_to((rect.x, rect.y));
+        path.line_to((rect.x + rect.width, rect.y));
+        path.line_to((rect.x + rect.width, rect.y + rect.height));
+        path.line_to((rect.x, rect.y + rect.height));
+        path.close_path();
+        self.paint_path(&path, style);
+    }
+
+    fn draw_circle(&mut self, center: Point, radius: f64, style: &FillStrokeStyle) {
+        let circle = Circle::new(VPoint::new(center.x, center.y), radius);
+        let path = circle.to_path(0.1);
+        self.paint_path(&path, style);
+    }
+
+    fn draw_line(&mut self, start: Point, end: Point, style: &Stroke) {
+        let mut path = BezPath::new();
+        path.move_to(VPoint::new(start.x, start.y));
+        path.line_to(VPoint::new(end.x, end.y));
+        self.ctx.set_paint(self.to_vello(&style.color));
+        self.ctx.set_stroke(Self::kurbo_stroke(style));
+        self.ctx.stroke_path(&path);
+    }
+
+    fn draw_polyline(&mut self, points: &[Point], style: &Stroke) {
+        if points.len() < 2 {
+            return;
+        }
+        let mut path = BezPath::new();
+        path.move_to(VPoint::new(points[0].x, points[0].y));
+        for p in &points[1..] {
+            path.line_to(VPoint::new(p.x, p.y));
+        }
+        self.ctx.set_paint(self.to_vello(&style.color));
+        self.ctx.set_stroke(Self::kurbo_stroke(style));
+        self.ctx.stroke_path(&path);
+    }
+
+    fn draw_path(&mut self, path: &BezPath, style: &FillStrokeStyle, closed: bool) {
+        let path = if closed {
+            let mut p = path.clone();
+            p.close_path();
+            p
+        } else {
+            path.clone()
+        };
+        self.paint_path(&path, style);
+    }
+
+    fn draw_gradient_path(
+        &mut self,
+        path: &BezPath,
+        gradient: &LinearGradient,
+        stroke: Option<&Stroke>,
+    ) {
+        use vello_cpu::peniko::{GradientKind, LinearGradientPosition};
+        let kind = GradientKind::Linear(LinearGradientPosition::new(
+            VPoint::new(gradient.start.x, gradient.start.y),
+            VPoint::new(gradient.end.x, gradient.end.y),
+        ));
+        self.paint_gradient(kind, &gradient.stops);
+        self.ctx.fill_path(path);
+        // 渐变 fill 设置了 user-space paint transform，绘制后复位。
+        self.ctx.reset_paint_transform();
+
+        if let Some(s) = stroke {
+            self.ctx.set_paint(self.to_vello(&s.color));
+            self.ctx.set_stroke(Self::kurbo_stroke(s));
+            self.ctx.stroke_path(path);
+        }
+    }
+
+    fn draw_text(
+        &mut self,
+        content: &str,
+        position: Point,
+        style: &TextStyle,
+        layout: Option<&crate::text::TextLayout>,
+    ) {
+        use vello_cpu::kurbo::Affine;
+
+        // 优先使用调用者提供的 layout；否则经统一 TLS 上下文现场排版（layout_text）。
+        let layout_arc = match layout {
+            Some(l) => Some(std::sync::Arc::new(l.clone())),
+            None => Some(crate::text::layout_text(content, style, style.max_width)),
+        };
+
+        let Some(layout) = layout_arc.as_ref() else {
+            return;
+        };
+
+        // 局部变换：若节点带 transform，已由 push_transform 处理；这里仅处理文本自身旋转。
+        // 锚点语义（canvas fillText）：把文本块在局部坐标中平移 (dx, dy)，使锚点落在
+        // position。dx 由 align（水平），dy 由 baseline（垂直）决定；旋转绕锚点。
+        let m = crate::text::layout_metrics(layout);
+        let dx = match style.align {
+            crate::text::TextAlign::Left => 0.0,
+            crate::text::TextAlign::Center => -m.width / 2.0,
+            crate::text::TextAlign::Right => -m.width,
+        };
+        let dy = -style.baseline.anchor_offset(&m);
+        let transform = Affine::translate((position.x, position.y))
+            * Affine::rotate(style.rotation)
+            * Affine::translate((dx, dy));
+
+        for line in layout.lines() {
+            for item in line.items() {
+                match item {
+                    parley::layout::PositionedLayoutItem::GlyphRun(glyph_run) => {
+                        let run = glyph_run.run();
+                        let font_data = run.font();
+                        let run_font_size = run.font_size();
+
+                        let glyphs: Vec<vello_cpu::Glyph> = glyph_run
+                            .positioned_glyphs()
+                            .map(|g| vello_cpu::Glyph {
+                                id: g.id,
+                                x: g.x,
+                                y: g.y,
+                            })
+                            .collect();
+                        if glyphs.is_empty() {
+                            continue;
+                        }
+
+                        let brush = glyph_run.style().brush;
+                        self.ctx.set_paint(self.to_vello(&brush));
+                        self.ctx
+                            .glyph_run(&mut self.resources, font_data)
+                            .font_size(run_font_size)
+                            .glyph_transform(transform)
+                            .fill_glyphs(glyphs.into_iter());
+                    }
+                    parley::layout::PositionedLayoutItem::InlineBox(_) => {}
+                }
+            }
+        }
+    }
+
+    fn push_transform(&mut self, t: Transform) {
+        use vello_cpu::kurbo::Affine;
+        let a = Affine::new([t.a, t.b, t.c, t.d, t.e, t.f]);
+        let combined = match self.transform_stack.last() {
+            Some(parent) => *parent * a,
+            None => a,
+        };
+        self.ctx.set_transform(combined);
+        self.transform_stack.push(combined);
+    }
+
+    fn pop_transform(&mut self) {
+        self.transform_stack.pop();
+        match self.transform_stack.last() {
+            Some(t) => self.ctx.set_transform(*t),
+            None => self.ctx.set_transform(vello_cpu::kurbo::Affine::IDENTITY),
+        }
+    }
+
+    fn push_opacity(&mut self, opacity: f64) {
+        let cur = self.current_opacity();
+        self.opacity_stack.push(cur * opacity.clamp(0.0, 1.0));
+    }
+
+    fn pop_opacity(&mut self) {
+        self.opacity_stack.pop();
+    }
+
+    fn push_clip(&mut self, clip: &crate::scene::Clip) {
+        // vello_cpu 的 clip 路径按当前 transform（clip_path_transform）应用；
+        // 我们 push_transform 已设置 ctx transform，故 clip 与节点变换一致复合。
+        let path = clip.to_bezpath();
+        self.ctx.push_clip_path(&path);
+    }
+
+    fn pop_clip(&mut self) {
+        self.ctx.pop_clip_path();
+    }
+}
+
+/// 将 Pixmap 转为 PNG 字节。
+fn pixmap_to_png(pixmap: &Pixmap) -> Vec<u8> {
+    use image::{DynamicImage, RgbaImage};
+    let (w, h) = (pixmap.width() as u32, pixmap.height() as u32);
+    let data: Vec<u8> = pixmap
+        .data()
+        .iter()
+        .flat_map(|p| vec![p.r, p.g, p.b, p.a])
+        .collect();
+    let img = RgbaImage::from_raw(w, h, data).expect("无法由 Pixmap 构造 RgbaImage");
+    let mut buf = std::io::Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(img)
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .expect("PNG 编码失败");
+    buf.into_inner()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::{Color, Point, Rect, Transform};
+    use crate::scene::{Element, FillStrokeStyle, GradientStop, LinearGradient, Scene, SceneNode};
+
+    /// 提取 pixmap 像素为 RGBA u8 数组（用于比较）。
+    fn pixels(pixmap: &Pixmap) -> Vec<u8> {
+        pixmap
+            .data()
+            .iter()
+            .flat_map(|p| vec![p.r, p.g, p.b, p.a])
+            .collect()
+    }
+
+    /// 一个横跨矩形、左右颜色差异明显的线性渐变矩形。
+    /// `rect` 为矩形坐标；`t` 为节点局部变换（None = 无）。
+    fn gradient_rect_scene(rect: Rect, t: Option<Transform>) -> Scene {
+        let grad = LinearGradient {
+            start: Point::new(10.0, 10.0),
+            end: Point::new(90.0, 10.0),
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Color::rgb(0xff, 0x00, 0x00),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: Color::rgb(0x00, 0x00, 0xff),
+                },
+            ],
+        };
+        let style = FillStrokeStyle {
+            fill: Some(grad.into()),
+            stroke: None,
+        };
+        let mut scene = Scene::new(100.0, 100.0);
+        let node = SceneNode::new(Element::rect(rect, style));
+        scene.push_node(match t {
+            Some(t) => node.with_transform(t),
+            None => node,
+        });
+        scene
+    }
+
+    /// Bug 1 回归：渐变坐标为用户（根）空间，不受节点局部 transform 影响。
+    ///
+    /// 场景 A：矩形直接画在 (10,10)，无变换，渐变轴 (10,10)->(90,10)。
+    /// 场景 B：矩形在 (0,0)，节点 transform=translate(10,10)，渐变轴仍 (10,10)->(90,10)。
+    /// 两者在屏幕上完全一致（图形位置、渐变轴都相同）→ 像素应相同。
+    /// 修复前渐变会随 transform 平移，B 的渐变轴变为相对图形偏移，像素不同。
+    #[test]
+    fn gradient_stays_in_user_space_under_node_transform() {
+        let mut ra = VelloPixmapRenderer::new(100, 100);
+        let mut rb = VelloPixmapRenderer::new(100, 100);
+        let scene_a = gradient_rect_scene(Rect::new(10.0, 10.0, 80.0, 80.0), None);
+        let scene_b = gradient_rect_scene(
+            Rect::new(0.0, 0.0, 80.0, 80.0),
+            Some(Transform::translate(10.0, 10.0)),
+        );
+        let a = pixels(&ra.render_scene_to_pixmap(&scene_a));
+        let b = pixels(&rb.render_scene_to_pixmap(&scene_b));
+        assert_eq!(a.len(), b.len());
+        // 允许极少量抗锯齿差异（<0.1% 通道字节）。
+        let diff = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+        assert!(
+            diff < a.len() / 1000,
+            "渐变在节点 transform 下应保持用户空间，但 {} 个通道字节不同",
+            diff
+        );
+    }
+
+    /// Bug 2 回归：同一渲染器可复用渲染多帧，结果一致（reset 清场 + Resources 复用）。
+    #[test]
+    fn renderer_reusable_across_frames() {
+        let mut renderer = VelloPixmapRenderer::new(60, 60).with_background(Color::WHITE);
+        let scene = gradient_rect_scene(Rect::new(5.0, 5.0, 50.0, 50.0), None);
+
+        let p1 = renderer.render_scene_to_pixmap(&scene);
+        let p2 = renderer.render_scene_to_pixmap(&scene);
+
+        let d1 = pixels(&p1);
+        let d2 = pixels(&p2);
+        assert_eq!(d1, d2, "多帧渲染结果应一致");
+        // 非全白背景：渐变矩形应覆盖部分像素。
+        let non_white = d1
+            .chunks_exact(4)
+            .filter(|px| px[0] < 250 || px[1] < 250 || px[2] < 250)
+            .count();
+        assert!(non_white > 0, "渐变矩形未渲染出来");
+    }
+
+    /// 统计 pixmap 中近似等于给定 RGB 的像素数（容差 tol）。
+    fn count_color(pixmap: &Pixmap, rgb: (u8, u8, u8), tol: u8) -> usize {
+        pixmap
+            .data()
+            .iter()
+            .filter(|p| {
+                p.r.abs_diff(rgb.0) <= tol
+                    && p.g.abs_diff(rgb.1) <= tol
+                    && p.b.abs_diff(rgb.2) <= tol
+            })
+            .count()
+    }
+
+    /// 读取 (x, y) 处的像素（RGBA）。越界返回 (0,0,0,0)。
+    fn pixel_at(pixmap: &Pixmap, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let w = pixmap.width() as u32;
+        let h = pixmap.height() as u32;
+        if x >= w || y >= h {
+            return (0, 0, 0, 0);
+        }
+        let p = &pixmap.data()[(y * w + x) as usize];
+        (p.r, p.g, p.b, p.a)
+    }
+
+    /// 覆盖：圆/椭圆/圆角矩形/多边形/圆弧/扇形 在 vello 端都能渲染出对应颜色。
+    #[test]
+    fn primitives_render() {
+        use crate::geometry::Vec2;
+        let mut scene = Scene::new(150.0, 100.0);
+        scene.push(Element::circle(
+            Point::new(20.0, 20.0),
+            10.0,
+            FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+        ));
+        scene.push(Element::ellipse(
+            Point::new(50.0, 20.0),
+            Vec2::new(15.0, 8.0),
+            0.0,
+            FillStrokeStyle::fill(Color::rgb(0x00, 0xff, 0x00)),
+        ));
+        scene.push(Element::rounded_rect(
+            Rect::new(75.0, 10.0, 30.0, 20.0),
+            5.0,
+            FillStrokeStyle::fill(Color::rgb(0x00, 0x00, 0xff)),
+        ));
+        scene.push(Element::polygon(
+            vec![
+                Point::new(5.0, 60.0),
+                Point::new(30.0, 60.0),
+                Point::new(17.0, 85.0),
+            ],
+            FillStrokeStyle::fill(Color::rgb(0xff, 0xff, 0x00)),
+        ));
+        scene.push(Element::arc(
+            Point::new(70.0, 70.0),
+            Vec2::new(20.0, 20.0),
+            0.0,
+            std::f64::consts::PI,
+            Stroke::new(Color::rgb(0x00, 0xff, 0xff), 3.0),
+        ));
+        scene.push(Element::pie(
+            Point::new(110.0, 60.0),
+            20.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+            FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0xff)),
+        ));
+        let mut r = VelloPixmapRenderer::new(150, 100);
+        let pix = r.render_scene_to_pixmap(&scene);
+        // 每种填充色都应出现。
+        assert!(count_color(&pix, (0xff, 0x00, 0x00), 20) > 0, "圆未渲染");
+        assert!(count_color(&pix, (0x00, 0xff, 0x00), 20) > 0, "椭圆未渲染");
+        assert!(
+            count_color(&pix, (0x00, 0x00, 0xff), 20) > 0,
+            "圆角矩形未渲染"
+        );
+        assert!(
+            count_color(&pix, (0xff, 0xff, 0x00), 20) > 0,
+            "多边形未渲染"
+        );
+        assert!(count_color(&pix, (0x00, 0xff, 0xff), 20) > 0, "圆弧未渲染");
+        assert!(count_color(&pix, (0xff, 0x00, 0xff), 20) > 0, "扇形未渲染");
+    }
+
+    /// 虚线描边：实线与虚线在同一路径上，虚线段数量少于实线（分段断裂）。
+    #[test]
+    fn dashed_stroke_renders() {
+        let mut scene_solid = Scene::new(100.0, 20.0);
+        scene_solid.push(Element::line(
+            Point::new(5.0, 10.0),
+            Point::new(95.0, 10.0),
+            Stroke::new(Color::BLACK, 4.0),
+        ));
+        let mut scene_dashed = Scene::new(100.0, 20.0);
+        scene_dashed.push(Element::line(
+            Point::new(5.0, 10.0),
+            Point::new(95.0, 10.0),
+            Stroke::dashed(Color::BLACK, 4.0, vec![8.0, 8.0]),
+        ));
+        let mut rs = VelloPixmapRenderer::new(100, 20).with_background(Color::WHITE);
+        let mut rd = VelloPixmapRenderer::new(100, 20).with_background(Color::WHITE);
+        let ps = rs.render_scene_to_pixmap(&scene_solid);
+        let pd = rd.render_scene_to_pixmap(&scene_dashed);
+        // 沿中线统计黑色不透明像素（排除白色背景）。
+        let black_on_line = |pix: &Pixmap| {
+            (0..100u32)
+                .filter(|&x| {
+                    let (r, g, b, a) = pixel_at(pix, x, 10);
+                    r < 100 && g < 100 && b < 100 && a > 200
+                })
+                .count()
+        };
+        let solid = black_on_line(&ps);
+        let dashed = black_on_line(&pd);
+        // 实线几乎全段覆盖，虚线约一半。
+        assert!(solid > 80, "实线应覆盖中线大部分, got {solid}");
+        assert!(
+            dashed < solid,
+            "虚线覆盖应少于实线, solid={solid} dashed={dashed}"
+        );
+        assert!(dashed > 5, "虚线应仍有可见段, got {dashed}");
+    }
+
+    /// 节点 opacity：半透明绿覆盖红 → 中心为混合色（≈(128,128,0)）。
+    #[test]
+    fn opacity_blends_pixels() {
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+            ))
+            .with_z(0),
+        );
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(Color::rgb(0x00, 0xff, 0x00)),
+            ))
+            .with_z(1)
+            .with_opacity(0.5),
+        );
+        let mut r = VelloPixmapRenderer::new(20, 20);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let (r_, g, b, _) = pixel_at(&pix, 10, 10);
+        // 50% 绿 over 红 → 期望 (128,128,0)；容差 40。
+        assert!(r_.abs_diff(128) <= 40, "R={r_}");
+        assert!(g.abs_diff(128) <= 40, "G={g}");
+        assert!(b <= 40, "B={b}");
+    }
+
+    /// 节点 visible=false：整棵子树跳过，不产生像素。
+    #[test]
+    fn visibility_skips_pixels() {
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+            ))
+            .with_visible(false),
+        );
+        let mut r = VelloPixmapRenderer::new(20, 20);
+        let pix = r.render_scene_to_pixmap(&scene);
+        // 背景为透明 → 红色像素数应为 0。
+        assert_eq!(
+            count_color(&pix, (0xff, 0x00, 0x00), 20),
+            0,
+            "隐藏节点不应渲染"
+        );
+    }
+
+    /// 图层层序：顶层覆盖底层。交换层序后遮挡关系反转。
+    #[test]
+    fn layer_order_pixels() {
+        use crate::scene::Layer;
+        let mut scene = Scene::new(40.0, 40.0);
+        let bottom = Layer::new("bottom").with_nodes(vec![SceneNode::new(Element::rect(
+            Rect::new(0.0, 0.0, 40.0, 40.0),
+            FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+        ))]);
+        let top = Layer::new("top").with_nodes(vec![SceneNode::new(Element::rect(
+            Rect::new(10.0, 10.0, 20.0, 20.0),
+            FillStrokeStyle::fill(Color::rgb(0x00, 0x00, 0xff)),
+        ))]);
+        scene.push_layer(bottom);
+        scene.push_layer(top);
+        let mut r = VelloPixmapRenderer::new(40, 40);
+        let pix = r.render_scene_to_pixmap(&scene);
+        // 中心 (20,20) 在顶层蓝矩形内 → 蓝色。
+        let (r_, g, b, _) = pixel_at(&pix, 20, 20);
+        assert!(
+            b > 200 && r_ < 100 && g < 100,
+            "中心应为顶层蓝色, got ({r_},{g},{b})"
+        );
+        // 角落 (2,2) 在底层红矩形内 → 红色。
+        let (r2, g2, b2, _) = pixel_at(&pix, 2, 2);
+        assert!(
+            r2 > 200 && g2 < 100 && b2 < 100,
+            "角落应为底层红色, got ({r2},{g2},{b2})"
+        );
+    }
+
+    /// 文本字形渲染：黑字在白色背景上产生非白像素。
+    #[test]
+    fn text_glyphs_render() {
+        let style = TextStyle::new(Color::rgb(0, 0, 0), 24.0, "sans-serif");
+        let mut scene = Scene::new(200.0, 60.0);
+        scene.push(Element::text("Hello", Point::new(10.0, 40.0), style));
+        let mut r = VelloPixmapRenderer::new(200, 60).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let non_white = pix
+            .data()
+            .iter()
+            .filter(|p| p.r < 250 || p.g < 250 || p.b < 250)
+            .count();
+        assert!(non_white > 20, "字形应产生非白像素, got {non_white}");
+    }
+
+    /// 预排版 layout 与自动排版渲染结果一致（同一 TLS 上下文）。
+    #[test]
+    fn prelaid_layout_renders_same_as_auto() {
+        use crate::text::measure_text;
+        let style = TextStyle::new(Color::BLACK, 24.0, "sans-serif");
+        let m = measure_text("Hello", &style, None);
+        // 自动排版
+        let mut a = Scene::new(200.0, 60.0);
+        a.push(Element::text(
+            "Hello",
+            Point::new(10.0, 40.0),
+            style.clone(),
+        ));
+        // 预排版
+        let mut b = Scene::new(200.0, 60.0);
+        b.push(Element::Text {
+            content: "Hello".into(),
+            position: Point::new(10.0, 40.0),
+            style,
+            layout: Some(m.layout),
+        });
+        let mut ra = VelloPixmapRenderer::new(200, 60).with_background(Color::WHITE);
+        let mut rb = VelloPixmapRenderer::new(200, 60).with_background(Color::WHITE);
+        let da = pixels(&ra.render_scene_to_pixmap(&a));
+        let db = pixels(&rb.render_scene_to_pixmap(&b));
+        let diff = da.iter().zip(db.iter()).filter(|(x, y)| x != y).count();
+        assert!(
+            diff < da.len() / 1000,
+            "预排版与自动排版应一致, 差异 {diff} 字节"
+        );
+    }
+
+    /// clip：把大红矩形裁到中心小圆内 → 圆心是红、四角是背景（非红）。
+    #[test]
+    fn clip_restricts_pixels_to_shape() {
+        use crate::scene::Clip;
+        let mut scene = Scene::new(100.0, 100.0);
+        // 全幅红色矩形，裁到中心半径 20 的圆。
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 100.0, 100.0),
+                FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+            ))
+            .with_clip(Clip::circle(Point::new(50.0, 50.0), 20.0)),
+        );
+        let mut r = VelloPixmapRenderer::new(100, 100).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&scene);
+        // 圆心 (50,50) 应在圆内 → 红色。
+        let (cr, cg, cb, ca) = pixel_at(&pix, 50, 50);
+        assert!(
+            cr > 200 && cg < 60 && cb < 60 && ca > 200,
+            "圆心应为红, got ({cr},{cg},{cb},{ca})"
+        );
+        // 角落 (5,5) 在圆外 → 白色背景（红色不应出现）。
+        let (lr, lg, lb, _) = pixel_at(&pix, 5, 5);
+        assert!(
+            lr > 240 && lg > 240 && lb > 240,
+            "角落应为白, got ({lr},{lg},{lb})"
+        );
+    }
+}

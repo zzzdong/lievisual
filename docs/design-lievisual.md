@@ -1,0 +1,113 @@
+# lievisual 设计文档
+
+声明式视觉场景 IR + 可插拔渲染后端。定位为 liecharts / liemermaid / liepress 共享的
+"绘图层"：上层业务（图表/流程图/Markdown）只产出 `Scene`，再由所选后端输出到
+SVG / vello_cpu 栅格 / GPU（规划中）/ PDF·DOCX（经 liepress）。
+
+## 核心原则
+
+1. **IR 与后端分离**。`Scene`/`Element` 描述"画什么"，`Renderer` trait 描述"怎么画"。
+   新增后端（如 GPU）不影响 IR；新增图元变体只需在 `Renderer` 各实现里加一个 `match` 分支，
+   且 `draw_*` 均有默认实现（几何转 `BezPath` 后走 `draw_path`），新后端不实现也能正确渲染。
+2. **层级与节点属性提升**。`z_index` / `Transform` / `clip` / `opacity` / `name` / `visible` 是
+   `SceneNode` 的字段，而非每个图元重复携带。其中 `transform` 与 `opacity` 对 `Group`
+   子树递归复合（`opacity` 逐层相乘），`clip` 将整棵子树限制在形状内（SVG `<clipPath>` /
+   vello `push_clip_path`），`visible = false` 整棵子树跳过。后端在默认遍历
+   `render_scene_ordered` 里统一处理排序、节点属性、`Group` 递归与局部变换。
+3. **图元丰富**。`Element` 覆盖：矩形、圆、椭圆（可旋转）、圆角矩形、线、折线、多边形、
+   圆弧（开放描边）、扇形（闭合、适合饼图）、路径、渐变路径、文本（双形态）、组合 Group。
+4. **图层（Layer）**。`Scene` 可携带一组有序 [`Layer`]（从底到顶），整层控制
+   `name` / `visible` / `opacity` / `transform`；层内节点再按 `z_index` 稳定排序，
+   互不影响其它层。`Scene::nodes` 作为"默认层"（最底）保留，向后兼容。
+5. **填充多样**。`Fill`：纯色 / 线性渐变 / 径向渐变（坐标一律为绝对用户坐标，
+   SVG 端以 `gradientUnits="userSpaceOnUse"` 保证与 IR 一致）。描边 `Stroke` 支持
+   线帽 / 连接 / 虚线（`dash_array` / `dash_offset`）/ `miter_limit`。
+6. **场景元数据**。`Scene` 携带 `title` / `description`（SVG 输出 `<title>`/`<desc>`）与
+   `scale`（像素密度，SVG 放大 `width`/`height` 而保持 `viewBox`）。
+7. **文本（Canvas 风格）**。`Element::Text` 支持纯文本 + `TextStyle`，也支持预排版的
+   `TextLayout`（可选）。`TextStyle` 对齐 Web Canvas：`font-family` / `font-size` /
+   `font-weight` / `font-style` / `line-height` + `textAlign`（[`TextAlign`]）+
+   `textBaseline`（[`TextBaseline`]）；`measure_text` 对应 `ctx.measureText()`，返回含
+   `TextMetrics`（canvas `TextMetrics`）。SVG 后端用原生 `<text>`（`text-anchor` /
+   `dominant-baseline`），不依赖 parley。
+8. **无 feature gate**。`svg` / `vello`（vello_cpu 栅格化）/ `text`（parley 排版）全部默认
+   启用，无需开启任何 feature 即可使用全部后端与文本能力。
+
+## 模块结构
+
+```
+src/
+  geometry.rs   点/向量/尺寸/矩形/颜色/仿射变换（f64 精度，与 kurbo/parley/vello 对齐）
+  scene.rs      Scene（元数据 + 图层 layers）/ Layer / SceneNode（层级+节点属性）/
+                Element（图元枚举）/ 样式（FillStrokeStyle/Fill:Solid·Linear·Radial/Stroke 含虚线）
+  text.rs       Canvas 风格文本 API：TextStyle/TextAlign/TextBaseline/TextMetrics/
+                measure_text（thread-local 排版上下文缓存）
+  render/
+    mod.rs      Renderer trait + 默认 render_scene_ordered（排序 + 节点属性 + 图层 + 递归 Group/变换）
+    svg.rs      SvgRenderer（原生标签 + 用户坐标渐变 + title/desc/scale + 图层 <g>）
+    vello_pixmap.rs  VelloPixmapRenderer（vello_cpu 0.2 → PNG；
+                统一渐变填充、虚线描边、变换栈与透明度栈）
+```
+
+## 后端清单
+
+| 后端 | 输出 | 文本处理 |
+|------|------|----------|
+| `SvgRenderer` | 矢量 SVG 字符串 | 原生 `<text>`（`text-anchor`/`dominant-baseline`/`font-weight`/`font-style`），不依赖 parley |
+| `VelloPixmapRenderer` | `Pixmap` → PNG 字节 | parley 排版（统一 TLS 上下文），优先用调用者提供的 `TextLayout` |
+| GPU（`vello_hybrid`） | GPU 加速（规划） | 同 vello，仅 Scene 提交方式不同 |
+
+所有后端默认启用，无需 feature 开关（vello 栅格化依赖 parley 排版，作为常驻依赖）。
+图层在 SVG 端输出为 `<g id="layer-name">`（含整层 `opacity` / `transform`），
+栅格端则并入透明度 / 变换栈。
+
+## 文本排版（Canvas API）
+
+文本 API 对齐 Web Canvas `CanvasRenderingContext2D`，方便上层（图表/流程图）从浏览器
+习惯迁移：
+
+| Canvas | lievisual |
+|--------|-----------|
+| `ctx.font` | `TextStyle`（`font_family`/`font_size`/`font_weight`/`font_style`/`line_height`） |
+| `ctx.textAlign` | [`TextAlign`]（Left/Center/Right） |
+| `ctx.textBaseline` | [`TextBaseline`]（Top/Hanging/Middle/Alphabetic/Ideographic/Bottom） |
+| `ctx.measureText()` | [`measure_text`] → [`TextMeasure`]（含 [`TextMetrics`]） |
+| `ctx.fillText(x, y)` | `Element::Text { position, .. }`：`x` 由 `align` 决定，`y` 由 `baseline` 决定 |
+
+**锚点语义**：水平锚点由 `align` 决定（左/中/右），垂直锚点由 `baseline` 决定
+（默认 `Alphabetic`，即 `position.y` 是基线——与 canvas 默认一致）。两端后端同步实现：
+- SVG：`text-anchor` + `dominant-baseline`；
+- vello：`translate(position) * rotate * translate(dx, dy)`，其中 `dx`/`dy` 由度量推导，
+  旋转绕锚点。
+
+**排版上下文缓存（thread-local）**：parley 的 `FontContext`（字体库 + LRU 源缓存）与
+`LayoutContext`（scratch + 字形缓存）被官方设计为"每应用/每线程一个"。lievisual 通过
+`thread_local` 持有这两个上下文，**所有 parley 相关操作**（[`measure_text`] 测量、
+渲染端现场排版 `layout_text`）统一经 `with_cached_context` 复用同一对实例：首次调用按
+线程懒初始化，之后线程内复用，避免反复的系统字体扫描与分配；多线程各持独立实例，
+无需同步。
+
+## 颜色约定
+
+- `geometry::Color`：RGBA，分量 0.0–1.0，贯穿整个 IR。
+- 作为 parley 的 brush 类型：`Color` 自动满足 `parley::Brush` marker trait，无需转换。
+- 栅格化时由后端 `to_vello` 转为 `vello_cpu::peniko::color::AlphaColor<Srgb>`，并乘入当前
+  节点透明度。
+
+## 依赖版本对齐
+
+- `kurbo = "0.13"`：与 `vello_cpu 0.2` 内部 kurbo 0.13 对齐，避免双版本类型不兼容。
+- `parley = "0.11"`、`vello_cpu = "0.2"`：参考 liemermaid 已验证可用的组合。
+- `peniko 0.6`（随 vello_cpu）：支持 Linear / Radial / Sweep 三种渐变。
+
+## 后续规划
+
+1. **GPU 后端**：新增 `VelloGpuRenderer`（基于 linebender/vello 的 `vello_hybrid` sparse_strips）。
+   因 `Scene` 已是纯几何 + 样式，直接喂给 GPU 渲染上下文即可，上层业务零改动。
+2. **`Scene::bounds()` 几何求交**：为布局/命中测试提供图元包围盒计算（依赖 `Shape::bounding_box`）。
+3. **SVG 文本矢量保真**（可选）：将 `TextLayout` 的字形转为 `<path>`，替代 `<text>`，
+   以获得跨渲染器完全一致的字形。
+4. **接入 liecharts / liemermaid**：二者现有 `VisualElement` + `Renderer` 模式与 lievisual
+   同构，可将各自的 IR 收敛到 lievisual 的 `Scene`，删除重复定义。
+5. **接入 liepress**：liepress 四端（PDF/PNG/SVG/DOCX）分别选用 `VelloPixmapRenderer`、
+   `SvgRenderer` 或内嵌 SVG，统一走 `Scene` 中间表示。
