@@ -9,13 +9,14 @@
 //! - 图层：`Scene` 可携带一组有序 [`Layer`]（从底到顶）。图层整体控制
 //!   `visible` / `opacity` / `transform`，层内节点再按 `z_index` 稳定排序；
 //!   `Scene::nodes` 作为"默认层"（最底）保留，向后兼容。
-//! - [`Element::Text`] 双形态：纯文本 + 样式，或携带预排版的 [`crate::text::TextLayout`]。
+//! - [`Element::Text`] 以样式化片段（[`crate::text::RichSpan`]）为核心表达文本，可携带
+//!   预排版的 [`crate::text::TextLayout`]；纯文本由 `spans` 拼接推导，各后端渲染一致。
 //! - 统一排序助手：[`SceneNode::ordered`] 按 `z_index` 稳定升序遍历节点（同层保持插入次序），
 //!   [`Scene::iter_ordered`] 为顶层集合的便捷入口；渲染与调用方复用同一套遍历逻辑。
 
 use crate::geometry::{Color, Point, Rect, Transform, Vec2};
 use crate::render::Renderer;
-use crate::text::TextLayout;
+use crate::text::{RichSpan, TextLayout};
 use kurbo::BezPath;
 
 /// 一个完整的可渲染场景。
@@ -645,13 +646,17 @@ pub enum Element {
         gradient: LinearGradient,
         stroke: Option<Stroke>,
     },
-    /// 文本：纯文本 + 样式，可选预排版 layout。
+    /// 文本：以样式化片段（[`RichSpan`]）为核心，可选预排版 layout。
+    ///
+    /// - `spans`：样式化片段（vello 等后端据此排版字形），单文本即单个片段；
+    /// - `style`：块级定位样式（`align` / `baseline` / `rotation` / `max_width`）与默认字体；
+    /// - `layout`：预排版结果，存在时后端应优先使用（精确字形定位）。
+    ///
+    /// 纯文本内容（SVG 后端）由 `spans` 拼接推导，保证各后端渲染一致。
     Text {
-        content: String,
+        spans: Vec<RichSpan>,
         position: Point,
         style: crate::text::TextStyle,
-        /// 预排版结果。存在时后端应优先使用（精确字形定位）；
-        /// 不存在时后端可回退到原生文本输出或自行排版。
         layout: Option<std::sync::Arc<TextLayout>>,
     },
     /// 递归组合：子节点在父变换与层级下绘制。
@@ -753,6 +758,9 @@ impl Element {
     }
 
     /// 纯文本图元（layout 为空，由后端自行排版）。
+    ///
+    /// `style` 既作为块级定位（`align` / `baseline` / `rotation` / `max_width`），
+    /// 也作为默认字体样式；内部生成单个 [`RichSpan`]。
     #[must_use]
     pub fn text(
         content: impl Into<String>,
@@ -760,7 +768,18 @@ impl Element {
         style: crate::text::TextStyle,
     ) -> Self {
         Self::Text {
-            content: content.into(),
+            spans: vec![RichSpan::new(content, style.clone())],
+            position,
+            style,
+            layout: None,
+        }
+    }
+
+    /// 富文本图元：由一段段样式化片段组成（`style` 提供块级定位与默认字体）。
+    #[must_use]
+    pub fn rich_text(spans: Vec<RichSpan>, position: Point, style: crate::text::TextStyle) -> Self {
+        Self::Text {
+            spans,
             position,
             style,
             layout: None,
@@ -788,322 +807,343 @@ mod tests {
         }
     }
 
-    #[test]
-    fn push_accepts_element_and_scene_node() {
-        let mut scene = Scene::new(100.0, 100.0);
-        scene.push(Element::rect(
-            Rect::new(0.0, 0.0, 1.0, 1.0),
-            FillStrokeStyle::fill(Color::BLACK),
-        ));
-        scene.push(SceneNode::new(Element::rect(
-            Rect::new(0.0, 0.0, 1.0, 1.0),
-            FillStrokeStyle::fill(Color::BLACK),
-        )));
-        assert_eq!(scene.nodes.len(), 2);
-    }
+    /// 元素构造器、节点构建器与默认值。
+    mod element {
+        use super::*;
 
-    #[test]
-    fn iter_ordered_sorts_z_ascending() {
-        let mut scene = Scene::new(100.0, 100.0);
-        scene.push_node(rect_node(0.0, 5));
-        scene.push_node(rect_node(0.0, -3));
-        scene.push_node(rect_node(0.0, 1));
-        let zs: Vec<i32> = scene.iter_ordered().map(|n| n.z_index).collect();
-        assert_eq!(zs, vec![-3, 1, 5]);
-    }
-
-    #[test]
-    fn ordered_is_stable_within_same_z() {
-        // 同 z_index 的三个节点，用可区分的 x 坐标验证保持插入次序。
-        let nodes = vec![rect_node(10.0, 0), rect_node(20.0, 0), rect_node(30.0, 0)];
-        let xs: Vec<f64> = SceneNode::ordered(&nodes).map(rect_x).collect();
-        assert_eq!(xs, vec![10.0, 20.0, 30.0]);
-    }
-
-    #[test]
-    fn builder_chaining() {
-        let node = SceneNode::new(Element::circle(
-            Point::new(1.0, 2.0),
-            3.0,
-            FillStrokeStyle::stroke(Color::BLACK, 1.0),
-        ))
-        .with_z(7)
-        .with_transform(Transform::translate(1.0, 2.0))
-        .with_opacity(0.5)
-        .with_name("node-a")
-        .with_visible(false);
-        assert_eq!(node.z_index, 7);
-        assert_eq!(node.transform, Some(Transform::translate(1.0, 2.0)));
-        assert_eq!(node.opacity, 0.5);
-        assert_eq!(node.name.as_deref(), Some("node-a"));
-        assert!(!node.visible);
-    }
-
-    #[test]
-    fn node_defaults() {
-        let node = SceneNode::new(Element::rect(
-            Rect::new(0.0, 0.0, 1.0, 1.0),
-            FillStrokeStyle::fill(Color::BLACK),
-        ));
-        assert_eq!(node.opacity, 1.0);
-        assert!(node.name.is_none());
-        assert!(node.visible);
-    }
-
-    #[test]
-    fn scene_metadata_defaults_and_builders() {
-        let scene = Scene::new(10.0, 20.0)
-            .with_title("图表")
-            .with_description("示例")
-            .with_scale(2.0);
-        assert_eq!(scene.title.as_deref(), Some("图表"));
-        assert_eq!(scene.description.as_deref(), Some("示例"));
-        assert_eq!(scene.scale, 2.0);
-        let d = Scene::default();
-        assert_eq!(d.scale, 1.0);
-    }
-
-    #[test]
-    fn scene_node_group_and_push_group() {
-        let group = SceneNode::group(vec![rect_node(0.0, 0), rect_node(0.0, 1)]);
-        match &group.element {
-            Element::Group { children } => assert_eq!(children.len(), 2),
-            _ => panic!("expected group"),
+        #[test]
+        fn push_accepts_element_and_scene_node() {
+            let mut scene = Scene::new(100.0, 100.0);
+            scene.push(Element::rect(
+                Rect::new(0.0, 0.0, 1.0, 1.0),
+                FillStrokeStyle::fill(Color::BLACK),
+            ));
+            scene.push(SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 1.0, 1.0),
+                FillStrokeStyle::fill(Color::BLACK),
+            )));
+            assert_eq!(scene.nodes.len(), 2);
         }
-        let mut scene = Scene::new(10.0, 10.0);
-        scene.push_group(vec![rect_node(0.0, 0)]);
-        assert!(matches!(&scene.nodes[0].element, Element::Group { .. }));
-    }
 
-    #[test]
-    fn from_element_conversion() {
-        let node: SceneNode = Element::line(
-            Point::new(0.0, 0.0),
-            Point::new(1.0, 1.0),
-            Stroke::new(Color::BLACK, 1.0),
-        )
-        .into();
-        assert_eq!(node.z_index, 0);
-        assert!(node.transform.is_none());
-    }
+        #[test]
+        fn builder_chaining() {
+            let node = SceneNode::new(Element::circle(
+                Point::new(1.0, 2.0),
+                3.0,
+                FillStrokeStyle::stroke(Color::BLACK, 1.0),
+            ))
+            .with_z(7)
+            .with_transform(Transform::translate(1.0, 2.0))
+            .with_opacity(0.5)
+            .with_name("node-a")
+            .with_visible(false);
+            assert_eq!(node.z_index, 7);
+            assert_eq!(node.transform, Some(Transform::translate(1.0, 2.0)));
+            assert_eq!(node.opacity, 0.5);
+            assert_eq!(node.name.as_deref(), Some("node-a"));
+            assert!(!node.visible);
+        }
 
-    #[test]
-    fn element_constructors() {
-        let r = Element::rect(
-            Rect::new(0.0, 0.0, 10.0, 10.0),
-            FillStrokeStyle::fill(Color::BLACK),
-        );
-        assert!(matches!(r, Element::Rect { .. }));
+        #[test]
+        fn node_defaults() {
+            let node = SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 1.0, 1.0),
+                FillStrokeStyle::fill(Color::BLACK),
+            ));
+            assert_eq!(node.opacity, 1.0);
+            assert!(node.name.is_none());
+            assert!(node.visible);
+        }
 
-        let c = Element::circle(
-            Point::new(1.0, 2.0),
-            3.0,
-            FillStrokeStyle::fill(Color::BLACK),
-        );
-        assert!(matches!(c, Element::Circle { .. }));
-
-        let e = Element::ellipse(
-            Point::new(1.0, 2.0),
-            Vec2::new(4.0, 2.0),
-            0.1,
-            FillStrokeStyle::fill(Color::BLACK),
-        );
-        assert!(matches!(e, Element::Ellipse { .. }));
-
-        let rr = Element::rounded_rect(
-            Rect::new(0.0, 0.0, 10.0, 10.0),
-            3.0,
-            FillStrokeStyle::fill(Color::BLACK),
-        );
-        assert!(matches!(rr, Element::RoundedRect { .. }));
-
-        let l = Element::line(
-            Point::new(0.0, 0.0),
-            Point::new(1.0, 1.0),
-            Stroke::new(Color::BLACK, 1.0),
-        );
-        assert!(matches!(l, Element::Line { .. }));
-
-        let p = Element::poly(
-            vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)],
-            Stroke::new(Color::BLACK, 1.0),
-        );
-        assert!(matches!(p, Element::Polyline { .. }));
-
-        let pg = Element::polygon(
-            vec![
+        #[test]
+        fn from_element_conversion() {
+            let node: SceneNode = Element::line(
                 Point::new(0.0, 0.0),
                 Point::new(1.0, 1.0),
-                Point::new(0.0, 1.0),
-            ],
-            FillStrokeStyle::fill(Color::BLACK),
-        );
-        assert!(matches!(pg, Element::Polygon { .. }));
+                Stroke::new(Color::BLACK, 1.0),
+            )
+            .into();
+            assert_eq!(node.z_index, 0);
+            assert!(node.transform.is_none());
+        }
 
-        let a = Element::arc(
-            Point::new(0.0, 0.0),
-            Vec2::new(5.0, 5.0),
-            0.0,
-            std::f64::consts::FRAC_PI_2,
-            Stroke::new(Color::BLACK, 1.0),
-        );
-        assert!(matches!(a, Element::Arc { .. }));
+        #[test]
+        fn element_constructors() {
+            let r = Element::rect(
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+                FillStrokeStyle::fill(Color::BLACK),
+            );
+            assert!(matches!(r, Element::Rect { .. }));
 
-        let pie = Element::pie(
-            Point::new(0.0, 0.0),
-            5.0,
-            0.0,
-            std::f64::consts::FRAC_PI_2,
-            FillStrokeStyle::fill(Color::BLACK),
-        );
-        assert!(matches!(pie, Element::Pie { .. }));
+            let c = Element::circle(
+                Point::new(1.0, 2.0),
+                3.0,
+                FillStrokeStyle::fill(Color::BLACK),
+            );
+            assert!(matches!(c, Element::Circle { .. }));
 
-        let t = Element::text(
-            "hi",
-            Point::new(0.0, 0.0),
-            crate::text::TextStyle::new(Color::BLACK, 12.0, "sans-serif"),
-        );
-        match t {
-            Element::Text {
-                content,
-                position,
-                style,
-                layout,
-            } => {
-                assert_eq!(content, "hi");
-                assert_eq!(position, Point::new(0.0, 0.0));
-                assert_eq!(style.font_size, 12.0);
-                assert!(layout.is_none());
+            let e = Element::ellipse(
+                Point::new(1.0, 2.0),
+                Vec2::new(4.0, 2.0),
+                0.1,
+                FillStrokeStyle::fill(Color::BLACK),
+            );
+            assert!(matches!(e, Element::Ellipse { .. }));
+
+            let rr = Element::rounded_rect(
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+                3.0,
+                FillStrokeStyle::fill(Color::BLACK),
+            );
+            assert!(matches!(rr, Element::RoundedRect { .. }));
+
+            let l = Element::line(
+                Point::new(0.0, 0.0),
+                Point::new(1.0, 1.0),
+                Stroke::new(Color::BLACK, 1.0),
+            );
+            assert!(matches!(l, Element::Line { .. }));
+
+            let p = Element::poly(
+                vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)],
+                Stroke::new(Color::BLACK, 1.0),
+            );
+            assert!(matches!(p, Element::Polyline { .. }));
+
+            let pg = Element::polygon(
+                vec![
+                    Point::new(0.0, 0.0),
+                    Point::new(1.0, 1.0),
+                    Point::new(0.0, 1.0),
+                ],
+                FillStrokeStyle::fill(Color::BLACK),
+            );
+            assert!(matches!(pg, Element::Polygon { .. }));
+
+            let a = Element::arc(
+                Point::new(0.0, 0.0),
+                Vec2::new(5.0, 5.0),
+                0.0,
+                std::f64::consts::FRAC_PI_2,
+                Stroke::new(Color::BLACK, 1.0),
+            );
+            assert!(matches!(a, Element::Arc { .. }));
+
+            let pie = Element::pie(
+                Point::new(0.0, 0.0),
+                5.0,
+                0.0,
+                std::f64::consts::FRAC_PI_2,
+                FillStrokeStyle::fill(Color::BLACK),
+            );
+            assert!(matches!(pie, Element::Pie { .. }));
+
+            let t = Element::text(
+                "hi",
+                Point::new(0.0, 0.0),
+                crate::text::TextStyle::new(Color::BLACK, 12.0, "sans-serif"),
+            );
+            match t {
+                Element::Text {
+                    spans,
+                    position,
+                    style,
+                    layout,
+                } => {
+                    assert_eq!(spans.len(), 1);
+                    assert_eq!(spans[0].text, "hi");
+                    assert_eq!(position, Point::new(0.0, 0.0));
+                    assert_eq!(style.font_size, 12.0);
+                    assert!(layout.is_none());
+                }
+                _ => panic!("expected text"),
             }
-            _ => panic!("expected text"),
+        }
+
+        #[test]
+        fn stroke_dash_and_miter_defaults() {
+            let s = Stroke::new(Color::BLACK, 2.0);
+            assert!(s.dash_array.is_empty());
+            assert_eq!(s.dash_offset, 0.0);
+            assert_eq!(s.miter_limit, 10.0);
+
+            let d = Stroke::dashed(Color::BLACK, 2.0, vec![4.0, 2.0]);
+            assert_eq!(d.dash_array, vec![4.0, 2.0]);
+        }
+
+        #[test]
+        fn radial_gradient_into_fill() {
+            let g = RadialGradient {
+                center: Point::new(0.0, 0.0),
+                radius: 10.0,
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: Color::BLACK,
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: Color::WHITE,
+                    },
+                ],
+            };
+            let style = FillStrokeStyle::fill_gradient(g);
+            assert!(matches!(style.fill, Some(Fill::RadialGradient(_))));
+        }
+
+        #[test]
+        fn rect_center_helper() {
+            assert_eq!(
+                Rect::new(2.0, 4.0, 10.0, 6.0).center(),
+                Point::new(7.0, 7.0)
+            );
+        }
+
+        #[test]
+        fn clip_constructors_and_bezpath() {
+            let c = Clip::circle(Point::new(1.0, 2.0), 5.0);
+            assert!(matches!(c, Clip::Circle { radius: 5.0, .. }));
+            // to_bezpath 应产出闭合的圆路径
+            let p = c.to_bezpath();
+            assert!(!p.is_empty());
+
+            let r = Clip::rect(Rect::new(0.0, 0.0, 10.0, 20.0));
+            assert!(matches!(r, Clip::Rect(_)));
+            assert!(!r.to_bezpath().is_empty());
+
+            let rr = Clip::rounded_rect(Rect::new(0.0, 0.0, 10.0, 10.0), 2.0);
+            assert!(matches!(rr, Clip::RoundedRect { .. }));
+
+            let e = Clip::ellipse(Point::new(0.0, 0.0), Vec2::new(3.0, 4.0), 0.0);
+            assert!(matches!(e, Clip::Ellipse { .. }));
+
+            let mut bp = BezPath::new();
+            bp.move_to((0.0, 0.0));
+            bp.line_to((1.0, 0.0));
+            let p2 = Clip::path(bp);
+            assert!(matches!(p2, Clip::Path(_)));
+            assert!(!p2.to_bezpath().is_empty());
+        }
+
+        #[test]
+        fn scene_node_clip_builder() {
+            let node = SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+                FillStrokeStyle::fill(Color::BLACK),
+            ))
+            .with_clip(Clip::circle(Point::new(5.0, 5.0), 3.0));
+            assert!(node.clip.is_some());
+            // 默认无 clip
+            let n = SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 1.0, 1.0),
+                FillStrokeStyle::fill(Color::BLACK),
+            ));
+            assert!(n.clip.is_none());
         }
     }
 
-    #[test]
-    fn stroke_dash_and_miter_defaults() {
-        let s = Stroke::new(Color::BLACK, 2.0);
-        assert!(s.dash_array.is_empty());
-        assert_eq!(s.dash_offset, 0.0);
-        assert_eq!(s.miter_limit, 10.0);
+    /// 排序：z_index 升序与同 z 稳定性。
+    mod ordering {
+        use super::*;
 
-        let d = Stroke::dashed(Color::BLACK, 2.0, vec![4.0, 2.0]);
-        assert_eq!(d.dash_array, vec![4.0, 2.0]);
+        #[test]
+        fn iter_ordered_sorts_z_ascending() {
+            let mut scene = Scene::new(100.0, 100.0);
+            scene.push_node(rect_node(0.0, 5));
+            scene.push_node(rect_node(0.0, -3));
+            scene.push_node(rect_node(0.0, 1));
+            let zs: Vec<i32> = scene.iter_ordered().map(|n| n.z_index).collect();
+            assert_eq!(zs, vec![-3, 1, 5]);
+        }
+
+        #[test]
+        fn ordered_is_stable_within_same_z() {
+            // 同 z_index 的三个节点，用可区分的 x 坐标验证保持插入次序。
+            let nodes = vec![rect_node(10.0, 0), rect_node(20.0, 0), rect_node(30.0, 0)];
+            let xs: Vec<f64> = SceneNode::ordered(&nodes).map(rect_x).collect();
+            assert_eq!(xs, vec![10.0, 20.0, 30.0]);
+        }
+
+        #[test]
+        fn layer_iter_ordered_sorts_within_layer() {
+            let layer = Layer::new("l").with_nodes(vec![
+                rect_node(0.0, 5),
+                rect_node(0.0, -2),
+                rect_node(0.0, 1),
+            ]);
+            let zs: Vec<i32> = layer.iter_ordered().map(|n| n.z_index).collect();
+            assert_eq!(zs, vec![-2, 1, 5]);
+        }
     }
 
-    #[test]
-    fn radial_gradient_into_fill() {
-        let g = RadialGradient {
-            center: Point::new(0.0, 0.0),
-            radius: 10.0,
-            stops: vec![
-                GradientStop {
-                    offset: 0.0,
-                    color: Color::BLACK,
-                },
-                GradientStop {
-                    offset: 1.0,
-                    color: Color::WHITE,
-                },
-            ],
-        };
-        let style = FillStrokeStyle::fill_gradient(g);
-        assert!(matches!(style.fill, Some(Fill::RadialGradient(_))));
+    /// Scene 元数据、分组、图层装载与查询。
+    mod scene {
+        use super::*;
+
+        #[test]
+        fn scene_metadata_defaults_and_builders() {
+            let scene = Scene::new(10.0, 20.0)
+                .with_title("图表")
+                .with_description("示例")
+                .with_scale(2.0);
+            assert_eq!(scene.title.as_deref(), Some("图表"));
+            assert_eq!(scene.description.as_deref(), Some("示例"));
+            assert_eq!(scene.scale, 2.0);
+            let d = Scene::default();
+            assert_eq!(d.scale, 1.0);
+        }
+
+        #[test]
+        fn scene_node_group_and_push_group() {
+            let group = SceneNode::group(vec![rect_node(0.0, 0), rect_node(0.0, 1)]);
+            match &group.element {
+                Element::Group { children } => assert_eq!(children.len(), 2),
+                _ => panic!("expected group"),
+            }
+            let mut scene = Scene::new(10.0, 10.0);
+            scene.push_group(vec![rect_node(0.0, 0)]);
+            assert!(matches!(&scene.nodes[0].element, Element::Group { .. }));
+        }
+
+        #[test]
+        fn scene_push_layer_and_lookup() {
+            let mut scene = Scene::new(100.0, 100.0);
+            scene.push_layer(Layer::new("grid"));
+            scene.push_layer(Layer::new("data").with_nodes(vec![rect_node(0.0, 0)]));
+            assert_eq!(scene.layers().len(), 2);
+            assert!(scene.layer("data").is_some());
+            assert!(scene.layer("missing").is_none());
+            scene.layer_mut("grid").unwrap().visible = false;
+            assert!(!scene.layers[0].visible);
+        }
+
+        #[test]
+        fn scene_default_has_empty_layers() {
+            let scene = Scene::new(10.0, 10.0);
+            assert!(scene.layers.is_empty());
+        }
     }
 
-    #[test]
-    fn rect_center_helper() {
-        assert_eq!(
-            Rect::new(2.0, 4.0, 10.0, 6.0).center(),
-            Point::new(7.0, 7.0)
-        );
-    }
+    /// Layer 默认值与构建器。
+    mod layer {
+        use super::*;
 
-    #[test]
-    fn layer_defaults_and_builders() {
-        let layer = Layer::new("data").with_nodes(vec![rect_node(0.0, 1)]);
-        assert_eq!(layer.name, "data");
-        assert!(layer.visible);
-        assert_eq!(layer.opacity, 1.0);
-        assert!(layer.transform.is_none());
-        assert_eq!(layer.nodes.len(), 1);
+        #[test]
+        fn layer_defaults_and_builders() {
+            let layer = Layer::new("data").with_nodes(vec![rect_node(0.0, 1)]);
+            assert_eq!(layer.name, "data");
+            assert!(layer.visible);
+            assert_eq!(layer.opacity, 1.0);
+            assert!(layer.transform.is_none());
+            assert_eq!(layer.nodes.len(), 1);
 
-        let l2 = Layer::new("x")
-            .with_visible(false)
-            .with_opacity(0.5)
-            .with_transform(Transform::translate(1.0, 2.0));
-        assert!(!l2.visible);
-        assert_eq!(l2.opacity, 0.5);
-        assert_eq!(l2.transform, Some(Transform::translate(1.0, 2.0)));
-    }
-
-    #[test]
-    fn layer_iter_ordered_sorts_within_layer() {
-        let layer = Layer::new("l").with_nodes(vec![
-            rect_node(0.0, 5),
-            rect_node(0.0, -2),
-            rect_node(0.0, 1),
-        ]);
-        let zs: Vec<i32> = layer.iter_ordered().map(|n| n.z_index).collect();
-        assert_eq!(zs, vec![-2, 1, 5]);
-    }
-
-    #[test]
-    fn scene_push_layer_and_lookup() {
-        let mut scene = Scene::new(100.0, 100.0);
-        scene.push_layer(Layer::new("grid"));
-        scene.push_layer(Layer::new("data").with_nodes(vec![rect_node(0.0, 0)]));
-        assert_eq!(scene.layers().len(), 2);
-        assert!(scene.layer("data").is_some());
-        assert!(scene.layer("missing").is_none());
-        scene.layer_mut("grid").unwrap().visible = false;
-        assert!(!scene.layers[0].visible);
-    }
-
-    #[test]
-    fn scene_default_has_empty_layers() {
-        let scene = Scene::new(10.0, 10.0);
-        assert!(scene.layers.is_empty());
-    }
-
-    #[test]
-    fn clip_constructors_and_bezpath() {
-        let c = Clip::circle(Point::new(1.0, 2.0), 5.0);
-        assert!(matches!(c, Clip::Circle { radius: 5.0, .. }));
-        // to_bezpath 应产出闭合的圆路径
-        let p = c.to_bezpath();
-        assert!(!p.is_empty());
-
-        let r = Clip::rect(Rect::new(0.0, 0.0, 10.0, 20.0));
-        assert!(matches!(r, Clip::Rect(_)));
-        assert!(!r.to_bezpath().is_empty());
-
-        let rr = Clip::rounded_rect(Rect::new(0.0, 0.0, 10.0, 10.0), 2.0);
-        assert!(matches!(rr, Clip::RoundedRect { .. }));
-
-        let e = Clip::ellipse(Point::new(0.0, 0.0), Vec2::new(3.0, 4.0), 0.0);
-        assert!(matches!(e, Clip::Ellipse { .. }));
-
-        let mut bp = BezPath::new();
-        bp.move_to((0.0, 0.0));
-        bp.line_to((1.0, 0.0));
-        let p2 = Clip::path(bp);
-        assert!(matches!(p2, Clip::Path(_)));
-        assert!(!p2.to_bezpath().is_empty());
-    }
-
-    #[test]
-    fn scene_node_clip_builder() {
-        let node = SceneNode::new(Element::rect(
-            Rect::new(0.0, 0.0, 10.0, 10.0),
-            FillStrokeStyle::fill(Color::BLACK),
-        ))
-        .with_clip(Clip::circle(Point::new(5.0, 5.0), 3.0));
-        assert!(node.clip.is_some());
-        // 默认无 clip
-        let n = SceneNode::new(Element::rect(
-            Rect::new(0.0, 0.0, 1.0, 1.0),
-            FillStrokeStyle::fill(Color::BLACK),
-        ));
-        assert!(n.clip.is_none());
+            let l2 = Layer::new("x")
+                .with_visible(false)
+                .with_opacity(0.5)
+                .with_transform(Transform::translate(1.0, 2.0));
+            assert!(!l2.visible);
+            assert_eq!(l2.opacity, 0.5);
+            assert_eq!(l2.transform, Some(Transform::translate(1.0, 2.0)));
+        }
     }
 }

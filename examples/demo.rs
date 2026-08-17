@@ -205,7 +205,14 @@ fn build_scene() -> Scene {
         .with_weight(700.0)
         .with_align(lievisual::TextAlign::Left);
     // 先测量再做水平居中（canvas 风格：measureText → 用 width 定位锚点）。
-    let m = lievisual::measure_text("lievisual · 丰富 IR · Layer", &title_style, None);
+    // 文本以样式化片段表达：单个 RichSpan 即单文本。
+    let m = lievisual::measure_text(
+        std::slice::from_ref(&lievisual::RichSpan::new(
+            "lievisual · 丰富 IR · Layer",
+            title_style.clone(),
+        )),
+        None,
+    );
     let title_x = 280.0 - m.size.width / 2.0; // 画布中心 280 居中
     let labels = Layer::new("labels").with_nodes(vec![SceneNode::new(Element::text(
         "lievisual · 丰富 IR · Layer",
@@ -241,7 +248,13 @@ fn main() {
     }
     // 演示 measure_text / TextMetrics（canvas 风格）
     let demo_style = lievisual::TextStyle::new(Color::BLACK, 20.0, "sans-serif");
-    let tm = lievisual::measure_text("Measure 示例", &demo_style, None);
+    let tm = lievisual::measure_text(
+        std::slice::from_ref(&lievisual::RichSpan::new(
+            "Measure 示例",
+            demo_style.clone(),
+        )),
+        None,
+    );
     println!(
         "  测量 \"Measure 示例\": width={:.2} height={:.2} alphabetic_baseline={:.2} ascent={:.2} descent={:.2}",
         tm.metrics.width,

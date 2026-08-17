@@ -291,21 +291,22 @@ impl Renderer for VelloPixmapRenderer {
 
     fn draw_text(
         &mut self,
-        content: &str,
+        spans: &[crate::text::RichSpan],
         position: Point,
         style: &TextStyle,
         layout: Option<&crate::text::TextLayout>,
     ) {
         use vello_cpu::kurbo::Affine;
 
-        // 优先使用调用者提供的 layout；否则经统一 TLS 上下文现场排版（layout_text）。
-        let layout_arc = match layout {
-            Some(l) => Some(std::sync::Arc::new(l.clone())),
-            None => Some(crate::text::layout_text(content, style, style.max_width)),
-        };
-
-        let Some(layout) = layout_arc.as_ref() else {
-            return;
+        // 优先使用调用者提供的 layout（直接借用，避免整体克隆）；否则经统一
+        // TLS 上下文现场排版（layout_text）持有临时 layout。
+        let owned_layout;
+        let layout = match layout {
+            Some(l) => l,
+            None => {
+                owned_layout = crate::text::layout_text(spans, style.max_width);
+                &owned_layout
+            }
         };
 
         // 局部变换：若节点带 transform，已由 push_transform 处理；这里仅处理文本自身旋转。
@@ -727,9 +728,13 @@ mod tests {
     /// 预排版 layout 与自动排版渲染结果一致（同一 TLS 上下文）。
     #[test]
     fn prelaid_layout_renders_same_as_auto() {
+        use crate::text::RichSpan;
         use crate::text::measure_text;
         let style = TextStyle::new(Color::BLACK, 24.0, "sans-serif");
-        let m = measure_text("Hello", &style, None);
+        let m = measure_text(
+            std::slice::from_ref(&RichSpan::new("Hello", style.clone())),
+            None,
+        );
         // 自动排版
         let mut a = Scene::new(200.0, 60.0);
         a.push(Element::text(
@@ -740,7 +745,7 @@ mod tests {
         // 预排版
         let mut b = Scene::new(200.0, 60.0);
         b.push(Element::Text {
-            content: "Hello".into(),
+            spans: vec![RichSpan::new("Hello", style.clone())],
             position: Point::new(10.0, 40.0),
             style,
             layout: Some(m.layout),

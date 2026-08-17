@@ -130,10 +130,13 @@ pub trait Renderer {
         stroke: Option<&crate::scene::Stroke>,
     );
 
-    /// 绘制文本。纯文本形态：由后端自行排版；若 `layout` 提供则优先使用。
+    /// 绘制文本。以样式化片段（`spans`）为核心；若 `layout` 提供则优先使用。
+    ///
+    /// 非 parley 后端（如 SVG）应从 `spans` 拼接纯文本；`style` 提供块级定位
+    /// （`align` / `baseline` / `rotation` / `max_width`）。
     fn draw_text(
         &mut self,
-        content: &str,
+        spans: &[crate::text::RichSpan],
         position: Point,
         style: &crate::text::TextStyle,
         layout: Option<&crate::text::TextLayout>,
@@ -303,11 +306,11 @@ pub trait Renderer {
                 stroke,
             } => self.draw_gradient_path(path, gradient, stroke.as_ref()),
             Element::Text {
-                content,
+                spans,
                 position,
                 style,
                 layout,
-            } => self.draw_text(content, *position, style, layout.as_deref()),
+            } => self.draw_text(spans, *position, style, layout.as_deref()),
         }
 
         self.pop_node_scope(node);

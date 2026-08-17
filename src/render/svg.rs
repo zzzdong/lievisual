@@ -299,12 +299,14 @@ impl Renderer for SvgRenderer {
 
     fn draw_text(
         &mut self,
-        content: &str,
+        spans: &[crate::text::RichSpan],
         position: Point,
         style: &TextStyle,
         _layout: Option<&crate::text::TextLayout>,
     ) {
         // SVG 使用原生 <text>，由浏览器排版；忽略 parley layout。
+        // 纯文本由 spans 拼接推导，保证与 vello 后端的字形内容一致。
+        let content = spans.iter().map(|s| s.text.as_str()).collect::<String>();
         // 锚点：text-anchor（水平，对应 align）+ dominant-baseline（垂直，对应 baseline）。
         let anchor = match style.align {
             crate::text::TextAlign::Left => "start",
@@ -338,10 +340,32 @@ impl Renderer for SvgRenderer {
             Some(h) => format!(r#" style="line-height:{:.2}""#, h),
             None => String::new(),
         };
+        // 可选排版属性：字宽（font-stretch）、字间距（letter-spacing）、
+        // 文本装饰（下划线 / 删除线，按 style 块级默认值输出）。
+        let fwidth = match style.font_width {
+            Some(w) => format!(r#" font-stretch="{:.0}%""#, w * 100.0),
+            None => String::new(),
+        };
+        let letter = if style.letter_spacing != 0.0 {
+            format!(r#" letter-spacing="{:.2}""#, style.letter_spacing)
+        } else {
+            String::new()
+        };
+        let decoration: Vec<&str> = match (style.underline, style.strikethrough) {
+            (true, true) => vec!["underline", "line-through"],
+            (true, false) => vec!["underline"],
+            (false, true) => vec!["line-through"],
+            (false, false) => vec![],
+        };
+        let deco = if decoration.is_empty() {
+            String::new()
+        } else {
+            format!(r#" text-decoration="{}""#, decoration.join(" "))
+        };
         let mut el = String::new();
         let _ = write!(
             el,
-            r#"<text x="{:.2}" y="{:.2}" text-anchor="{}" dominant-baseline="{}" font-family="{}" font-size="{:.2}" font-style="{}" font-weight="{:.0}" fill="{}"{}{}>{}</text>"#,
+            r#"<text x="{:.2}" y="{:.2}" text-anchor="{}" dominant-baseline="{}" font-family="{}" font-size="{:.2}" font-style="{}" font-weight="{:.0}" fill="{}"{}{}{}{}{}>{}</text>"#,
             position.x,
             position.y,
             anchor,
@@ -351,9 +375,12 @@ impl Renderer for SvgRenderer {
             fstyle,
             style.font_weight,
             style.color.to_hex(),
+            fwidth,
+            letter,
+            deco,
             lh,
             rot,
-            escape_text(content)
+            escape_text(&content)
         );
         self.buf.push_str(&el);
         self.buf.push('\n');
@@ -881,18 +908,22 @@ mod tests {
 
     #[test]
     fn prelaid_text_ignores_layout_in_svg() {
+        use crate::text::RichSpan;
         use crate::text::measure_text;
         let mut scene = Scene::new(100.0, 100.0);
         let style = TextStyle::new(Color::BLACK, 12.0, "sans-serif");
-        let m = measure_text("hello", &style, None);
+        let m = measure_text(
+            std::slice::from_ref(&RichSpan::new("hello", style.clone())),
+            None,
+        );
         scene.push(Element::Text {
-            content: "hello".into(),
+            spans: vec![RichSpan::new("hello", style.clone())],
             position: Point::new(1.0, 2.0),
             style,
             layout: Some(m.layout),
         });
         let out = render(&scene);
-        // SVG 用 content 输出 <text>，与预排版 layout 无关。
+        // SVG 从 spans 拼接纯文本输出 <text>，与预排版 layout 无关。
         assert!(out.contains(">hello</text>"));
         assert!(!out.contains("path"));
     }
@@ -915,6 +946,23 @@ mod tests {
         assert!(out.contains(r#"font-family="'Helvetica Neue', 'Rock &amp; Roll', sans-serif""#));
         // 单引号族名不应被 XML 转义（单引号在双引号属性内安全）
         assert!(!out.contains("&apos;"));
+    }
+
+    #[test]
+    fn text_decoration_spacing_stretch_emitted() {
+        use crate::text::TextStyle;
+        let mut scene = Scene::new(100.0, 100.0);
+        let style = TextStyle::new(Color::BLACK, 12.0, "sans-serif")
+            .with_underline(true)
+            .with_strikethrough(true)
+            .with_letter_spacing(2.0)
+            .with_font_width(0.75);
+        scene.push(Element::text("x", Point::new(1.0, 2.0), style));
+        let out = render(&scene);
+        // 装饰 / 间距 / 字宽作为 SVG 属性输出。
+        assert!(out.contains(r#"text-decoration="underline line-through""#));
+        assert!(out.contains(r#"letter-spacing="2.00""#));
+        assert!(out.contains(r#"font-stretch="75%""#));
     }
 
     #[test]

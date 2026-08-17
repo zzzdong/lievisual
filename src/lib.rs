@@ -15,8 +15,9 @@
 //!   圆弧、扇形、路径、渐变路径、文本、组合（Group），覆盖图表/流程图/Markdown 常见需求。
 //! - **填充多样**：纯色、线性渐变、径向渐变（[`scene::Fill`]）；描边支持线帽/连接、
 //!   虚线（`dash_array` / `dash_offset`）与 `miter_limit`。
-//! - **文本双形态**：[`scene::Element::Text`] 既支持纯文本 + 样式，也支持预排版的
-//!   [`text::TextLayout`]（可选）。栅格后端用 layout 精确绘字形，SVG 后端回退到 `<text>`。
+//! - **文本（富文本核心）**：[`scene::Element::Text`] 以样式化片段 [`text::RichSpan`] 为核心，
+//!   排版 / 测量统一走 `&[RichSpan]` 入口（[`text::measure_text`] / [`text::layout_text`]）；
+//!   可携带预排版 [`text::TextLayout`]。栅格后端用 layout 精确绘字形，SVG 后端回退到 `<text>`。
 //!
 //! ## 后端支持（默认全部启用，无 feature gate）
 //! - [`render::SvgRenderer`]：输出矢量 SVG 字符串，支持场景元数据（`title` / `description`
@@ -34,7 +35,6 @@ pub use scene::{
     RadialGradient, Scene, SceneNode, Stroke,
 };
 pub use text::{
-    compute_text_offset, create_text_layout, create_text_layout_with_contexts, FontSource,
-    FontStyle, layout_text, layout_text_with_contexts, register_font, TextAlign, TextBaseline,
-    TextLayout, TextMeasure, TextMetrics, TextStyle, with_text_contexts,
+    FontSource, FontStyle, RichSpan, TextAlign, TextBaseline, TextLayout, TextMeasure, TextMetrics,
+    TextStyle, compute_text_offset, layout_metrics, layout_text, measure_text, register_font,
 };

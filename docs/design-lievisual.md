@@ -68,11 +68,29 @@ src/
 
 | Canvas | lievisual |
 |--------|-----------|
-| `ctx.font` | `TextStyle`（`font_family`/`font_size`/`font_weight`/`font_style`/`line_height`） |
+| `ctx.font` | `TextStyle`（`font_family`/`font_size`/`font_weight`/`font_style`/`font_width`/`line_height`） |
 | `ctx.textAlign` | [`TextAlign`]（Left/Center/Right） |
 | `ctx.textBaseline` | [`TextBaseline`]（Top/Hanging/Middle/Alphabetic/Ideographic/Bottom） |
 | `ctx.measureText()` | [`measure_text`] → [`TextMeasure`]（含 [`TextMetrics`]） |
 | `ctx.fillText(x, y)` | `Element::Text { position, .. }`：`x` 由 `align` 决定，`y` 由 `baseline` 决定 |
+
+**富文本（Rich Text，核心表达）**：文本内容统一以样式化片段 [`RichSpan`]（文本 + 样式）为
+核心，单文本是单个片段的特例，富文本是多个片段按序拼接。排版 / 测量统一走 span 列表入口：
+- [`measure_text`] / [`layout_text`]：接受 `&[RichSpan]`，经统一 TLS 上下文将多段不同样式的
+  文本合并为一个 `TextLayout`；`TextStyle` 提供**对齐 Pango 的能力**，每段可独立设置：
+  - 字体族 / 字号 / 字重 / 风格 / **字宽（font-stretch）**
+  - 前景色（`color`）
+  - **下划线（`underline` + `underline_color`）** / **删除线（`strikethrough` + `strikethrough_color`）**
+  - **字间距（`letter_spacing`）** / 行高（`line_height`）
+- [`crate::scene::Element::Text`] 携带 `spans`（样式化片段）与块级 `style`（定位/默认字体），
+  纯文本由 `spans` 拼接推导（SVG 后端），保证与 vello 后端字形一致；
+- 富文本布局可喂给渲染端精确绘字形，也可与 [`compute_text_offset`] 配合实现任意对齐；
+- 依赖 parley（同为 Pango 的 Rust 移植）→ 上述能力经 parley `StyleProperty` 映射到同一排版引擎。
+
+**与 Pango 的能力边界**：lievisual 的 span 数组已覆盖 Pango markup 的绝大多数字形级属性
+（family/size/style/weight/stretch/foreground/underline/strikethrough/letter_spacing）。
+Pango 独有而 parley 0.11 尚未提供的：`rise`（上标/下标）与文本背景色 `background` —— 这两项
+为硬限制，需在 lievisual 侧手工模拟（如装饰线条 / 上升偏移），不在本模块直接支持。
 
 **锚点语义**：水平锚点由 `align` 决定（左/中/右），垂直锚点由 `baseline` 决定
 （默认 `Alphabetic`，即 `position.y` 是基线——与 canvas 默认一致）。两端后端同步实现：
