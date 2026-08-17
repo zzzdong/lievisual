@@ -34,6 +34,7 @@ pub use scene::{
     RadialGradient, Scene, SceneNode, Stroke,
 };
 pub use text::{
-    FontStyle, TextAlign, TextBaseline, TextLayout, TextMeasure, TextMetrics, TextStyle,
-    measure_text,
+    compute_text_offset, create_text_layout, create_text_layout_with_contexts, FontSource,
+    FontStyle, layout_text, layout_text_with_contexts, register_font, TextAlign, TextBaseline,
+    TextLayout, TextMeasure, TextMetrics, TextStyle, with_text_contexts,
 };

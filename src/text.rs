@@ -266,8 +266,11 @@ fn is_css_ident(s: &str) -> bool {
 
 pub type TextLayout = parley::Layout<Color>; // brush = lievisual 的 Color（自动满足 parley::Brush）
 
-pub(crate) use measure::layout_text;
-pub use measure::{layout_metrics, measure_text};
+pub use measure::{
+    compute_text_offset, create_text_layout, create_text_layout_with_contexts, layout_metrics,
+    layout_text, layout_text_with_contexts, measure_text, register_font, FontSource,
+    with_text_contexts,
+};
 
 /// 文本测量结果（canvas `measureText()` 返回值）。
 ///
@@ -319,6 +322,7 @@ pub struct TextMeasure {
 
 mod measure {
     use super::*;
+    use parley::style::FontFamily;
     use parley::{FontContext, LayoutContext, StyleProperty};
     use std::cell::RefCell;
     use std::sync::Arc;
@@ -366,12 +370,113 @@ mod measure {
     ///
     /// 与 [`measure_text`] 共享同一 TLS 上下文；供渲染端等"只要 layout"的场景复用，
     /// 避免重复排版。`style.max_width` 作为换行上限。
-    pub(crate) fn layout_text(
-        content: &str,
+    pub fn layout_text(content: &str, style: &TextStyle, max_width: Option<f64>) -> Arc<TextLayout> {
+        with_cached_context(|fc, lc| Arc::new(build_layout(fc, lc, content, style, max_width)))
+    }
+
+    /// 创建文本布局。
+    ///
+    /// 使用 parley 以**左对齐**排版文本，返回布局以获取自然宽度/高度。
+    /// 组件的对齐（居中、右对齐等）应在拿到 layout 尺寸后由 [`compute_text_offset`]
+    /// 手动计算位置偏移。
+    pub fn create_text_layout(
+        text: &str,
+        font_config: &TextStyle,
+        max_width: Option<f64>,
+    ) -> TextLayout {
+        with_cached_context(|font_cx, layout_cx| {
+            create_text_layout_with_contexts(text, font_config, max_width, font_cx, layout_cx)
+        })
+    }
+
+    /// 使用指定的上下文创建文本布局（[`create_text_layout`] 的上下文复用版本）。
+    pub fn create_text_layout_with_contexts(
+        text: &str,
         style: &TextStyle,
         max_width: Option<f64>,
-    ) -> Arc<TextLayout> {
-        with_cached_context(|fc, lc| Arc::new(build_layout(fc, lc, content, style, max_width)))
+        font_cx: &mut FontContext,
+        layout_cx: &mut LayoutContext<Color>,
+    ) -> TextLayout {
+        let mut layout = build_layout(font_cx, layout_cx, text, style, max_width);
+        // 始终左对齐：parley 不做居中/右对齐，组件的对齐由 compute_text_offset 或手动计算实现。
+        layout.align(parley::Alignment::Start, parley::AlignmentOptions::default());
+        layout
+    }
+
+    /// 将多段不同样式的文本合并在一个 `TextLayout` 中。
+    ///
+    /// 每段文本可以有自己的 `TextStyle`（字体、字号、颜色）。所有文本按顺序直接拼接，
+    /// 通过 parley 的 `RangedBuilder` 为各段应用不同样式；需要换行时请自行包含 `\n`。
+    /// 最终返回单一 `TextLayout`，支持断行和多行对齐。
+    pub fn layout_text_with_contexts(
+        texts: &[(&str, &TextStyle)],
+        max_width: Option<f64>,
+        align: TextAlign,
+        font_cx: &mut FontContext,
+        layout_cx: &mut LayoutContext<Color>,
+    ) -> TextLayout {
+        if texts.is_empty() {
+            return create_text_layout_with_contexts(
+                "",
+                &TextStyle::new(Color::BLACK, 12.0, "sans-serif"),
+                max_width,
+                font_cx,
+                layout_cx,
+            );
+        }
+
+        let mut combined = String::new();
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(texts.len());
+        for (text, _) in texts {
+            let start = combined.len();
+            combined.push_str(text);
+            let end = combined.len();
+            ranges.push((start, end));
+        }
+
+        let mut builder = layout_cx.ranged_builder(font_cx, &combined, 1.0, true);
+
+        let first_style = &texts[0].1;
+        builder.push_default(StyleProperty::FontFamily(FontFamily::named(&first_style.font_family)));
+        builder.push_default(StyleProperty::FontSize(first_style.font_size as f32));
+        builder.push_default(StyleProperty::Brush(first_style.color));
+
+        for (i, (_, style)) in texts.iter().enumerate().skip(1) {
+            let (start, end) = ranges[i];
+            if start >= end {
+                continue;
+            }
+            if style.font_family != first_style.font_family {
+                builder.push(
+                    StyleProperty::FontFamily(FontFamily::named(&style.font_family)),
+                    start..end,
+                );
+            }
+            if (style.font_size - first_style.font_size).abs() > f64::EPSILON {
+                builder.push(StyleProperty::FontSize(style.font_size as f32), start..end);
+            }
+            if style.color != first_style.color {
+                builder.push(StyleProperty::Brush(style.color), start..end);
+            }
+        }
+
+        let mut layout = builder.build(&combined);
+        layout.break_all_lines(max_width.map(|w| w as f32));
+
+        let paragraph_align = match align {
+            TextAlign::Left => parley::Alignment::Start,
+            TextAlign::Center => parley::Alignment::Center,
+            TextAlign::Right => parley::Alignment::End,
+        };
+        layout.align(paragraph_align, parley::AlignmentOptions::default());
+        layout
+    }
+
+    /// 同时访问两个上下文的便捷函数（供需要复用 TLS 上下文的高级调用方）。
+    pub fn with_text_contexts<R, F: FnOnce(&mut FontContext, &mut LayoutContext<Color>) -> R>(
+        f: F,
+    ) -> R {
+        with_cached_context(f)
     }
 
     /// 从已排版 layout 提取度量（canvas `TextMetrics`）。
@@ -451,6 +556,84 @@ mod measure {
         // 最大宽度作为换行上限；无限制时传 None。
         layout.break_all_lines(max_width.map(|w| w as f32));
         layout
+    }
+
+    /// 字体来源。
+    #[derive(Debug, Clone)]
+    pub enum FontSource {
+        /// 从文件路径加载。
+        Path(std::path::PathBuf),
+        /// 从内存数据加载。
+        Memory(Vec<u8>),
+    }
+
+    /// 注册自定义字体到全局字体上下文。
+    ///
+    /// 加载后的字体可通过 `font_family` 名称在文本样式中使用。
+    /// 由于所有排版统一走本 crate 的线程本地上下文，注册一次即可被测量与渲染共享。
+    pub fn register_font(
+        source: FontSource,
+        family_name_override: Option<&str>,
+    ) -> Result<(), String> {
+        use parley::fontique::Blob;
+        use std::sync::Arc;
+
+        let data = match source {
+            FontSource::Path(path) => {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| format!("Failed to read font file: {e}"))?;
+                Blob::new(Arc::new(bytes))
+            }
+            FontSource::Memory(bytes) => Blob::new(Arc::new(bytes)),
+        };
+
+        let override_info = family_name_override.map(|name| parley::fontique::FontInfoOverride {
+            family_name: Some(name),
+            ..Default::default()
+        });
+
+        with_cached_context(|font_cx, _| {
+            font_cx.collection.register_fonts(data, override_info);
+        });
+        Ok(())
+    }
+
+    /// 从锚点到文本块左上角的偏移量。
+    ///
+    /// 根据期望的对齐/基线方式，计算从锚点坐标到文本块左上角的偏移。
+    /// 组件使用范式：先 [`create_text_layout`] 拿到 layout，再 [`compute_text_offset`]
+    /// 计算偏移，将锚点加上偏移即为文本块左上角（绘制时 TextRun 用 Left/Top）。
+    pub fn compute_text_offset(
+        layout: &TextLayout,
+        align: TextAlign,
+        baseline: TextBaseline,
+    ) -> (f64, f64) {
+        let layout_width = layout.width() as f64;
+        let layout_height = layout.height() as f64;
+
+        let x_offset = match align {
+            TextAlign::Left => 0.0,
+            TextAlign::Center => -layout_width / 2.0,
+            TextAlign::Right => -layout_width,
+        };
+
+        let y_offset = match baseline {
+            TextBaseline::Top => 0.0,
+            TextBaseline::Middle => -layout_height / 2.0,
+            TextBaseline::Bottom => -layout_height,
+            TextBaseline::Alphabetic => {
+                let first_line = layout.lines().next();
+                if let Some(line) = first_line {
+                    let line_metrics = line.metrics();
+                    -line_metrics.ascent as f64
+                } else {
+                    -layout_height * 0.8
+                }
+            }
+            _ => -layout_height * 0.8,
+        };
+
+        (x_offset, y_offset)
     }
 }
 
