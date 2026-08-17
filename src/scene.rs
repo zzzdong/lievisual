@@ -19,6 +19,90 @@ use crate::render::Renderer;
 use crate::text::{RichSpan, TextLayout};
 use kurbo::BezPath;
 
+/// 图片在目标框（`Element::Image.frame`，pt/px 坐标）内的适应方式。
+///
+/// 与 liepress 的 [`crate::document::types::ObjectFit`] 一一对应，但作为
+/// lievisual IR 的自包含枚举，避免渲染层依赖文档层。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObjectFit {
+    /// 等比缩放，完整显示（可能在框内留白）。对应 SVG `meet`。
+    #[default]
+    Contain,
+    /// 等比缩放，填满框并裁剪溢出部分。对应 SVG `slice`。
+    Cover,
+    /// 拉伸填满框（可能变形）。
+    Fill,
+    /// 不缩放，按原始像素尺寸放置于框左上角（可能溢出或留白）。
+    None,
+}
+
+/// 场景中的图片资源（自包含二进制）。
+///
+/// 持有原始编码字节与像素尺寸，由渲染后端负责解码与绘制。
+/// `frame` 为显示区域（在 [`Element::Image`] 中给出），`object_fit` 决定
+/// 图片如何映射到 `frame`。
+#[derive(Debug, Clone)]
+pub struct SceneImage {
+    /// 原始图片字节（png/jpeg/... 等编码格式）。
+    pub data: Vec<u8>,
+    /// 格式标签（如 "png" / "jpeg" / "webp"），用于选择解码器与 SVG mime。
+    pub format: String,
+    /// 原始像素宽。
+    pub width: u32,
+    /// 原始像素高。
+    pub height: u32,
+    /// 适应方式。
+    pub object_fit: ObjectFit,
+}
+
+impl SceneImage {
+    /// 构造（自动推导默认 `object_fit = Contain`）。
+    #[must_use]
+    pub fn new(data: Vec<u8>, format: impl Into<String>, width: u32, height: u32) -> Self {
+        Self {
+            data,
+            format: format.into(),
+            width,
+            height,
+            object_fit: ObjectFit::Contain,
+        }
+    }
+
+    /// 设置适应方式。
+    #[must_use]
+    pub fn with_object_fit(mut self, fit: ObjectFit) -> Self {
+        self.object_fit = fit;
+        self
+    }
+
+    /// SVG 输出用的 mime 类型（由 `format` 推导）。
+    #[must_use]
+    pub fn mime(&self) -> &'static str {
+        match self.format.to_ascii_lowercase().as_str() {
+            "png" => "image/png",
+            "jpeg" | "jpg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "bmp" => "image/bmp",
+            _ => "image/png",
+        }
+    }
+
+    /// SVG 输出用的 `preserveAspectRatio` 片段（无前缀）。
+    ///
+    /// `None` 配合 `"none"` + SVG 侧原始像素宽高，实现"不缩放、左上角"。
+    #[must_use]
+    pub fn preserve_aspect_ratio(&self) -> &'static str {
+        match self.object_fit {
+            ObjectFit::Contain => "xMidYMid meet",
+            ObjectFit::Cover => "xMidYMid slice",
+            ObjectFit::Fill => "none",
+            ObjectFit::None => "none",
+        }
+    }
+}
+
 /// 一个完整的可渲染场景。
 #[derive(Debug, Clone)]
 pub struct Scene {
@@ -390,18 +474,18 @@ impl Clip {
         match self {
             Clip::Rect(rect) => {
                 let mut p = BezPath::new();
-                p.move_to((rect.x, rect.y));
-                p.line_to((rect.x + rect.width, rect.y));
-                p.line_to((rect.x + rect.width, rect.y + rect.height));
-                p.line_to((rect.x, rect.y + rect.height));
+                p.move_to((rect.min_x(), rect.min_y()));
+                p.line_to((rect.max_x(), rect.min_y()));
+                p.line_to((rect.max_x(), rect.max_y()));
+                p.line_to((rect.min_x(), rect.max_y()));
                 p.close_path();
                 p
             }
             Clip::RoundedRect { rect, radius } => kurbo::RoundedRect::new(
-                rect.x,
-                rect.y,
-                rect.x + rect.width,
-                rect.y + rect.height,
+                rect.min_x(),
+                rect.min_y(),
+                rect.max_x(),
+                rect.max_y(),
                 *radius,
             )
             .to_path(0.1),
@@ -640,6 +724,19 @@ pub enum Element {
         /// true 表示闭合路径（用于填充）。
         closed: bool,
     },
+    /// 图片：自包含二进制资源 + 显示框（pt/px 坐标）。
+    ///
+    /// - `image`：图片字节与原始像素尺寸、适应方式（见 [`SceneImage`]）；
+    /// - `frame`：显示区域，后端按 `image.object_fit` 将图片映射到该框；
+    /// - `opacity`：整体透明度（0–1），默认 1.0。
+    ///
+    /// - SVG：`<image>` 标签（`data:` URI + `preserveAspectRatio`）；
+    /// - vello：解码为位图后以 image paint 绘制（受 `object_fit` 与 `frame` 裁剪）。
+    Image {
+        image: SceneImage,
+        frame: Rect,
+        opacity: f64,
+    },
     /// 带渐变填充的路径。
     GradientPath {
         path: BezPath,
@@ -785,6 +882,18 @@ impl Element {
             layout: None,
         }
     }
+
+    /// 图片图元：`image` 为自包含资源，`frame` 为显示区域（pt/px 坐标）。
+    ///
+    /// `opacity` 默认 1.0；`object_fit` 由 [`SceneImage::object_fit`] 控制。
+    #[must_use]
+    pub fn image(image: SceneImage, frame: Rect) -> Self {
+        Self::Image {
+            image,
+            frame,
+            opacity: 1.0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -794,7 +903,7 @@ mod tests {
     /// 构造一个 x 坐标可区分、z_index 可指定的矩形节点（用于稳定性断言）。
     fn rect_node(x: f64, z: i32) -> SceneNode {
         SceneNode::new(Element::rect(
-            Rect::new(x, 0.0, 1.0, 1.0),
+            Rect::new(x, 0.0, x + 1.0, 1.0),
             FillStrokeStyle::fill(Color::BLACK),
         ))
         .with_z(z)
@@ -802,7 +911,7 @@ mod tests {
 
     fn rect_x(node: &SceneNode) -> f64 {
         match &node.element {
-            Element::Rect { rect, .. } => rect.x,
+            Element::Rect { rect, .. } => rect.min_x(),
             _ => panic!("expected rect"),
         }
     }
@@ -993,8 +1102,9 @@ mod tests {
 
         #[test]
         fn rect_center_helper() {
+            // kurbo Rect::new(x0, y0, x1, y1)；origin(2,4) 宽10 高6 → (2,4)-(12,10)。
             assert_eq!(
-                Rect::new(2.0, 4.0, 10.0, 6.0).center(),
+                Rect::new(2.0, 4.0, 12.0, 10.0).center(),
                 Point::new(7.0, 7.0)
             );
         }
@@ -1144,6 +1254,76 @@ mod tests {
             assert!(!l2.visible);
             assert_eq!(l2.opacity, 0.5);
             assert_eq!(l2.transform, Some(Transform::translate(1.0, 2.0)));
+        }
+    }
+
+    /// 图片资源：SceneImage 的 mime / object-fit 映射。
+    mod image {
+        use super::*;
+
+        #[test]
+        fn mime_by_format() {
+            for (fmt, expect) in [
+                ("png", "image/png"),
+                ("jpeg", "image/jpeg"),
+                ("jpg", "image/jpeg"),
+                ("gif", "image/gif"),
+                ("webp", "image/webp"),
+                ("svg", "image/svg+xml"),
+                ("bmp", "image/bmp"),
+                ("PNG", "image/png"),
+            ] {
+                let img = SceneImage::new(vec![], fmt, 1, 1);
+                assert_eq!(img.mime(), expect, "format={fmt}");
+            }
+        }
+
+        #[test]
+        fn preserve_aspect_ratio_mapping() {
+            let base = SceneImage::new(vec![], "png", 10, 10);
+            assert_eq!(base.preserve_aspect_ratio(), "xMidYMid meet");
+            assert_eq!(
+                base.clone()
+                    .with_object_fit(ObjectFit::Cover)
+                    .preserve_aspect_ratio(),
+                "xMidYMid slice"
+            );
+            assert_eq!(
+                base.clone()
+                    .with_object_fit(ObjectFit::Fill)
+                    .preserve_aspect_ratio(),
+                "none"
+            );
+            assert_eq!(
+                base.clone()
+                    .with_object_fit(ObjectFit::None)
+                    .preserve_aspect_ratio(),
+                "none"
+            );
+        }
+
+        #[test]
+        fn default_object_fit_is_contain() {
+            let img = SceneImage::new(vec![], "png", 1, 1);
+            assert_eq!(img.object_fit, ObjectFit::Contain);
+        }
+
+        #[test]
+        fn image_element_constructs() {
+            let img = SceneImage::new(vec![0, 1, 2], "png", 4, 4);
+            let el = Element::image(img, Rect::new(0.0, 0.0, 10.0, 10.0));
+            match &el {
+                Element::Image {
+                    image,
+                    frame,
+                    opacity,
+                } => {
+                    assert_eq!(image.width, 4);
+                    assert_eq!(frame.width(), 10.0);
+                    assert_eq!(*opacity, 1.0);
+                }
+                _ => panic!("expected image"),
+            }
         }
     }
 }

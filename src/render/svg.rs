@@ -126,7 +126,10 @@ impl Renderer for SvgRenderer {
         let _ = write!(
             el,
             r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" "#,
-            rect.x, rect.y, rect.width, rect.height
+            rect.min_x(),
+            rect.min_y(),
+            rect.width(),
+            rect.height()
         );
         self.apply_fill_stroke(&mut el, style);
         let _ = writeln!(el, "/>");
@@ -171,7 +174,11 @@ impl Renderer for SvgRenderer {
         let _ = write!(
             el,
             r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="{:.2}" "#,
-            rect.x, rect.y, rect.width, rect.height, radius
+            rect.min_x(),
+            rect.min_y(),
+            rect.width(),
+            rect.height(),
+            radius
         );
         self.apply_fill_stroke(&mut el, style);
         let _ = writeln!(el, "/>");
@@ -302,14 +309,16 @@ impl Renderer for SvgRenderer {
         spans: &[crate::text::RichSpan],
         position: Point,
         style: &TextStyle,
-        _layout: Option<&crate::text::TextLayout>,
+        layout: Option<&crate::text::TextLayout>,
     ) {
-        // SVG 使用原生 <text>，由浏览器排版；忽略 parley layout。
+        // SVG 使用原生 <text>，由浏览器排版；layout 仅用于背景矩形的精确尺寸。
         // 纯文本由 spans 拼接推导，保证与 vello 后端的字形内容一致。
         let content = spans.iter().map(|s| s.text.as_str()).collect::<String>();
+        // 预排版 layout 可提供文本块精确尺寸；无则回退到近似。
+        let metrics = layout.map(crate::text::layout_metrics);
         // 锚点：text-anchor（水平，对应 align）+ dominant-baseline（垂直，对应 baseline）。
         let anchor = match style.align {
-            crate::text::TextAlign::Left => "start",
+            crate::text::TextAlign::Left | crate::text::TextAlign::Justify => "start",
             crate::text::TextAlign::Center => "middle",
             crate::text::TextAlign::Right => "end",
         };
@@ -362,10 +371,55 @@ impl Renderer for SvgRenderer {
         } else {
             format!(r#" text-decoration="{}""#, decoration.join(" "))
         };
+        // 基线偏移（上下标）：baseline-shift 正数=上移（上标），负数=下移（下标）。
+        let bshift = if style.baseline_shift != 0.0 {
+            format!(r#" baseline-shift="{:.2}px""#, -style.baseline_shift)
+        } else {
+            String::new()
+        };
+        // 文本背景（行内高亮）：优先用预排版 layout 的精确宽高；无 layout 时回退近似。
+        // 宽 = metrics.width（有 layout）或 字符数×0.6×font-size；高 = metrics.height 或 font-size×1.3。
+        if let Some(bg) = style.background_color {
+            let (w, h) = match &metrics {
+                Some(m) => (m.width, m.height),
+                None => {
+                    let avg_w = style.font_size * 0.6;
+                    (
+                        (content.chars().count() as f64 * avg_w).max(avg_w),
+                        style.font_size * 1.3,
+                    )
+                }
+            };
+            let (rx, ry) = match style.baseline {
+                crate::text::TextBaseline::Top | crate::text::TextBaseline::Hanging => {
+                    (position.x, position.y)
+                }
+                crate::text::TextBaseline::Middle => (position.x, position.y - h / 2.0),
+                crate::text::TextBaseline::Alphabetic | crate::text::TextBaseline::Ideographic => {
+                    (position.x, position.y - style.font_size * 0.85)
+                }
+                crate::text::TextBaseline::Bottom => (position.x, position.y - h),
+            };
+            // 右对齐时背景向左扩展。
+            let bx = match style.align {
+                crate::text::TextAlign::Right => rx - w,
+                crate::text::TextAlign::Center => rx - w / 2.0,
+                crate::text::TextAlign::Left | crate::text::TextAlign::Justify => rx,
+            };
+            self.buf.push_str(&format!(
+                r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="{}"/>"#,
+                bx,
+                ry - style.baseline_shift,
+                w,
+                h,
+                bg.to_hex()
+            ));
+            self.buf.push('\n');
+        }
         let mut el = String::new();
         let _ = write!(
             el,
-            r#"<text x="{:.2}" y="{:.2}" text-anchor="{}" dominant-baseline="{}" font-family="{}" font-size="{:.2}" font-style="{}" font-weight="{:.0}" fill="{}"{}{}{}{}{}>{}</text>"#,
+            r#"<text x="{:.2}" y="{:.2}" text-anchor="{}" dominant-baseline="{}" font-family="{}" font-size="{:.2}" font-style="{}" font-weight="{:.0}" fill="{}"{}{}{}{}{}{}>{}</text>"#,
             position.x,
             position.y,
             anchor,
@@ -380,7 +434,37 @@ impl Renderer for SvgRenderer {
             deco,
             lh,
             rot,
+            bshift,
             escape_text(&content)
+        );
+        self.buf.push_str(&el);
+        self.buf.push('\n');
+    }
+
+    fn draw_image(&mut self, image: &crate::SceneImage, frame: Rect, opacity: f64) {
+        // 编码为 data: URI（base64）并输出 <image>，由浏览器负责解码与 object-fit。
+        let b64 = base64_encode(&image.data);
+        let data_uri = format!("data:{};base64,{}", image.mime(), b64);
+        let op = if (opacity - 1.0).abs() > 1e-6 {
+            format!(r#" opacity="{:.3}""#, opacity)
+        } else {
+            String::new()
+        };
+        // preserveAspectRatio 控制 object-fit；x/y/width/height 为显示框。
+        // None：不缩放，用原始像素尺寸放框左上角。
+        let (w, h) = match image.object_fit {
+            crate::ObjectFit::None => (image.width as f64, image.height as f64),
+            _ => (frame.width(), frame.height()),
+        };
+        let el = format!(
+            r#"<image x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" href="{}" preserveAspectRatio="{}"{}/>"#,
+            frame.min_x(),
+            frame.min_y(),
+            w,
+            h,
+            data_uri,
+            image.preserve_aspect_ratio(),
+            op
         );
         self.buf.push_str(&el);
         self.buf.push('\n');
@@ -423,11 +507,18 @@ impl Renderer for SvgRenderer {
         let inner = match clip {
             crate::scene::Clip::Rect(rect) => format!(
                 r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}"/>"#,
-                rect.x, rect.y, rect.width, rect.height
+                rect.min_x(),
+                rect.min_y(),
+                rect.width(),
+                rect.height()
             ),
             crate::scene::Clip::RoundedRect { rect, radius } => format!(
                 r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="{:.2}"/>"#,
-                rect.x, rect.y, rect.width, rect.height, radius
+                rect.min_x(),
+                rect.min_y(),
+                rect.width(),
+                rect.height(),
+                radius
             ),
             crate::scene::Clip::Circle { center, radius } => format!(
                 r#"<circle cx="{:.2}" cy="{:.2}" r="{:.2}"/>"#,
@@ -623,6 +714,32 @@ fn escape_attr(s: &str) -> String {
     escape_text(s).replace('"', "&quot;")
 }
 
+/// 最小化 base64 编码（用于 SVG `data:` URI），避免引入额外依赖。
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,7 +776,7 @@ mod tests {
             FillStrokeStyle::fill(Color::BLACK),
         ));
         scene.push(Element::rounded_rect(
-            Rect::new(50.0, 50.0, 40.0, 20.0),
+            Rect::new(50.0, 50.0, 90.0, 70.0),
             5.0,
             FillStrokeStyle::fill(Color::BLACK),
         ));
@@ -748,7 +865,7 @@ mod tests {
         );
         scene.push_node(
             SceneNode::new(Element::rect(
-                Rect::new(20.0, 0.0, 10.0, 10.0),
+                Rect::new(20.0, 0.0, 30.0, 10.0),
                 FillStrokeStyle::fill(Color::BLACK),
             ))
             .with_visible(false),
@@ -984,5 +1101,124 @@ mod tests {
         ));
         // 应有 <g clip-path="url(#clip0)"> 包裹
         assert!(out.contains(r#"<g clip-path="url(#clip0)">"#));
+    }
+
+    #[test]
+    fn base64_encode_standard_vectors() {
+        // RFC 4648 测试向量。
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn image_emits_data_uri_and_contain_meet() {
+        use crate::SceneImage;
+        let mut scene = Scene::new(100.0, 100.0);
+        let img = SceneImage::new(vec![1, 2, 3], "png", 4, 4); // Contain 默认
+        scene.push(Element::image(img, Rect::new(0.0, 0.0, 10.0, 20.0)));
+        let out = render(&scene);
+        // data:image/png;base64,AQID (1,2,3)
+        assert!(out.contains(r#"href="data:image/png;base64,AQID""#));
+        assert!(out.contains(r#"width="10.00" height="20.00""#));
+        assert!(out.contains(r#"preserveAspectRatio="xMidYMid meet""#));
+    }
+
+    #[test]
+    fn image_object_fit_none_uses_raw_pixel_size() {
+        use crate::SceneImage;
+        let mut scene = Scene::new(100.0, 100.0);
+        let img = SceneImage::new(vec![1], "png", 30, 40).with_object_fit(crate::ObjectFit::None);
+        scene.push(Element::image(img, Rect::new(5.0, 6.0, 105.0, 106.0)));
+        let out = render(&scene);
+        // None：preserveAspectRatio="none" 且 width/height 用原始像素尺寸（30x40）。
+        assert!(out.contains(r#"x="5.00" y="6.00" width="30.00" height="40.00""#));
+        assert!(out.contains(r#"preserveAspectRatio="none""#));
+    }
+
+    #[test]
+    fn image_object_fit_fill_maps_to_none() {
+        use crate::SceneImage;
+        let mut scene = Scene::new(100.0, 100.0);
+        let img = SceneImage::new(vec![1], "png", 10, 10).with_object_fit(crate::ObjectFit::Fill);
+        scene.push(Element::image(img, Rect::new(0.0, 0.0, 10.0, 10.0)));
+        let out = render(&scene);
+        // Fill：用 frame 尺寸 + preserveAspectRatio="none"。
+        assert!(out.contains(r#"width="10.00" height="10.00""#));
+        assert!(out.contains(r#"preserveAspectRatio="none""#));
+    }
+
+    #[test]
+    fn image_respects_opacity() {
+        use crate::SceneImage;
+        let mut scene = Scene::new(100.0, 100.0);
+        let img = SceneImage::new(vec![1], "png", 10, 10);
+        scene.push_node(
+            SceneNode::from(Element::image(img, Rect::new(0.0, 0.0, 10.0, 10.0))).with_opacity(0.5),
+        );
+        let out = render(&scene);
+        assert!(out.contains(r#"opacity="0.500""#));
+    }
+
+    #[test]
+    fn text_baseline_shift_and_background_emitted() {
+        use crate::text::TextStyle;
+        let mut scene = Scene::new(200.0, 100.0);
+        // 上标：baseline_shift 正 → baseline-shift 负（上移）。
+        let sup = TextStyle::new(Color::BLACK, 12.0, "sans-serif").with_baseline_shift(6.0);
+        scene.push(Element::text("x²", Point::new(10.0, 50.0), sup));
+        // 行内背景：输出背景 <rect>。
+        let code = TextStyle::new(Color::BLACK, 12.0, "sans-serif")
+            .with_background_color(Some(Color::rgb(0xf0, 0xf0, 0xf0)));
+        scene.push(Element::text("code", Point::new(30.0, 50.0), code));
+        let out = render(&scene);
+        assert!(out.contains("baseline-shift=\"-6.00px\""));
+        assert!(out.contains("<rect "));
+        assert!(out.contains("fill=\"#f0f0f0\""));
+    }
+
+    #[test]
+    fn text_background_uses_layout_exact_size() {
+        use crate::text::{measure_text, RichSpan, TextStyle};
+        let style = TextStyle::new(Color::BLACK, 12.0, "sans-serif")
+            .with_background_color(Some(Color::rgb(0xf0, 0xf0, 0xf0)));
+        let m = measure_text(
+            std::slice::from_ref(&RichSpan::new("code", style.clone())),
+            None,
+        );
+        // 提供预排版 layout → 背景 <rect> 应使用精确的 layout 宽度。
+        let mut scene = Scene::new(200.0, 100.0);
+        scene.push(Element::Text {
+            spans: vec![RichSpan::new("code", style.clone())],
+            position: Point::new(30.0, 50.0),
+            style,
+            layout: Some(m.layout),
+        });
+        let out = render(&scene);
+        let expect_w = format!("{:.2}", m.metrics.width);
+        let expect_h = format!("{:.2}", m.metrics.height);
+        assert!(
+            out.contains(&format!("width=\"{}\" height=\"{}\"", expect_w, expect_h)),
+            "背景矩形应使用 layout 精确尺寸，但输出含: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn text_no_background_when_none() {
+        use crate::text::TextStyle;
+        let mut scene = Scene::new(100.0, 100.0);
+        scene.push(Element::text(
+            "plain",
+            Point::new(10.0, 50.0),
+            TextStyle::new(Color::BLACK, 12.0, "sans-serif"),
+        ));
+        let out = render(&scene);
+        // 无 background_color 时只有画布背景 1 个 <rect>（无文本背景矩形）。
+        assert_eq!(out.matches("<rect ").count(), 1);
     }
 }

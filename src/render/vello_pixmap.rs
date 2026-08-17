@@ -218,10 +218,10 @@ impl Renderer for VelloPixmapRenderer {
     fn draw_rect(&mut self, rect: Rect, style: &FillStrokeStyle) {
         // 统一转路径绘制，以支持渐变填充与虚线描边。
         let mut path = BezPath::new();
-        path.move_to((rect.x, rect.y));
-        path.line_to((rect.x + rect.width, rect.y));
-        path.line_to((rect.x + rect.width, rect.y + rect.height));
-        path.line_to((rect.x, rect.y + rect.height));
+        path.move_to((rect.min_x(), rect.min_y()));
+        path.line_to((rect.max_x(), rect.min_y()));
+        path.line_to((rect.max_x(), rect.max_y()));
+        path.line_to((rect.min_x(), rect.max_y()));
         path.close_path();
         self.paint_path(&path, style);
     }
@@ -289,6 +289,109 @@ impl Renderer for VelloPixmapRenderer {
         }
     }
 
+    fn draw_image(&mut self, image: &crate::SceneImage, frame: Rect, opacity: f64) {
+        if image.data.is_empty() || image.width == 0 || image.height == 0 {
+            return;
+        }
+        let dyn_img = match image::load_from_memory(&image.data) {
+            Ok(img) => img,
+            Err(e) => {
+                eprintln!("[lievisual] draw_image: 解码失败 ({}): {}", image.data.len(), e);
+                return;
+            }
+        };
+
+        // frame 已处于 px 坐标（场景坐标即 px）；直接换算到设备像素。
+        let fx = frame.min_x();
+        let fy = frame.min_y();
+        let fw = frame.width().max(1.0);
+        let fh = frame.height().max(1.0);
+
+        // 按 object_fit 计算图片在 frame 内的实际绘制矩形（局部坐标，相对 frame 原点）。
+        let (dw, dh, offx, offy) = match image.object_fit {
+            crate::ObjectFit::Fill => (fw, fh, 0.0, 0.0),
+            crate::ObjectFit::None => (
+                image.width as f64,
+                image.height as f64,
+                0.0,
+                0.0,
+            ),
+            fit => {
+                let iw = image.width as f64;
+                let ih = image.height as f64;
+                let scale = if fit == crate::ObjectFit::Cover {
+                    (fw / iw).max(fh / ih)
+                } else {
+                    (fw / iw).min(fh / ih)
+                };
+                let dw = iw * scale;
+                let dh = ih * scale;
+                (dw, dh, (fw - dw) / 2.0, (fh - dh) / 2.0)
+            }
+        };
+
+        // 目标帧位图（frame 大小，透明底）；cover/none 时图片可能溢出 frame，
+        // 用 fill_rect 的裁剪范围（frame）裁掉溢出部分，省去显式 clip。
+        let frame_w = (fw.ceil() as u32).max(1).min(u16::MAX as u32);
+        let frame_h = (fh.ceil() as u32).max(1).min(u16::MAX as u32);
+        let dest_w = (dw.ceil() as u32).max(1).min(u16::MAX as u32);
+        let dest_h = (dh.ceil() as u32).max(1).min(u16::MAX as u32);
+        let scaled = dyn_img.resize_exact(dest_w, dest_h, image::imageops::FilterType::Triangle);
+        let rgba = scaled.to_rgba8();
+
+        // 应用整体 opacity：预乘到 alpha 通道（frame 透明底，src-over 合成正确）。
+        let op = opacity.clamp(0.0, 1.0);
+        let mut dest_pixels: Vec<vello_cpu::color::PremulRgba8> =
+            vec![vello_cpu::color::PremulRgba8::from_u8_array([0, 0, 0, 0]); (frame_w * frame_h) as usize];
+        let src_pixels: Vec<vello_cpu::color::PremulRgba8> = rgba
+            .as_raw()
+            .chunks_exact(4)
+            .map(|p| {
+                let [r, g, b, a] = [p[0], p[1], p[2], p[3]];
+                let a = ((a as f64) * op) as u8;
+                vello_cpu::color::PremulRgba8 {
+                    r: ((a as u32 * r as u32) / 255) as u8,
+                    g: ((a as u32 * g as u32) / 255) as u8,
+                    b: ((a as u32 * b as u32) / 255) as u8,
+                    a,
+                }
+            })
+            .collect();
+
+        // 把缩放后的图片 blit 到 frame 位图（考虑 offx/offy，越界部分被 frame 裁剪）。
+        let ox = offx.floor() as i64;
+        let oy = offy.floor() as i64;
+        for row in 0..(dest_h as i64) {
+            let dy = row + oy;
+            if dy < 0 || dy >= frame_h as i64 {
+                continue;
+            }
+            for col in 0..(dest_w as i64) {
+                let dx = col + ox;
+                if dx < 0 || dx >= frame_w as i64 {
+                    continue;
+                }
+                let sidx = (row * dest_w as i64 + col) as usize;
+                let didx = (dy * frame_w as i64 + dx) as usize;
+                dest_pixels[didx] = src_pixels[sidx];
+            }
+        }
+
+        let dest_pixmap = vello_cpu::Pixmap::from_parts(dest_pixels, frame_w as u16, frame_h as u16);
+        let brush = vello_cpu::Image {
+            image: vello_cpu::ImageSource::Pixmap(std::sync::Arc::new(dest_pixmap)),
+            sampler: vello_cpu::peniko::ImageSampler::default(),
+        };
+        self.ctx.set_paint(brush);
+        // Image paint 以 pixmap 像素坐标 (0,0) 起始绘制；用 paint transform 把它
+        // 平移到 frame 原点（frame 大小即为裁剪框）。
+        let rect = VRect::new(fx, fy, fx + fw, fy + fh);
+        self.ctx
+            .set_paint_transform(vello_cpu::kurbo::Affine::translate((fx, fy)));
+        self.ctx.fill_rect(&rect);
+        self.ctx.reset_paint_transform();
+    }
+
     fn draw_text(
         &mut self,
         spans: &[crate::text::RichSpan],
@@ -314,45 +417,52 @@ impl Renderer for VelloPixmapRenderer {
         // position。dx 由 align（水平），dy 由 baseline（垂直）决定；旋转绕锚点。
         let m = crate::text::layout_metrics(layout);
         let dx = match style.align {
-            crate::text::TextAlign::Left => 0.0,
+            crate::text::TextAlign::Left | crate::text::TextAlign::Justify => 0.0,
             crate::text::TextAlign::Center => -m.width / 2.0,
             crate::text::TextAlign::Right => -m.width,
         };
-        let dy = -style.baseline.anchor_offset(&m);
+        let dy = -style.baseline.anchor_offset(&m) - style.baseline_shift;
         let transform = Affine::translate((position.x, position.y))
             * Affine::rotate(style.rotation)
             * Affine::translate((dx, dy));
 
-        for line in layout.lines() {
-            for item in line.items() {
-                match item {
-                    parley::layout::PositionedLayoutItem::GlyphRun(glyph_run) => {
-                        let run = glyph_run.run();
-                        let font_data = run.font();
-                        let run_font_size = run.font_size();
+        // 文本背景（行内高亮）：在 layout 局部坐标 [0,0]×[w,h] 画矩形，经 transform
+        // 映射到节点坐标，与 glyph 精确定位一致。
+        if let Some(bg) = style.background_color {
+            // kurbo Affine 不支持直接乘 Rect，手动变换对角点得 AABB。
+            let p0 = transform * VPoint::new(0.0, 0.0);
+            let p1 = transform * VPoint::new(m.width, m.height);
+            let bg_rect = Rect::from_points(p0, p1);
+            let style = crate::scene::FillStrokeStyle::fill(bg);
+            self.draw_rect(bg_rect, &style);
+        }
 
-                        let glyphs: Vec<vello_cpu::Glyph> = glyph_run
-                            .positioned_glyphs()
-                            .map(|g| vello_cpu::Glyph {
-                                id: g.id,
-                                x: g.x,
-                                y: g.y,
-                            })
-                            .collect();
-                        if glyphs.is_empty() {
-                            continue;
-                        }
-
-                        let brush = glyph_run.style().brush;
-                        self.ctx.set_paint(self.to_vello(&brush));
-                        self.ctx
-                            .glyph_run(&mut self.resources, font_data)
-                            .font_size(run_font_size)
-                            .glyph_transform(transform)
-                            .fill_glyphs(glyphs.into_iter());
-                    }
-                    parley::layout::PositionedLayoutItem::InlineBox(_) => {}
+        for line in &layout.lines {
+            for run in &line.runs {
+                let glyphs: Vec<vello_cpu::Glyph> = run
+                    .glyphs
+                    .iter()
+                    .map(|g| vello_cpu::Glyph {
+                        id: g.id,
+                        x: g.x,
+                        y: g.y,
+                    })
+                    .collect();
+                if glyphs.is_empty() {
+                    continue;
                 }
+
+                // 从自闭环的字体字节构造 vello 字体（与 parley/vello 共享同一 peniko FontData）。
+                let font_data = vello_cpu::peniko::FontData::new(
+                    vello_cpu::peniko::Blob::from(run.font_data.as_ref().clone()),
+                    0,
+                );
+                self.ctx.set_paint(self.to_vello(&run.color));
+                self.ctx
+                    .glyph_run(&mut self.resources, &font_data)
+                    .font_size(run.font_size)
+                    .glyph_transform(transform)
+                    .fill_glyphs(glyphs.into_iter());
             }
         }
     }
@@ -469,7 +579,7 @@ mod tests {
     fn gradient_stays_in_user_space_under_node_transform() {
         let mut ra = VelloPixmapRenderer::new(100, 100);
         let mut rb = VelloPixmapRenderer::new(100, 100);
-        let scene_a = gradient_rect_scene(Rect::new(10.0, 10.0, 80.0, 80.0), None);
+        let scene_a = gradient_rect_scene(Rect::new(10.0, 10.0, 90.0, 90.0), None);
         let scene_b = gradient_rect_scene(
             Rect::new(0.0, 0.0, 80.0, 80.0),
             Some(Transform::translate(10.0, 10.0)),
@@ -490,7 +600,7 @@ mod tests {
     #[test]
     fn renderer_reusable_across_frames() {
         let mut renderer = VelloPixmapRenderer::new(60, 60).with_background(Color::WHITE);
-        let scene = gradient_rect_scene(Rect::new(5.0, 5.0, 50.0, 50.0), None);
+        let scene = gradient_rect_scene(Rect::new(5.0, 5.0, 55.0, 55.0), None);
 
         let p1 = renderer.render_scene_to_pixmap(&scene);
         let p2 = renderer.render_scene_to_pixmap(&scene);
@@ -547,7 +657,7 @@ mod tests {
             FillStrokeStyle::fill(Color::rgb(0x00, 0xff, 0x00)),
         ));
         scene.push(Element::rounded_rect(
-            Rect::new(75.0, 10.0, 30.0, 20.0),
+            Rect::new(75.0, 10.0, 105.0, 30.0),
             5.0,
             FillStrokeStyle::fill(Color::rgb(0x00, 0x00, 0xff)),
         ));
@@ -688,7 +798,7 @@ mod tests {
             FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
         ))]);
         let top = Layer::new("top").with_nodes(vec![SceneNode::new(Element::rect(
-            Rect::new(10.0, 10.0, 20.0, 20.0),
+            Rect::new(10.0, 10.0, 30.0, 30.0),
             FillStrokeStyle::fill(Color::rgb(0x00, 0x00, 0xff)),
         ))]);
         scene.push_layer(bottom);

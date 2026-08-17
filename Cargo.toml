@@ -22,5 +22,5 @@ kurbo = "0.13"
 vello_cpu = "0.2"
 # 文本排版（Canvas 风格 API 基于 parley）
 parley = "0.11"
-# PNG 编码：仅启用 png 特性，关闭默认特性
-image = { version = "0.25", default-features = false, features = ["png"] }
+# 图片编解码：用于场景图片资源的 PNG/JPEG 解码与 PNG 编码
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }

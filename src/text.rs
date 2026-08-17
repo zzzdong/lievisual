@@ -38,7 +38,7 @@
 //! **thread-local** 持有这两个上下文：首次调用按线程懒初始化，之后线程内所有排版
 //! 复用同一实例，避免反复的系统字体扫描与分配；多线程各持独立实例，无需同步。
 
-use crate::geometry::{Color, Size};
+use crate::geometry::{Color, Rect, Size};
 use std::sync::Arc;
 
 /// 文本水平对齐方式（`position.x` 作为锚点）。对应 Canvas `textAlign`。
@@ -51,6 +51,8 @@ pub enum TextAlign {
     Center,
     /// 锚点在文本块右边缘。
     Right,
+    /// 两端对齐（最后一行左对齐）。parley 在排版时调整字距实现。
+    Justify,
 }
 
 /// 文本垂直锚点（`position.y` 作为锚点）。对应 Canvas `textBaseline`。
@@ -125,6 +127,16 @@ pub struct TextStyle {
     pub strikethrough: bool,
     /// 删除线颜色。`None` 使用前景色。
     pub strikethrough_color: Option<Color>,
+    /// 基线偏移（px，正数=上移/上标，负数=下移/下标）。
+    ///
+    /// parley 无 rise 属性，lievisual 在渲染端对整个文本块做 y 平移实现。
+    pub baseline_shift: f64,
+    /// 文本背景色（行内高亮/行内代码灰底）。`None` 不画背景。
+    ///
+    /// parley 无 background 属性，lievisual 在渲染端画文本块矩形实现。
+    pub background_color: Option<Color>,
+    /// 超链接 URL（`None` 无链接）。lievisual 扩展（pango 的 `link` 属性）。
+    pub url: Option<String>,
     /// 旋转弧度（绕文本锚点；lievisual 扩展，canvas 需 `ctx.translate/rotate`）。
     pub rotation: f64,
     /// 最大宽度（px）：`Some` 时在超过处换行（canvas `fillText` 的 `maxWidth` 近似，
@@ -153,6 +165,9 @@ impl TextStyle {
             underline_color: None,
             strikethrough: false,
             strikethrough_color: None,
+            baseline_shift: 0.0,
+            background_color: None,
+            url: None,
             rotation: 0.0,
             max_width: None,
             align: TextAlign::Left,
@@ -224,6 +239,27 @@ impl TextStyle {
     #[must_use]
     pub fn with_strikethrough_color(mut self, color: Option<Color>) -> Self {
         self.strikethrough_color = color;
+        self
+    }
+
+    /// 基线偏移（px，正数=上移/上标，负数=下移/下标）。
+    #[must_use]
+    pub fn with_baseline_shift(mut self, shift: f64) -> Self {
+        self.baseline_shift = shift;
+        self
+    }
+
+    /// 文本背景色（行内高亮 / 行内代码灰底）。`None` 不画背景。
+    #[must_use]
+    pub fn with_background_color(mut self, color: Option<Color>) -> Self {
+        self.background_color = color;
+        self
+    }
+
+    /// 超链接 URL（`None` 无链接）。
+    #[must_use]
+    pub fn with_url(mut self, url: Option<String>) -> Self {
+        self.url = url;
         self
     }
 
@@ -372,10 +408,131 @@ fn is_css_ident(s: &str) -> bool {
         })
 }
 
-pub type TextLayout = parley::Layout<Color>; // brush = lievisual 的 Color（自动满足 parley::Brush）
+// ---------------------------------------------------------------------------
+// 字形级排版结果（自闭环，可脱离 parley 独立消费）
+// ---------------------------------------------------------------------------
+
+/// 文本修饰（下划线 / 删除线）。pango 的 `underline` / `strikethrough` 属性。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextDecoration {
+    /// 无修饰。
+    #[default]
+    None,
+    /// 下划线。
+    Underline,
+    /// 删除线。
+    LineThrough,
+}
+
+/// 单个字形（与 parley 的 positioned glyph 一一对应）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Glyph {
+    /// 字形 ID。
+    pub id: u32,
+    /// X 坐标（相对所属 [`TextLine::bounds`] 原点的偏移）。
+    pub x: f32,
+    /// Y 坐标（相对所属 [`TextLine::bounds`] 原点的偏移）。
+    pub y: f32,
+    /// 前进宽度。
+    pub advance: f32,
+    /// 字节簇偏移（相对本 run 自身的 `text`，即 `text[cluster..]`）。
+    pub cluster: u32,
+}
+
+/// 文本 Run —— 一段具有相同样式（字体、字号、颜色）的连续字形序列。
+///
+/// 文本渲染的最小单元。Run 自闭环：`text` 为相对原始 `full_text` 的局部切片，
+/// `glyphs[].cluster` 已归一化为相对 `text` 的局部偏移，脱离所属 Line 与原始
+/// 字符串即可独立绘制。字体以 `Vec<u8>` 自包含（`Arc` 共享，不复制整份字体文件）。
+///
+/// 扩展属性（`url` / `decoration` / `background_color` / `baseline_shift`）由
+/// lievisual 从 [`RichSpan`] 的样式（[`TextStyle`]）按字节区间映射到 run 携带，
+/// 下游可直接消费，无需二次标注。
+#[derive(Debug, Clone)]
+pub struct TextRun {
+    /// 该 Run 的文本内容（自包含，相对原始 full_text 的局部切片）。
+    pub text: String,
+    /// 字体原始字节（解析自 parley FontData 的 blob，自包含，`Arc` 共享）。
+    pub font_data: Arc<Vec<u8>>,
+    /// 字体大小。
+    pub font_size: f32,
+    /// 字体是否粗体（SVG 等用系统字体的后端据此输出 font-weight）。
+    pub font_weight_bold: bool,
+    /// 字体是否斜体（SVG 等后端据此输出 font-style）。
+    pub font_style_italic: bool,
+    /// 文本颜色。
+    pub color: Color,
+    /// 总前进宽度。
+    pub advance: f32,
+    /// 字形列表（坐标相对 [`TextLine::bounds`] 原点偏移）。
+    pub glyphs: Vec<Glyph>,
+    /// 是否从右到左。
+    pub is_rtl: bool,
+    /// 该 Run 第一个字符的基线 X 坐标（相对 layout 原点）。
+    pub baseline_x: f32,
+    /// 该行的基线 Y 坐标（相对行顶的偏移；同一行内所有 run 共享此值）。
+    pub baseline_y: f32,
+    /// 超链接 URL（如有）。
+    pub url: Option<String>,
+    /// 文本修饰（下划线 / 删除线）。
+    pub decoration: TextDecoration,
+    /// 基线偏移（使上下标相对行内位置上下移动）。
+    pub baseline_shift: f32,
+    /// 行内背景色（行内代码 / 高亮，`None` 无背景）。
+    pub background_color: Option<Color>,
+}
+
+/// 行内字体度量（来自 parley `LineMetrics`）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LineMetrics {
+    /// 上肩高（baseline 向上）。
+    pub ascent: f32,
+    /// 下伸量（baseline 向下）。
+    pub descent: f32,
+    /// 基线距行顶的距离。
+    pub baseline: f32,
+    /// 行高。
+    pub line_height: f32,
+}
+
+/// 文本行 —— 包含一行中的所有 [`TextRun`]。
+///
+/// 坐标系统（相对 layout 原点）：
+/// - `bounds.origin`: 行在 layout 中的位置。
+/// - `runs[].glyphs[].x/y`: 相对 `bounds.origin` 的偏移。
+///
+/// 绝对定位时：glyph 坐标 = 页面偏移 + bounds.origin + glyph。
+#[derive(Debug, Clone)]
+pub struct TextLine {
+    /// 该行的所有 Run。
+    pub runs: Vec<TextRun>,
+    /// 行的边界框（相对 layout 原点）。
+    pub bounds: Rect,
+    /// 行内字体度量（ascent / descent / baseline / line_height）。
+    pub metrics: LineMetrics,
+}
+
+/// 富文本排版结果 —— 包含排版后的行集合。
+///
+/// 由 [`layout_text`] / [`measure_text`] 生成，**自闭环**：不依赖 parley 的
+/// 生命周期，`font_data` 内嵌字体字节、`glyphs[].cluster` 为相对 run 文本的
+/// 局部偏移。下游（如 liepress 的 PDF / SVG 后端）可直接遍历 `lines` 绘制，
+/// 无需再触达 parley。
+///
+/// 坐标全部相对 layout 原点（段落左上角）；分页与绝对定位由输出后端负责。
+#[derive(Debug, Clone)]
+pub struct TextLayout {
+    /// 排版后的所有行。
+    pub lines: Vec<TextLine>,
+    /// 布局总宽度。
+    pub width: f64,
+    /// 布局总高度。
+    pub height: f64,
+}
 
 pub use measure::{
-    FontSource, compute_text_offset, layout_metrics, layout_text, measure_text, register_font,
+    FontSource, compute_text_offset, layout_metrics, layout_text, measure_text, parse_generic_family,
+    register_font, register_font_generic,
 };
 
 /// 文本测量结果（canvas `measureText()` 返回值）。
@@ -431,7 +588,13 @@ mod measure {
     use parley::style::FontFamily;
     use parley::{FontContext, LayoutContext, StyleProperty};
     use std::cell::RefCell;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    // 跨排版共享的字体字节缓存：key 为 parley `Blob` 的稳定 `id()`（每种字体唯一）。
+    // 避免每个 Run 都 `to_vec` 整份字体文件（可能数十 MB）导致内存随文本规模爆炸。
+    // 每种唯一字体在整个进程生命周期内只复制一次字节，其余 Run 通过 `Arc` 共享。
+    static FONT_BYTE_CACHE: OnceLock<Mutex<HashMap<u64, Arc<Vec<u8>>>>> = OnceLock::new();
 
     // 每个线程一个缓存的排版上下文：懒初始化，线程内所有测量/排版统一复用。
     // parley 官方将 FontContext（字体库 + LRU 源缓存）与 LayoutContext（scratch + 字形缓存）
@@ -481,7 +644,8 @@ mod measure {
         with_cached_context(|fc, lc| Arc::new(build_rich_layout(spans, max_width, fc, lc)))
     }
 
-    /// 用 `RangedBuilder` 构造富文本布局（测量与渲染共享，保证尺寸一致）。
+    /// 用 `RangedBuilder` 构造富文本布局（测量与渲染共享，保证尺寸一致），
+    /// 并提取为自闭环 [`TextLayout`]（含字形级 run / glyph 与扩展属性）。
     fn build_rich_layout(
         spans: &[RichSpan],
         max_width: Option<f64>,
@@ -518,7 +682,13 @@ mod measure {
 
         let mut layout = builder.build(&combined);
         layout.break_all_lines(max_width.map(|w| w as f32));
-        layout
+        // 按首段 align 应用 parley 对齐：Center/Right 让多行在块内对齐，
+        // Justify 排版时调整字距。渲染端 dx 只负责块整体相对锚点定位，两者正交。
+        apply_parley_align(&mut layout, spans[0].style.align);
+
+        // 提取为自闭环结构，扩展属性（url/decoration/background/baseline_shift）
+        // 按 span 字节区间映射到每个 run。
+        extract_lines_from_parley(&layout, &combined, spans)
     }
 
     /// 解析 CSS `font-family` 列表为 parley 的 `FontFamily`（与 [`build_layout`] 一致）。
@@ -545,6 +715,20 @@ mod measure {
     fn parley_line_height(lh: f64, font_size: f64) -> parley::style::LineHeight {
         let factor = (lh / font_size.max(1e-6)) as f32;
         parley::style::LineHeight::FontSizeRelative(factor)
+    }
+
+    /// 按对齐应用 parley 段落对齐（Center/Right 让多行在块内对齐，Justify 调整字距）。
+    ///
+    /// 与渲染端锚点偏移正交：parley 负责**块内**各行对齐，渲染端 dx 负责**块整体**
+    /// 相对锚点定位。
+    fn apply_parley_align(layout: &mut parley::Layout<Color>, align: TextAlign) {
+        let p = match align {
+            TextAlign::Left => parley::Alignment::Start,
+            TextAlign::Center => parley::Alignment::Center,
+            TextAlign::Right => parley::Alignment::End,
+            TextAlign::Justify => parley::Alignment::Justify,
+        };
+        layout.align(p, parley::AlignmentOptions::default());
     }
 
     /// 将 `TextStyle` 的排版属性 push 为 builder 的默认值（`build_layout` 与
@@ -666,11 +850,11 @@ mod measure {
 
     /// 从已排版 layout 提取度量（canvas `TextMetrics`）。
     pub fn layout_metrics(layout: &TextLayout) -> TextMetrics {
-        let width = layout.width() as f64;
-        let height = layout.height() as f64;
-        let (ascent, descent, baseline, line_height) = match layout.get(0) {
+        let width = layout.width;
+        let height = layout.height;
+        let (ascent, descent, baseline, line_height) = match layout.lines.first() {
             Some(line) => {
-                let m = line.metrics();
+                let m = line.metrics;
                 (
                     m.ascent as f64,
                     m.descent as f64,
@@ -698,7 +882,7 @@ mod measure {
         }
     }
 
-    /// 构造 parley 布局（测量与渲染共享，保证尺寸一致）。
+    /// 构造 parley 布局（测量与渲染共享，保证尺寸一致），提取为自闭环 [`TextLayout`]。
     pub(crate) fn build_layout(
         font_ctx: &mut FontContext,
         layout_ctx: &mut LayoutContext<Color>,
@@ -713,7 +897,283 @@ mod measure {
         let mut layout = builder.build(content);
         // 最大宽度作为换行上限；无限制时传 None。
         layout.break_all_lines(max_width.map(|w| w as f32));
-        layout
+        // 按 align 应用 parley 对齐：Center/Right 让多行在块内对齐，
+        // Justify 排版时调整字距。渲染端 dx 只负责块整体相对锚点定位，两者正交。
+        apply_parley_align(&mut layout, style.align);
+
+        // 单文本视为单个 span，提取为自闭环结构。
+        let span = RichSpan::new(content.to_string(), style.clone());
+        let spans = std::slice::from_ref(&span);
+        extract_lines_from_parley(&layout, content, spans)
+    }
+
+    /// 字形原始数据（相对 layout 原点的坐标），仅在提取过程中使用。
+    struct GlyphRaw {
+        id: u32,
+        x: f32,
+        y: f32,
+        advance: f32,
+        cluster: u32,
+    }
+
+    /// 从 parley Layout 提取自闭环 [`TextLayout`]，扩展属性（`url` / `decoration` /
+    /// `background_color` / `baseline_shift`）按 span 字节区间映射到每个 run。
+    ///
+    /// 每个 [`TextLine::bounds`] 表示该行在 layout 中的位置：`x` = 最左字形相对
+    /// layout 左侧偏移，`y` = 行顶相对 layout 顶部的累积偏移。run 的 `glyphs[].x/y`
+    /// 为相对行原点的偏移（自闭环，可脱离 layout / full_text 独立绘制）。
+    ///
+    /// 字体字节经进程级缓存按 `Blob::id()` 去重，每种唯一字体只 `to_vec` 一次存入
+    /// `Arc`，其余 run 共享，避免每个 run 复制整份字体文件导致内存爆炸。
+    fn extract_lines_from_parley(
+        layout: &parley::Layout<Color>,
+        full_text: &str,
+        spans: &[RichSpan],
+    ) -> TextLayout {
+        // 构建 span 字节区间表，用于扩展属性（url/decoration/background/baseline_shift）查找。
+        let mut span_ranges: Vec<(usize, usize, &TextStyle)> = Vec::with_capacity(spans.len());
+        let mut acc = 0usize;
+        for span in spans {
+            let end = acc + span.text.len();
+            span_ranges.push((acc, end, &span.style));
+            acc = end;
+        }
+
+        let mut lines = Vec::new();
+        let mut row_top_rel = 0.0_f32;
+
+        for line in layout.lines() {
+            let m = line.metrics();
+            let line_metrics = LineMetrics {
+                ascent: m.ascent,
+                descent: m.descent,
+                baseline: m.baseline,
+                line_height: m.line_height,
+            };
+            let line_height = m.line_height;
+            let baseline_y = m.baseline - row_top_rel;
+
+            let mut glyph_data: Vec<(GlyphRaw, usize)> = Vec::new();
+            #[allow(clippy::type_complexity)]
+            let mut run_infos: Vec<(
+                Color,
+                Arc<Vec<u8>>,
+                f32,
+                parley::layout::Run<'_, Color>,
+                f32,
+            )> = Vec::new();
+
+            let mut next_run_idx = 0;
+            for item in line.items() {
+                if let parley::layout::PositionedLayoutItem::GlyphRun(glyph_run) = item {
+                    let run = glyph_run.run();
+                    let color = glyph_run.style().brush;
+                    // 字体字节：按 Blob::id() 去重缓存。
+                    let blob = &run.font().data;
+                    let font_id = blob.id();
+                    let font_arc = {
+                        let mut cache = FONT_BYTE_CACHE
+                            .get_or_init(|| Mutex::new(HashMap::new()))
+                            .lock()
+                            .expect("font cache poisoned");
+                        cache
+                            .entry(font_id)
+                            .or_insert_with(|| Arc::new(blob.data().to_vec()))
+                            .clone()
+                    };
+                    let font_size = run.font_size();
+
+                    let first_glyph_x = glyph_run
+                        .positioned_glyphs()
+                        .next()
+                        .map(|g| g.x)
+                        .unwrap_or(0.0);
+
+                    run_infos.push((color, font_arc, font_size, *run, first_glyph_x));
+
+                    // 收集已定位字形，cluster 经 visual_clusters 的 text_range 提供。
+                    let positioned: Vec<_> = glyph_run.positioned_glyphs().collect();
+                    let mut gi = 0usize;
+                    for cluster in glyph_run.run().visual_clusters() {
+                        let cluster_byte = cluster.text_range().start as u32;
+                        let cluster_glyphs: Vec<_> = cluster.glyphs().collect();
+                        for _cg in &cluster_glyphs {
+                            if gi < positioned.len() {
+                                let g = &positioned[gi];
+                                glyph_data.push((
+                                    GlyphRaw {
+                                        id: g.id,
+                                        x: g.x,
+                                        y: g.y,
+                                        advance: g.advance,
+                                        cluster: cluster_byte,
+                                    },
+                                    next_run_idx,
+                                ));
+                                gi += 1;
+                            }
+                        }
+                    }
+                    next_run_idx += 1;
+                }
+            }
+
+            if glyph_data.is_empty() {
+                row_top_rel += line_height;
+                continue;
+            }
+
+            let min_x = glyph_data
+                .iter()
+                .map(|(g, _)| g.x)
+                .fold(f32::INFINITY, f32::min);
+            let max_x = glyph_data
+                .iter()
+                .map(|(g, _)| g.x)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let width = max_x - min_x;
+
+            let mut runs = Vec::new();
+
+            // 按 run 索引切分字形。
+            let mut run_glyph_ranges: Vec<(usize, usize)> = Vec::new();
+            let mut current_start = 0;
+            let mut last_run_idx = glyph_data[0].1;
+            for (i, (_, run_idx)) in glyph_data.iter().enumerate() {
+                if *run_idx != last_run_idx {
+                    run_glyph_ranges.push((current_start, i));
+                    current_start = i;
+                    last_run_idx = *run_idx;
+                }
+            }
+            run_glyph_ranges.push((current_start, glyph_data.len()));
+
+            for (start_idx, end_idx) in run_glyph_ranges.iter() {
+                let run_idx = glyph_data[*start_idx].1;
+                let (color, font_data, font_size, run, first_glyph_x) = &run_infos[run_idx];
+
+                let run_text_range = run.text_range();
+                let text_start = run_text_range.start;
+                let text_end = run_text_range.end;
+
+                let run_text = full_text
+                    .get(text_start..text_end)
+                    .map(str::to_string)
+                    .unwrap_or_default();
+
+                // 归一化 cluster 为相对 run_text 的局部偏移（自闭环）。
+                let relative_glyphs: Vec<Glyph> = glyph_data[*start_idx..*end_idx]
+                    .iter()
+                    .map(|(g, _)| Glyph {
+                        id: g.id,
+                        x: g.x - min_x,
+                        y: g.y - row_top_rel,
+                        advance: g.advance,
+                        cluster: g.cluster.saturating_sub(text_start as u32),
+                    })
+                    .collect();
+
+                let baseline_x = *first_glyph_x - min_x;
+
+                // 扩展属性：从 spans 按字节区间查找。
+                let (url, decoration, background_color, baseline_shift) =
+                    lookup_extended_props(text_start, &span_ranges);
+
+                // 基线偏移调整 glyph y：shift>0（上标）→ y 增大 → 视觉上移（y-down）。
+                let adjusted_glyphs: Vec<Glyph> = relative_glyphs
+                    .iter()
+                    .map(|g| Glyph {
+                        id: g.id,
+                        x: g.x,
+                        y: g.y + baseline_shift,
+                        advance: g.advance,
+                        cluster: g.cluster,
+                    })
+                    .collect();
+                let adjusted_baseline_y = baseline_y - baseline_shift;
+                let advance = adjusted_glyphs.iter().map(|g| g.advance).sum();
+
+                // 字体粗细 / 斜体（SVG 等用系统字体后端需要）。
+                let font_attrs = run.font_attrs();
+                let font_weight_bold = font_attrs.weight >= parley::fontique::FontWeight::BOLD;
+                let font_style_italic = font_attrs.style != parley::fontique::FontStyle::Normal;
+
+                runs.push(TextRun {
+                    text: run_text,
+                    font_data: font_data.clone(),
+                    font_size: *font_size,
+                    font_weight_bold,
+                    font_style_italic,
+                    color: *color,
+                    advance,
+                    glyphs: adjusted_glyphs,
+                    is_rtl: false,
+                    baseline_x,
+                    baseline_y: adjusted_baseline_y,
+                    url,
+                    decoration,
+                    baseline_shift,
+                    background_color,
+                });
+            }
+
+            let bounds = Rect::new(
+                min_x as f64,
+                row_top_rel as f64,
+                (min_x + width) as f64,
+                (row_top_rel + line_height) as f64,
+            );
+
+            lines.push(TextLine {
+                runs,
+                bounds,
+                metrics: line_metrics,
+            });
+
+            row_top_rel += line_height;
+        }
+
+        let width = layout.width() as f64;
+        let height = layout.height() as f64;
+        TextLayout {
+            lines,
+            width,
+            height,
+        }
+    }
+
+    /// 查找字节位置对应的扩展属性（url / decoration / background / baseline_shift）。
+    ///
+    /// 一个 run 可能横跨多个 span（CJK 优先后 parley 常把整行合并为一个 run），
+    /// 优先取与位置重叠且带 url / 背景的 span，否则回退到起点所在 span。
+    fn lookup_extended_props(
+        pos: usize,
+        span_ranges: &[(usize, usize, &TextStyle)],
+    ) -> (Option<String>, TextDecoration, Option<Color>, f32) {
+        let matched = span_ranges
+            .iter()
+            .find(|(s, e, st)| *s <= pos && pos < *e && (st.url.is_some() || st.background_color.is_some()))
+            .or_else(|| span_ranges.iter().find(|(s, e, _)| *s <= pos && pos < *e));
+        match matched {
+            Some((_, _, st)) => {
+                let decoration = if st.underline && st.strikethrough {
+                    TextDecoration::None // 冲突时按无处理（调用方自行用 span 级样式）
+                } else if st.strikethrough {
+                    TextDecoration::LineThrough
+                } else if st.underline {
+                    TextDecoration::Underline
+                } else {
+                    TextDecoration::None
+                };
+                (
+                    st.url.clone(),
+                    decoration,
+                    st.background_color,
+                    st.baseline_shift as f32,
+                )
+            }
+            None => (None, TextDecoration::None, None, 0.0),
+        }
     }
 
     /// 字体来源。
@@ -733,6 +1193,21 @@ mod measure {
         source: FontSource,
         family_name_override: Option<&str>,
     ) -> Result<(), String> {
+        register_font_generic(source, family_name_override, None)
+    }
+
+    /// 注册自定义字体，并可选关联到**通用字体族**（`GenericFamily`）。
+    ///
+    /// 与 [`register_font`] 相同，额外支持把字体挂到 `sans-serif` / `monospace` /
+    /// `serif` 等通用族，使 `font-family: monospace` 时使用注册字体而非系统默认。
+    /// `generic_family` 为 `None` 时与 [`register_font`] 等价。
+    ///
+    /// 通用族类型 [`parley::fontique::GenericFamily`] 经 [`crate::parley`] re-export 可见。
+    pub fn register_font_generic(
+        source: FontSource,
+        family_name_override: Option<&str>,
+        generic_family: Option<parley::fontique::GenericFamily>,
+    ) -> Result<(), String> {
         use parley::fontique::Blob;
         use std::sync::Arc;
 
@@ -751,9 +1226,39 @@ mod measure {
         });
 
         with_cached_context(|font_cx, _| {
-            font_cx.collection.register_fonts(data, override_info);
+            let registered = font_cx.collection.register_fonts(data, override_info);
+            if let Some(generic) = generic_family {
+                let ids: Vec<_> = registered.into_iter().map(|(id, _)| id).collect();
+                font_cx.collection.append_generic_families(generic, ids.into_iter());
+            }
         });
         Ok(())
+    }
+
+    /// 解析通用字体族名称（`"monospace"` / `"sans-serif"` 等）为 parley 的
+    /// [`parley::fontique::GenericFamily`]。
+    ///
+    /// 供注册字体关联到通用族（见 [`register_font_generic`]）、以及把 `font-family`
+    /// 中的通用族名归一化使用。无法识别时返回 `None`。
+    #[must_use]
+    pub fn parse_generic_family(name: &str) -> Option<parley::fontique::GenericFamily> {
+        use parley::fontique::GenericFamily;
+        match name.to_lowercase().as_str() {
+            "serif" => Some(GenericFamily::Serif),
+            "sans-serif" | "sansserif" => Some(GenericFamily::SansSerif),
+            "monospace" => Some(GenericFamily::Monospace),
+            "cursive" => Some(GenericFamily::Cursive),
+            "fantasy" => Some(GenericFamily::Fantasy),
+            "system-ui" | "systemui" => Some(GenericFamily::SystemUi),
+            "ui-serif" | "uiserif" => Some(GenericFamily::UiSerif),
+            "ui-sans-serif" | "uisansserif" => Some(GenericFamily::UiSansSerif),
+            "ui-monospace" | "uimonospace" => Some(GenericFamily::UiMonospace),
+            "ui-rounded" | "uirounded" => Some(GenericFamily::UiRounded),
+            "emoji" => Some(GenericFamily::Emoji),
+            "math" => Some(GenericFamily::Math),
+            "fangsong" => Some(GenericFamily::FangSong),
+            _ => None,
+        }
     }
 
     /// 从锚点到文本块左上角的偏移量。
@@ -766,11 +1271,11 @@ mod measure {
         align: TextAlign,
         baseline: TextBaseline,
     ) -> (f64, f64) {
-        let layout_width = layout.width() as f64;
-        let layout_height = layout.height() as f64;
+        let layout_width = layout.width;
+        let layout_height = layout.height;
 
         let x_offset = match align {
-            TextAlign::Left => 0.0,
+            TextAlign::Left | TextAlign::Justify => 0.0,
             TextAlign::Center => -layout_width / 2.0,
             TextAlign::Right => -layout_width,
         };
@@ -780,10 +1285,9 @@ mod measure {
             TextBaseline::Middle => -layout_height / 2.0,
             TextBaseline::Bottom => -layout_height,
             TextBaseline::Alphabetic => {
-                let first_line = layout.lines().next();
+                let first_line = layout.lines.first();
                 if let Some(line) = first_line {
-                    let line_metrics = line.metrics();
-                    -line_metrics.ascent as f64
+                    -line.metrics.ascent as f64
                 } else {
                     -layout_height * 0.8
                 }
@@ -792,18 +1296,17 @@ mod measure {
             // 与 [`TextBaseline::anchor_offset`] / [`layout_metrics`] 约定保持一致：
             // Hanging ≈ 0.8 × 上肩高；Ideographic ≈ 基线下 0.1 × 下伸量。
             TextBaseline::Hanging => {
-                let first_line = layout.lines().next();
+                let first_line = layout.lines.first();
                 if let Some(line) = first_line {
-                    let m = line.metrics();
-                    -(m.ascent * 0.8) as f64
+                    -(line.metrics.ascent * 0.8) as f64
                 } else {
                     -layout_height * 0.8
                 }
             }
             TextBaseline::Ideographic => {
-                let first_line = layout.lines().next();
+                let first_line = layout.lines.first();
                 if let Some(line) = first_line {
-                    let m = line.metrics();
+                    let m = line.metrics;
                     -(m.baseline + m.descent * 0.1) as f64
                 } else {
                     -layout_height * 0.8
@@ -894,8 +1397,8 @@ mod tests {
             let style = TextStyle::new(Color::BLACK, 16.0, "sans-serif");
             let m = measure_one("共享", &style, None);
             let l = layout_one("共享", &style, None);
-            assert_eq!(l.width() as f64, m.metrics.width);
-            assert_eq!(l.height() as f64, m.metrics.height);
+            assert_eq!(l.width, m.metrics.width);
+            assert_eq!(l.height, m.metrics.height);
         }
     }
 
@@ -912,8 +1415,8 @@ mod tests {
             let (x_right, _) = compute_text_offset(&layout, TextAlign::Right, TextBaseline::Top);
             assert_eq!(x_left, 0.0);
             // 居中 / 右对齐按 layout 宽度对称偏移。
-            assert!((x_center + layout.width() as f64 / 2.0).abs() < 1e-6);
-            assert!((x_right + layout.width() as f64).abs() < 1e-6);
+            assert!((x_center + layout.width / 2.0).abs() < 1e-6);
+            assert!((x_right + layout.width).abs() < 1e-6);
         }
 
         #[test]
@@ -934,6 +1437,32 @@ mod tests {
             assert!(hanging > alpha, "hanging({hanging}) > alpha({alpha})");
             assert!(alpha > ideo, "alpha({alpha}) > ideo({ideo})");
             assert!(ideo > bottom, "ideo({ideo}) > bottom({bottom})");
+        }
+
+        #[test]
+        fn justify_offsets_like_left_and_layouts_multiline() {
+            // 锚点偏移：Justify 与 Left 相同（0，因为两端对齐由 parley 排版实现）。
+            let style = TextStyle::new(Color::BLACK, 20.0, "sans-serif");
+            let layout = layout_one("Hello", &style, None);
+            let (xj, _) = compute_text_offset(&layout, TextAlign::Justify, TextBaseline::Top);
+            let (xl, _) = compute_text_offset(&layout, TextAlign::Left, TextBaseline::Top);
+            assert_eq!(xj, xl);
+
+            // 多行文本 Justify 排版不 panic、产生多行（视觉两端对齐由 parley 保证）。
+            let jstyle = TextStyle::new(Color::BLACK, 16.0, "sans-serif")
+                .with_align(TextAlign::Justify);
+            let text = "The quick brown fox jumps over the lazy dog while padding enough to wrap.";
+            let jl = layout_text(
+                std::slice::from_ref(&RichSpan::new(text, jstyle.clone())),
+                Some(160.0),
+            );
+            let lines: Vec<_> = jl.lines.iter().collect();
+            assert!(lines.len() >= 2, "应产生多行");
+            let single = layout_text(
+                std::slice::from_ref(&RichSpan::new("a", jstyle)),
+                None,
+            );
+            assert!(jl.height > single.height);
         }
     }
 
@@ -1110,15 +1639,15 @@ mod tests {
             let top_left_x = cx + x_off;
             let top_left_y = cy + y_off;
             // 居中：左上角 x = cx - 半宽；垂直居中：左上角 y = cy - 半高。
-            assert!((top_left_x - (cx - layout.width() as f64 / 2.0)).abs() < 1e-6);
-            assert!((top_left_y - (cy - layout.height() as f64 / 2.0)).abs() < 1e-6);
+            assert!((top_left_x - (cx - layout.width / 2.0)).abs() < 1e-6);
+            assert!((top_left_y - (cy - layout.height / 2.0)).abs() < 1e-6);
 
             // 富文本测量结果与单段同样式 layout 宽度一致，且 Arc<TextLayout> 可作 Element::Text.layout。
             let rich = measure_text(
                 std::slice::from_ref(&RichSpan::new(text, style.clone())),
                 None,
             );
-            assert!((rich.layout.width() as f64 - layout.width() as f64).abs() < 1e-6);
+            assert!((rich.layout.width - layout.width).abs() < 1e-6);
             let node = Element::Text {
                 spans: vec![RichSpan::new(text, style.clone())],
                 position: crate::geometry::Point::new(top_left_x, top_left_y),
@@ -1184,6 +1713,20 @@ mod tests {
             assert!(!s.strikethrough);
             assert_eq!(s.underline_color, None);
             assert_eq!(s.strikethrough_color, None);
+            assert_eq!(s.baseline_shift, 0.0);
+            assert_eq!(s.background_color, None);
+        }
+
+        #[test]
+        fn baseline_shift_and_background_builders() {
+            let s = TextStyle::new(Color::BLACK, 12.0, "sans-serif")
+                .with_baseline_shift(6.0)
+                .with_background_color(Some(Color::rgb(0xf0, 0xf0, 0xf0)));
+            assert_eq!(s.baseline_shift, 6.0);
+            assert_eq!(s.background_color, Some(Color::rgb(0xf0, 0xf0, 0xf0)));
+            // 负偏移 = 下标下移。
+            let sub = TextStyle::new(Color::BLACK, 12.0, "sans-serif").with_baseline_shift(-4.0);
+            assert_eq!(sub.baseline_shift, -4.0);
         }
 
         #[test]

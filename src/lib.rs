@@ -29,12 +29,18 @@ pub mod render;
 pub mod scene;
 pub mod text;
 
+/// 暴露底层排版引擎 parley，供下游（如 liepress）从 [`text::TextLayout`] 读取
+/// 逐字形 / run / 字体字节等细粒度数据（lievisual 只封装高层测量与渲染）。
+pub use parley;
+
 pub use geometry::{Color, Point, Rect, Size, Transform, Vec2};
 pub use scene::{
     Clip, Element, Fill, FillStrokeStyle, GradientStop, Layer, LineCap, LineJoin, LinearGradient,
-    RadialGradient, Scene, SceneNode, Stroke,
+    ObjectFit, RadialGradient, Scene, SceneImage, SceneNode, Stroke,
 };
 pub use text::{
-    FontSource, FontStyle, RichSpan, TextAlign, TextBaseline, TextLayout, TextMeasure, TextMetrics,
-    TextStyle, compute_text_offset, layout_metrics, layout_text, measure_text, register_font,
+    FontSource, FontStyle, Glyph, LineMetrics, RichSpan, TextAlign, TextBaseline,
+    TextDecoration, TextLayout, TextLine, TextMeasure, TextMetrics, TextRun, TextStyle,
+    compute_text_offset, layout_metrics, layout_text, measure_text, parse_generic_family,
+    register_font, register_font_generic,
 };

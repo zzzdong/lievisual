@@ -42,10 +42,10 @@ pub trait Renderer {
     /// 绘制圆角矩形（`radius` 为四角统一圆角半径）。
     fn draw_rounded_rect(&mut self, rect: Rect, radius: f64, style: &FillStrokeStyle) {
         let path = kurbo::RoundedRect::new(
-            rect.x,
-            rect.y,
-            rect.x + rect.width,
-            rect.y + rect.height,
+            rect.min_x(),
+            rect.min_y(),
+            rect.max_x(),
+            rect.max_y(),
             radius,
         )
         .to_path(0.1);
@@ -141,6 +141,14 @@ pub trait Renderer {
         style: &crate::text::TextStyle,
         layout: Option<&crate::text::TextLayout>,
     );
+
+    /// 绘制图片：`image` 为自包含资源，`frame` 为显示区域（pt/px 坐标）。
+    ///
+    /// 后端需解码 `image.data` 并按 `image.object_fit` 映射到 `frame`。
+    /// 默认实现为空（后端应 override 以真正绘制）。
+    fn draw_image(&mut self, image: &crate::SceneImage, frame: Rect, opacity: f64) {
+        let _ = (image, frame, opacity);
+    }
 
     /// 进入一个变换作用域（Group 或节点局部变换）。
     /// 默认空实现；支持栈式状态的后端（vello/svg group）应 override。
@@ -300,6 +308,11 @@ pub trait Renderer {
                 style,
                 closed,
             } => self.draw_path(path, style, *closed),
+            Element::Image {
+                image,
+                frame,
+                opacity,
+            } => self.draw_image(image, *frame, *opacity),
             Element::GradientPath {
                 path,
                 gradient,

@@ -1,88 +1,76 @@
 //! 几何与颜色基础类型。
 //!
-//! 坐标与尺寸统一使用 `f64`，以匹配 kurbo / parley / vello 的几何精度；
-//! 渲染后端在落盘时再按各自需要向 `f32`（`vello`）或字符串（`svg`）转换。
+//! 坐标类型（[`Point`] / [`Rect`] / [`Vec2`] / [`Size`]）**直接 re-export kurbo**：
+//! 与渲染后端（vello / parley）及下游（如 liemermaid）的几何类型零转换互通，
+//! 消除"两套坐标"导致的 `to_lie_*` 缝合函数。布局方法（`min_x`/`max_x`/`union`/
+//! `inflate`/`from_points`/`center` 等）由 kurbo 直接提供。
+//!
+//! [`Color`] / [`Transform`] 保留自定义（kurbo 无对应或需业务语义）。
 
-use kurbo::{Affine, Rect as KurboRect};
+pub use kurbo::{Point, Rect, Size, Vec2};
 
-/// 二维点。
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Point {
-    pub x: f64,
-    pub y: f64,
-}
+use kurbo::Affine;
 
-impl Point {
-    pub const fn new(x: f64, y: f64) -> Self {
-        Self { x, y }
-    }
-}
-
-impl From<(f64, f64)> for Point {
-    fn from((x, y): (f64, f64)) -> Self {
-        Self { x, y }
-    }
-}
-
-/// 二维向量（与 `Point` 区分语义，避免混用）。
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Vec2 {
-    pub x: f64,
-    pub y: f64,
-}
-
-impl Vec2 {
-    pub const fn new(x: f64, y: f64) -> Self {
-        Self { x, y }
-    }
-}
-
-/// 尺寸。
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Size {
-    pub width: f64,
-    pub height: f64,
-}
-
-impl Size {
-    pub const fn new(width: f64, height: f64) -> Self {
-        Self { width, height }
-    }
-}
-
-/// 轴对齐矩形（左上角 + 尺寸）。
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Rect {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
-
-impl Rect {
-    pub fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    /// 几何中心。
+/// [`Point`] 的便捷扩展方法（kurbo 缺失的辅助）。
+///
+/// 使用时需 `use lievisual::geometry::PointExt`。
+pub trait PointExt {
+    /// 中点。
     #[must_use]
-    pub fn center(&self) -> Point {
-        Point::new(self.x + self.width / 2.0, self.y + self.height / 2.0)
+    fn midpoint(self, other: Self) -> Self;
+    /// 两个分量是否都是有限值（非 NaN / 无穷）。
+    #[must_use]
+    fn is_finite(&self) -> bool;
+    /// 分量最小值。
+    #[must_use]
+    fn min(self, other: Self) -> Self;
+    /// 分量最大值。
+    #[must_use]
+    fn max(self, other: Self) -> Self;
+}
+
+impl PointExt for Point {
+    #[inline]
+    fn midpoint(self, other: Self) -> Self {
+        Point::new((self.x + other.x) / 2.0, (self.y + other.y) / 2.0)
     }
 
-    /// 转为 kurbo 矩形（用于后端几何计算）。
-    pub fn to_kurbo(&self) -> KurboRect {
-        KurboRect::new(self.x, self.y, self.x + self.width, self.y + self.height)
+    #[inline]
+    fn is_finite(&self) -> bool {
+        self.x.is_finite() && self.y.is_finite()
     }
 
-    /// 从 kurbo 矩形构造（左上角 + 宽高）。
-    pub fn from_kurbo(r: KurboRect) -> Self {
-        Self::new(r.min_x(), r.min_y(), r.width(), r.height())
+    #[inline]
+    fn min(self, other: Self) -> Self {
+        Point::new(self.x.min(other.x), self.y.min(other.y))
+    }
+
+    #[inline]
+    fn max(self, other: Self) -> Self {
+        Point::new(self.x.max(other.x), self.y.max(other.y))
+    }
+}
+
+/// [`Rect`] 的便捷扩展方法（kurbo 0.13 缺失的辅助）。
+///
+/// 使用时需 `use lievisual::geometry::RectExt`。
+///
+/// 注：外扩用 kurbo 自带 `Rect::inflate(width, height)`（x/y 各自外扩量）。
+pub trait RectExt {
+    /// 包含另一个矩形的包围盒（并集）。
+    #[must_use]
+    fn union(&self, other: Self) -> Rect;
+}
+
+impl RectExt for Rect {
+    #[inline]
+    fn union(&self, other: Self) -> Rect {
+        Rect::new(
+            self.min_x().min(other.min_x()),
+            self.min_y().min(other.min_y()),
+            self.max_x().max(other.max_x()),
+            self.max_y().max(other.max_y()),
+        )
     }
 }
 
@@ -203,5 +191,92 @@ impl Transform {
             self.a * p.x + self.c * p.y + self.e,
             self.b * p.x + self.d * p.y + self.f,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod point {
+        use super::{PointExt, *};
+
+        #[test]
+        fn arithmetic_and_distance() {
+            let a = Point::new(1.0, 2.0);
+            let b = Point::new(4.0, 6.0);
+            // kurbo 语义：Point + Vec2 = Point；Point - Point = Vec2。
+            assert_eq!(a + b.to_vec2(), Point::new(5.0, 8.0));
+            assert_eq!(b - a, Vec2::new(3.0, 4.0));
+            assert_eq!(a.to_vec2() * 2.0, Vec2::new(2.0, 4.0));
+            assert!((a.distance(b) - 5.0).abs() < 1e-9); // 3-4-5
+        }
+
+        #[test]
+        fn lerp_midpoint_min_max() {
+            let a = Point::new(0.0, 0.0);
+            let b = Point::new(10.0, 20.0);
+            assert_eq!(a.lerp(b, 0.5), Point::new(5.0, 10.0));
+            assert_eq!(a.midpoint(b), Point::new(5.0, 10.0));
+            assert_eq!(a.min(b), Point::new(0.0, 0.0));
+            assert_eq!(a.max(b), Point::new(10.0, 20.0));
+        }
+    }
+
+    mod vec2 {
+        use super::*;
+
+        #[test]
+        fn length_dot_and_ops() {
+            let a = Vec2::new(3.0, 4.0);
+            assert!((a.length() - 5.0).abs() < 1e-9);
+            assert!((a.dot(Vec2::new(1.0, 0.0)) - 3.0).abs() < 1e-9);
+            assert_eq!(a + Vec2::new(1.0, 1.0), Vec2::new(4.0, 5.0));
+            assert_eq!(a * 2.0, Vec2::new(6.0, 8.0));
+        }
+    }
+
+    mod rect {
+        use super::*;
+
+        #[test]
+        fn accessors_and_bounds() {
+            // kurbo Rect::new(x0, y0, x1, y1) —— min/max 语义。
+            let r = Rect::new(2.0, 4.0, 12.0, 10.0);
+            assert_eq!(r.min_x(), 2.0);
+            assert_eq!(r.max_x(), 12.0);
+            assert_eq!(r.min_y(), 4.0);
+            assert_eq!(r.max_y(), 10.0);
+            assert_eq!(r.width(), 10.0);
+            assert_eq!(r.height(), 6.0);
+        }
+
+        #[test]
+        fn from_points_normalizes_opposite_corners() {
+            let r = Rect::from_points(Point::new(5.0, 7.0), Point::new(1.0, 3.0));
+            assert_eq!(r, Rect::new(1.0, 3.0, 5.0, 7.0));
+        }
+
+        #[test]
+        fn union_and_inflate() {
+            let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+            let b = Rect::new(5.0, 5.0, 15.0, 15.0);
+            let u = a.union(b);
+            assert_eq!(u, Rect::new(0.0, 0.0, 15.0, 15.0));
+            // kurbo 自带 inflate(width, height) —— x/y 各自外扩。
+            let i = a.inflate(2.0, 2.0);
+            assert_eq!(i, Rect::new(-2.0, -2.0, 12.0, 12.0));
+        }
+
+        #[test]
+        fn contains_point() {
+            // kurbo contains 是半开区间 [x0,x1) × [y0,y1)。
+            let r = Rect::new(0.0, 0.0, 10.0, 10.0);
+            assert!(r.contains(Point::new(5.0, 5.0)));
+            assert!(r.contains(Point::new(0.0, 0.0)));
+            assert!(!r.contains(Point::new(10.0, 10.0))); // 右/下边界不含
+            assert!(!r.contains(Point::new(10.1, 5.0)));
+            assert!(!r.contains(Point::new(5.0, -1.0)));
+        }
     }
 }
