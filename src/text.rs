@@ -1083,9 +1083,10 @@ mod measure {
 
                 let baseline_x = *first_glyph_x - min_x;
 
-                // 扩展属性：从 spans 按字节区间查找。
+                // 扩展属性：从 spans 按字节区间查找（传 run 的 [start, end)，
+                // 以命中横跨多个 span 的合并 run 中带 url/背景的 span）。
                 let (url, decoration, background_color, baseline_shift) =
-                    lookup_extended_props(text_start, &span_ranges);
+                    lookup_extended_props(text_start, text_end, &span_ranges);
 
                 // 基线偏移调整 glyph y：shift>0（上标）→ y 增大 → 视觉上移（y-down）。
                 let adjusted_glyphs: Vec<Glyph> = relative_glyphs
@@ -1151,20 +1152,28 @@ mod measure {
         }
     }
 
-    /// 查找字节位置对应的扩展属性（url / decoration / background / baseline_shift）。
+    /// 查找字节区间 `[start, end)` 对应的扩展属性（url / decoration / background /
+    /// baseline_shift）。
     ///
-    /// 一个 run 可能横跨多个 span（CJK 优先后 parley 常把整行合并为一个 run），
-    /// 优先取与位置重叠且带 url / 背景的 span，否则回退到起点所在 span。
+    /// 一个 run 可能横跨多个 span（CJK 优先后 parley 常把整行合并为一个 run），因此
+    /// 用**区间重叠**匹配：优先取与 `[start, end)` 有重叠且带 url / 背景的 span，
+    /// 否则回退到起点所在 span。这样「普通文本 + 行内链接」合并成单个 run 时，
+    /// 链接 span 的 url 也能命中，而不只是 run 起点所在的 span。
     fn lookup_extended_props(
-        pos: usize,
+        start: usize,
+        end: usize,
         span_ranges: &[(usize, usize, &TextStyle)],
     ) -> (Option<String>, TextDecoration, Option<Color>, f32) {
         let matched = span_ranges
             .iter()
             .find(|(s, e, st)| {
-                *s <= pos && pos < *e && (st.url.is_some() || st.background_color.is_some())
+                *s < end && *e > start && (st.url.is_some() || st.background_color.is_some())
             })
-            .or_else(|| span_ranges.iter().find(|(s, e, _)| *s <= pos && pos < *e));
+            .or_else(|| {
+                span_ranges
+                    .iter()
+                    .find(|(s, e, _)| *s <= start && start < *e)
+            });
         match matched {
             Some((_, _, st)) => {
                 let decoration = if st.underline && st.strikethrough {
