@@ -322,14 +322,27 @@ impl Renderer for SvgRenderer {
             crate::text::TextAlign::Center => "middle",
             crate::text::TextAlign::Right => "end",
         };
-        let baseline = match style.baseline {
-            crate::text::TextBaseline::Top => "top",
-            crate::text::TextBaseline::Hanging => "hanging",
-            crate::text::TextBaseline::Alphabetic => "alphabetic",
-            crate::text::TextBaseline::Middle => "middle",
-            crate::text::TextBaseline::Ideographic => "ideographic",
-            crate::text::TextBaseline::Bottom => "bottom",
+        // SVG 的 dominant-baseline 没有 "top"/"bottom" 等值；统一转成 alphabetic
+        // baseline 坐标，让浏览器排版与 vello/parley 后端的 canvas fillText 语义一致。
+        // position.y 是锚点（由 baseline 决定含义），先算文本块顶部，再推到 alphabetic baseline。
+        let (anchor_offset, alphabetic_baseline) = match &metrics {
+            Some(m) => (style.baseline.anchor_offset(m), m.alphabetic_baseline),
+            None => {
+                let ab = style.font_size * 0.85;
+                let off = match style.baseline {
+                    crate::text::TextBaseline::Top => 0.0,
+                    crate::text::TextBaseline::Hanging => style.font_size * 0.75,
+                    crate::text::TextBaseline::Middle => style.font_size * 0.5,
+                    crate::text::TextBaseline::Alphabetic => ab,
+                    crate::text::TextBaseline::Ideographic => style.font_size * 0.9,
+                    crate::text::TextBaseline::Bottom => style.font_size * 1.3,
+                };
+                (off, ab)
+            }
         };
+        let block_top_y = position.y - anchor_offset;
+        let alphabetic_y = block_top_y + alphabetic_baseline;
+        let baseline = "alphabetic";
         let fstyle = match style.font_style {
             crate::text::FontStyle::Normal => "normal",
             crate::text::FontStyle::Italic => "italic",
@@ -390,16 +403,9 @@ impl Renderer for SvgRenderer {
                     )
                 }
             };
-            let (rx, ry) = match style.baseline {
-                crate::text::TextBaseline::Top | crate::text::TextBaseline::Hanging => {
-                    (position.x, position.y)
-                }
-                crate::text::TextBaseline::Middle => (position.x, position.y - h / 2.0),
-                crate::text::TextBaseline::Alphabetic | crate::text::TextBaseline::Ideographic => {
-                    (position.x, position.y - style.font_size * 0.85)
-                }
-                crate::text::TextBaseline::Bottom => (position.x, position.y - h),
-            };
+            // 背景矩形与文本块顶部对齐，和 vello 后端一致。
+            let rx = position.x;
+            let ry = block_top_y;
             // 右对齐时背景向左扩展。
             let bx = match style.align {
                 crate::text::TextAlign::Right => rx - w,
@@ -421,7 +427,7 @@ impl Renderer for SvgRenderer {
             el,
             r#"<text x="{:.2}" y="{:.2}" text-anchor="{}" dominant-baseline="{}" font-family="{}" font-size="{:.2}" font-style="{}" font-weight="{:.0}" fill="{}"{}{}{}{}{}{}>{}</text>"#,
             position.x,
-            position.y,
+            alphabetic_y,
             anchor,
             baseline,
             escape_attr(&style.font_family_css()),
@@ -602,6 +608,9 @@ impl SvgRenderer {
     }
 
     fn apply_stroke_only(&self, el: &mut String, style: &Stroke) {
+        // SVG 形状的 fill 默认是 black；只描边的元素必须显式关闭填充，
+        // 否则浏览器会把 polyline/arc 等区域填充成黑色。
+        let _ = write!(el, r#" fill="none""#);
         self.append_stroke(el, style);
     }
 
@@ -927,7 +936,7 @@ mod tests {
                 .with_line_height(18.0),
         ));
         let out = render(&scene);
-        assert!(out.contains(r#"dominant-baseline="middle""#));
+        assert!(out.contains(r#"dominant-baseline="alphabetic""#));
         assert!(out.contains(r#"font-weight="700""#));
         assert!(out.contains(r#"font-style="italic""#));
         assert!(out.contains(r#"style="line-height:18.00""#));
