@@ -442,9 +442,10 @@ impl Renderer for SvgRenderer {
     }
 
     fn draw_image(&mut self, image: &crate::SceneImage, frame: Rect, opacity: f64) {
-        // 编码为 data: URI（base64）并输出 <image>，由浏览器负责解码与 object-fit。
-        let b64 = base64_encode(&image.data);
-        let data_uri = format!("data:{};base64,{}", image.mime(), b64);
+        // 位图 → PNG 编码 → data: URI（base64）并输出 <image>，由浏览器负责解码与 object-fit。
+        let png = image.pixmap.to_png();
+        let b64 = base64_encode(&png);
+        let data_uri = format!("data:image/png;base64,{b64}");
         let op = if (opacity - 1.0).abs() > 1e-6 {
             format!(r#" opacity="{:.3}""#, opacity)
         } else {
@@ -453,7 +454,7 @@ impl Renderer for SvgRenderer {
         // preserveAspectRatio 控制 object-fit；x/y/width/height 为显示框。
         // None：不缩放，用原始像素尺寸放框左上角。
         let (w, h) = match image.object_fit {
-            crate::ObjectFit::None => (image.width as f64, image.height as f64),
+            crate::ObjectFit::None => (image.pixmap.width() as f64, image.pixmap.height() as f64),
             _ => (frame.width(), frame.height()),
         };
         let el = format!(
@@ -716,8 +717,7 @@ fn escape_attr(s: &str) -> String {
 
 /// 最小化 base64 编码（用于 SVG `data:` URI），避免引入额外依赖。
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -1115,25 +1115,33 @@ mod tests {
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
+    /// 构造一个实心单色 RGBA8 pixmap 图片。
+    fn test_image(w: u32, h: u32, fill: u8) -> crate::SceneImage {
+        let pixels = vec![fill; (w * h * 4) as usize];
+        crate::SceneImage::from_rgba8(w, h, pixels).unwrap()
+    }
+
     #[test]
     fn image_emits_data_uri_and_contain_meet() {
-        use crate::SceneImage;
         let mut scene = Scene::new(100.0, 100.0);
-        let img = SceneImage::new(vec![1, 2, 3], "png", 4, 4); // Contain 默认
-        scene.push(Element::image(img, Rect::new(0.0, 0.0, 10.0, 20.0)));
+        scene.push(Element::image(
+            test_image(4, 4, 255),
+            Rect::new(0.0, 0.0, 10.0, 20.0),
+        ));
         let out = render(&scene);
-        // data:image/png;base64,AQID (1,2,3)
-        assert!(out.contains(r#"href="data:image/png;base64,AQID""#));
+        // 位图 → PNG → data:image/png;base64,<real PNG>
+        assert!(out.contains(r#"href="data:image/png;base64,"#));
         assert!(out.contains(r#"width="10.00" height="20.00""#));
         assert!(out.contains(r#"preserveAspectRatio="xMidYMid meet""#));
     }
 
     #[test]
     fn image_object_fit_none_uses_raw_pixel_size() {
-        use crate::SceneImage;
         let mut scene = Scene::new(100.0, 100.0);
-        let img = SceneImage::new(vec![1], "png", 30, 40).with_object_fit(crate::ObjectFit::None);
-        scene.push(Element::image(img, Rect::new(5.0, 6.0, 105.0, 106.0)));
+        scene.push(Element::image(
+            test_image(30, 40, 255).with_object_fit(crate::ObjectFit::None),
+            Rect::new(5.0, 6.0, 105.0, 106.0),
+        ));
         let out = render(&scene);
         // None：preserveAspectRatio="none" 且 width/height 用原始像素尺寸（30x40）。
         assert!(out.contains(r#"x="5.00" y="6.00" width="30.00" height="40.00""#));
@@ -1142,10 +1150,11 @@ mod tests {
 
     #[test]
     fn image_object_fit_fill_maps_to_none() {
-        use crate::SceneImage;
         let mut scene = Scene::new(100.0, 100.0);
-        let img = SceneImage::new(vec![1], "png", 10, 10).with_object_fit(crate::ObjectFit::Fill);
-        scene.push(Element::image(img, Rect::new(0.0, 0.0, 10.0, 10.0)));
+        scene.push(Element::image(
+            test_image(10, 10, 255).with_object_fit(crate::ObjectFit::Fill),
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+        ));
         let out = render(&scene);
         // Fill：用 frame 尺寸 + preserveAspectRatio="none"。
         assert!(out.contains(r#"width="10.00" height="10.00""#));
@@ -1154,11 +1163,13 @@ mod tests {
 
     #[test]
     fn image_respects_opacity() {
-        use crate::SceneImage;
         let mut scene = Scene::new(100.0, 100.0);
-        let img = SceneImage::new(vec![1], "png", 10, 10);
         scene.push_node(
-            SceneNode::from(Element::image(img, Rect::new(0.0, 0.0, 10.0, 10.0))).with_opacity(0.5),
+            SceneNode::from(Element::image(
+                test_image(10, 10, 255),
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+            ))
+            .with_opacity(0.5),
         );
         let out = render(&scene);
         assert!(out.contains(r#"opacity="0.500""#));
@@ -1183,7 +1194,7 @@ mod tests {
 
     #[test]
     fn text_background_uses_layout_exact_size() {
-        use crate::text::{measure_text, RichSpan, TextStyle};
+        use crate::text::{RichSpan, TextStyle, measure_text};
         let style = TextStyle::new(Color::BLACK, 12.0, "sans-serif")
             .with_background_color(Some(Color::rgb(0xf0, 0xf0, 0xf0)));
         let m = measure_text(

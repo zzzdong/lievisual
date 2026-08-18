@@ -75,7 +75,7 @@ impl VelloPixmapRenderer {
         pixmap
     }
 
-    /// 渲染场景并导出 PNG 字节（依赖 `image` 的 PNG 编码，常驻依赖）。
+    /// 渲染场景并导出 PNG 字节（依赖 `png` 常驻编码）。
     pub fn render_png(&mut self, scene: &Scene) -> Vec<u8> {
         let pixmap = self.render_scene_to_pixmap(scene);
         pixmap_to_png(&pixmap)
@@ -290,16 +290,10 @@ impl Renderer for VelloPixmapRenderer {
     }
 
     fn draw_image(&mut self, image: &crate::SceneImage, frame: Rect, opacity: f64) {
-        if image.data.is_empty() || image.width == 0 || image.height == 0 {
+        let src = &image.pixmap;
+        if src.width() == 0 || src.height() == 0 {
             return;
         }
-        let dyn_img = match image::load_from_memory(&image.data) {
-            Ok(img) => img,
-            Err(e) => {
-                eprintln!("[lievisual] draw_image: 解码失败 ({}): {}", image.data.len(), e);
-                return;
-            }
-        };
 
         // frame 已处于 px 坐标（场景坐标即 px）；直接换算到设备像素。
         let fx = frame.min_x();
@@ -308,17 +302,12 @@ impl Renderer for VelloPixmapRenderer {
         let fh = frame.height().max(1.0);
 
         // 按 object_fit 计算图片在 frame 内的实际绘制矩形（局部坐标，相对 frame 原点）。
+        let iw = src.width() as f64;
+        let ih = src.height() as f64;
         let (dw, dh, offx, offy) = match image.object_fit {
             crate::ObjectFit::Fill => (fw, fh, 0.0, 0.0),
-            crate::ObjectFit::None => (
-                image.width as f64,
-                image.height as f64,
-                0.0,
-                0.0,
-            ),
+            crate::ObjectFit::None => (iw, ih, 0.0, 0.0),
             fit => {
-                let iw = image.width as f64;
-                let ih = image.height as f64;
                 let scale = if fit == crate::ObjectFit::Cover {
                     (fw / iw).max(fh / ih)
                 } else {
@@ -336,15 +325,16 @@ impl Renderer for VelloPixmapRenderer {
         let frame_h = (fh.ceil() as u32).max(1).min(u16::MAX as u32);
         let dest_w = (dw.ceil() as u32).max(1).min(u16::MAX as u32);
         let dest_h = (dh.ceil() as u32).max(1).min(u16::MAX as u32);
-        let scaled = dyn_img.resize_exact(dest_w, dest_h, image::imageops::FilterType::Triangle);
-        let rgba = scaled.to_rgba8();
+        // 缩放源位图（RGBA8）到目标尺寸。
+        let rgba = resize_rgba8(src.pixels(), src.width(), src.height(), dest_w, dest_h);
 
         // 应用整体 opacity：预乘到 alpha 通道（frame 透明底，src-over 合成正确）。
         let op = opacity.clamp(0.0, 1.0);
-        let mut dest_pixels: Vec<vello_cpu::color::PremulRgba8> =
-            vec![vello_cpu::color::PremulRgba8::from_u8_array([0, 0, 0, 0]); (frame_w * frame_h) as usize];
+        let mut dest_pixels: Vec<vello_cpu::color::PremulRgba8> = vec![
+                vello_cpu::color::PremulRgba8::from_u8_array([0, 0, 0, 0]);
+                (frame_w * frame_h) as usize
+            ];
         let src_pixels: Vec<vello_cpu::color::PremulRgba8> = rgba
-            .as_raw()
             .chunks_exact(4)
             .map(|p| {
                 let [r, g, b, a] = [p[0], p[1], p[2], p[3]];
@@ -377,7 +367,8 @@ impl Renderer for VelloPixmapRenderer {
             }
         }
 
-        let dest_pixmap = vello_cpu::Pixmap::from_parts(dest_pixels, frame_w as u16, frame_h as u16);
+        let dest_pixmap =
+            vello_cpu::Pixmap::from_parts(dest_pixels, frame_w as u16, frame_h as u16);
         let brush = vello_cpu::Image {
             image: vello_cpu::ImageSource::Pixmap(std::sync::Arc::new(dest_pixmap)),
             sampler: vello_cpu::peniko::ImageSampler::default(),
@@ -507,21 +498,61 @@ impl Renderer for VelloPixmapRenderer {
     }
 }
 
-/// 将 Pixmap 转为 PNG 字节。
+/// 将 vello Pixmap 转为 PNG 字节（RGBA8 → PNG，经 `png` 常驻依赖）。
 fn pixmap_to_png(pixmap: &Pixmap) -> Vec<u8> {
-    use image::{DynamicImage, RgbaImage};
     let (w, h) = (pixmap.width() as u32, pixmap.height() as u32);
     let data: Vec<u8> = pixmap
         .data()
         .iter()
         .flat_map(|p| vec![p.r, p.g, p.b, p.a])
         .collect();
-    let img = RgbaImage::from_raw(w, h, data).expect("无法由 Pixmap 构造 RgbaImage");
-    let mut buf = std::io::Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(img)
-        .write_to(&mut buf, image::ImageFormat::Png)
-        .expect("PNG 编码失败");
-    buf.into_inner()
+    let mut out = Vec::with_capacity(data.len() + 64);
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().expect("PNG 编码：写入头失败");
+        writer
+            .write_image_data(&data)
+            .expect("PNG 编码：写入像素失败");
+    }
+    out
+}
+
+/// 双线性缩放 RGBA8 位图（`src` 尺寸 `sw×sh` → `dw×dh`）。
+///
+/// 用双线性插值替代 `image` 的 `resize_exact`（移除解码依赖后自实现，够图表场景用）。
+fn resize_rgba8(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    if sw == dw && sh == dh {
+        return src.to_vec();
+    }
+    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
+    let sx = sw as f64 / dw as f64;
+    let sy = sh as f64 / dh as f64;
+    for dy in 0..dh {
+        let fy = (dy as f64 + 0.5) * sy - 0.5;
+        let y0 = fy.floor().max(0.0) as u32;
+        let y1 = (y0 + 1).min(sh - 1);
+        let wy = (fy - fy.floor()).clamp(0.0, 1.0);
+        for dx in 0..dw {
+            let fx = (dx as f64 + 0.5) * sx - 0.5;
+            let x0 = fx.floor().max(0.0) as u32;
+            let x1 = (x0 + 1).min(sw - 1);
+            let wx = (fx - fx.floor()).clamp(0.0, 1.0);
+            // 四个采样像素（RGBA8，u32 直接读取）。
+            let p00 = &src[((y0 * sw + x0) as usize) * 4..];
+            let p01 = &src[((y0 * sw + x1) as usize) * 4..];
+            let p10 = &src[((y1 * sw + x0) as usize) * 4..];
+            let p11 = &src[((y1 * sw + x1) as usize) * 4..];
+            let out_idx = ((dy * dw + dx) as usize) * 4;
+            for c in 0..4 {
+                let top = p00[c] as f64 * (1.0 - wx) + p01[c] as f64 * wx;
+                let bot = p10[c] as f64 * (1.0 - wx) + p11[c] as f64 * wx;
+                out[out_idx + c] = (top * (1.0 - wy) + bot * wy).round() as u8;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

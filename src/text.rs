@@ -454,6 +454,10 @@ pub struct TextRun {
     pub text: String,
     /// 字体原始字节（解析自 parley FontData 的 blob，自包含，`Arc` 共享）。
     pub font_data: Arc<Vec<u8>>,
+    /// 字体在字体文件集合（ttc / otc）中的索引。单字体文件恒为 0。
+    ///
+    /// 下游（如 PDF 嵌入字体）用它从 `font_data` 定位到具体的字体实例。
+    pub font_index: u32,
     /// 字体大小。
     pub font_size: f32,
     /// 字体是否粗体（SVG 等用系统字体的后端据此输出 font-weight）。
@@ -531,8 +535,8 @@ pub struct TextLayout {
 }
 
 pub use measure::{
-    FontSource, compute_text_offset, layout_metrics, layout_text, measure_text, parse_generic_family,
-    register_font, register_font_generic,
+    FontSource, compute_text_offset, layout_metrics, layout_text, measure_text,
+    parse_generic_family, register_font, register_font_generic,
 };
 
 /// 文本测量结果（canvas `measureText()` 返回值）。
@@ -958,6 +962,7 @@ mod measure {
             let mut run_infos: Vec<(
                 Color,
                 Arc<Vec<u8>>,
+                u32,
                 f32,
                 parley::layout::Run<'_, Color>,
                 f32,
@@ -968,9 +973,11 @@ mod measure {
                 if let parley::layout::PositionedLayoutItem::GlyphRun(glyph_run) = item {
                     let run = glyph_run.run();
                     let color = glyph_run.style().brush;
-                    // 字体字节：按 Blob::id() 去重缓存。
-                    let blob = &run.font().data;
+                    // 字体字节 + 集合索引：字节按 Blob::id() 去重缓存。
+                    let font = run.font();
+                    let blob = &font.data;
                     let font_id = blob.id();
+                    let font_index = font.index;
                     let font_arc = {
                         let mut cache = FONT_BYTE_CACHE
                             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -989,7 +996,7 @@ mod measure {
                         .map(|g| g.x)
                         .unwrap_or(0.0);
 
-                    run_infos.push((color, font_arc, font_size, *run, first_glyph_x));
+                    run_infos.push((color, font_arc, font_index, font_size, *run, first_glyph_x));
 
                     // 收集已定位字形，cluster 经 visual_clusters 的 text_range 提供。
                     let positioned: Vec<_> = glyph_run.positioned_glyphs().collect();
@@ -1050,7 +1057,8 @@ mod measure {
 
             for (start_idx, end_idx) in run_glyph_ranges.iter() {
                 let run_idx = glyph_data[*start_idx].1;
-                let (color, font_data, font_size, run, first_glyph_x) = &run_infos[run_idx];
+                let (color, font_data, font_index, font_size, run, first_glyph_x) =
+                    &run_infos[run_idx];
 
                 let run_text_range = run.text_range();
                 let text_start = run_text_range.start;
@@ -1101,6 +1109,7 @@ mod measure {
                 runs.push(TextRun {
                     text: run_text,
                     font_data: font_data.clone(),
+                    font_index: *font_index,
                     font_size: *font_size,
                     font_weight_bold,
                     font_style_italic,
@@ -1152,7 +1161,9 @@ mod measure {
     ) -> (Option<String>, TextDecoration, Option<Color>, f32) {
         let matched = span_ranges
             .iter()
-            .find(|(s, e, st)| *s <= pos && pos < *e && (st.url.is_some() || st.background_color.is_some()))
+            .find(|(s, e, st)| {
+                *s <= pos && pos < *e && (st.url.is_some() || st.background_color.is_some())
+            })
             .or_else(|| span_ranges.iter().find(|(s, e, _)| *s <= pos && pos < *e));
         match matched {
             Some((_, _, st)) => {
@@ -1229,7 +1240,9 @@ mod measure {
             let registered = font_cx.collection.register_fonts(data, override_info);
             if let Some(generic) = generic_family {
                 let ids: Vec<_> = registered.into_iter().map(|(id, _)| id).collect();
-                font_cx.collection.append_generic_families(generic, ids.into_iter());
+                font_cx
+                    .collection
+                    .append_generic_families(generic, ids.into_iter());
             }
         });
         Ok(())
@@ -1449,8 +1462,8 @@ mod tests {
             assert_eq!(xj, xl);
 
             // 多行文本 Justify 排版不 panic、产生多行（视觉两端对齐由 parley 保证）。
-            let jstyle = TextStyle::new(Color::BLACK, 16.0, "sans-serif")
-                .with_align(TextAlign::Justify);
+            let jstyle =
+                TextStyle::new(Color::BLACK, 16.0, "sans-serif").with_align(TextAlign::Justify);
             let text = "The quick brown fox jumps over the lazy dog while padding enough to wrap.";
             let jl = layout_text(
                 std::slice::from_ref(&RichSpan::new(text, jstyle.clone())),
@@ -1458,10 +1471,7 @@ mod tests {
             );
             let lines: Vec<_> = jl.lines.iter().collect();
             assert!(lines.len() >= 2, "应产生多行");
-            let single = layout_text(
-                std::slice::from_ref(&RichSpan::new("a", jstyle)),
-                None,
-            );
+            let single = layout_text(std::slice::from_ref(&RichSpan::new("a", jstyle)), None);
             assert!(jl.height > single.height);
         }
     }

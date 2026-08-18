@@ -36,36 +36,70 @@ pub enum ObjectFit {
     None,
 }
 
-/// 场景中的图片资源（自包含二进制）。
+/// 场景中的图片资源（自包含 RGBA8 位图）。
 ///
-/// 持有原始编码字节与像素尺寸，由渲染后端负责解码与绘制。
-/// `frame` 为显示区域（在 [`Element::Image`] 中给出），`object_fit` 决定
-/// 图片如何映射到 `frame`。
+/// 持有已解码的像素位图（[`crate::Pixmap`]），**lievisual 不做解码**——解码是调用方 /
+/// 资源加载层的职责。`frame` 为显示区域（在 [`Element::Image`] 中给出），`object_fit`
+/// 决定图片如何映射到 `frame`。
 #[derive(Debug, Clone)]
 pub struct SceneImage {
-    /// 原始图片字节（png/jpeg/... 等编码格式）。
-    pub data: Vec<u8>,
-    /// 格式标签（如 "png" / "jpeg" / "webp"），用于选择解码器与 SVG mime。
-    pub format: String,
-    /// 原始像素宽。
-    pub width: u32,
-    /// 原始像素高。
-    pub height: u32,
+    /// 已解码的 RGBA8 位图。
+    pub pixmap: crate::Pixmap,
     /// 适应方式。
     pub object_fit: ObjectFit,
 }
 
 impl SceneImage {
-    /// 构造（自动推导默认 `object_fit = Contain`）。
+    /// 由已解码的 RGBA8 位图构造（默认 `object_fit = Contain`）。
     #[must_use]
-    pub fn new(data: Vec<u8>, format: impl Into<String>, width: u32, height: u32) -> Self {
+    pub fn from_pixmap(pixmap: crate::Pixmap) -> Self {
         Self {
-            data,
-            format: format.into(),
-            width,
-            height,
+            pixmap,
             object_fit: ObjectFit::Contain,
         }
+    }
+
+    /// 便捷：由 RGBA8 像素构造位图（自动推导默认 `object_fit = Contain`）。
+    ///
+    /// 长度必须为 `4 * width * height`，否则返回 `None`。
+    #[must_use]
+    pub fn from_rgba8(
+        width: u32,
+        height: u32,
+        pixels: impl Into<std::sync::Arc<[u8]>>,
+    ) -> Option<Self> {
+        crate::Pixmap::from_rgba8(width, height, pixels).map(Self::from_pixmap)
+    }
+
+    /// 便捷：由 PNG 字节解码构造（`png` 常驻依赖）。非 PNG / 解码失败返回 `None`。
+    #[must_use]
+    pub fn from_png(bytes: &[u8]) -> Option<Self> {
+        crate::Pixmap::decode_png(bytes).map(Self::from_pixmap)
+    }
+
+    /// 由任意编码字节解码构造（`jpeg` / `webp` / `gif` 等，经 `image`）。
+    ///
+    /// 仅在启用 `extra-image-codecs` feature 时可用。默认 lievisual 不做解码，
+    /// 图片以已解码 RGBA8 位图进入 IR。
+    #[cfg(feature = "extra-image-codecs")]
+    #[must_use]
+    pub fn from_encoded(bytes: &[u8]) -> Option<Self> {
+        let dyn_img = image::load_from_memory(bytes).ok()?;
+        let rgba = dyn_img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        Self::from_rgba8(w, h, rgba.into_raw())
+    }
+
+    /// 原始像素宽。
+    #[must_use]
+    pub fn width(&self) -> u32 {
+        self.pixmap.width()
+    }
+
+    /// 原始像素高。
+    #[must_use]
+    pub fn height(&self) -> u32 {
+        self.pixmap.height()
     }
 
     /// 设置适应方式。
@@ -73,20 +107,6 @@ impl SceneImage {
     pub fn with_object_fit(mut self, fit: ObjectFit) -> Self {
         self.object_fit = fit;
         self
-    }
-
-    /// SVG 输出用的 mime 类型（由 `format` 推导）。
-    #[must_use]
-    pub fn mime(&self) -> &'static str {
-        match self.format.to_ascii_lowercase().as_str() {
-            "png" => "image/png",
-            "jpeg" | "jpg" => "image/jpeg",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            "svg" => "image/svg+xml",
-            "bmp" => "image/bmp",
-            _ => "image/png",
-        }
     }
 
     /// SVG 输出用的 `preserveAspectRatio` 片段（无前缀）。
@@ -1257,30 +1277,18 @@ mod tests {
         }
     }
 
-    /// 图片资源：SceneImage 的 mime / object-fit 映射。
+    /// 图片资源：SceneImage 的 object-fit 映射与构造。
     mod image {
         use super::*;
 
-        #[test]
-        fn mime_by_format() {
-            for (fmt, expect) in [
-                ("png", "image/png"),
-                ("jpeg", "image/jpeg"),
-                ("jpg", "image/jpeg"),
-                ("gif", "image/gif"),
-                ("webp", "image/webp"),
-                ("svg", "image/svg+xml"),
-                ("bmp", "image/bmp"),
-                ("PNG", "image/png"),
-            ] {
-                let img = SceneImage::new(vec![], fmt, 1, 1);
-                assert_eq!(img.mime(), expect, "format={fmt}");
-            }
+        fn img(w: u32, h: u32) -> SceneImage {
+            let px = vec![0u8; (w * h * 4) as usize];
+            SceneImage::from_rgba8(w, h, px).unwrap()
         }
 
         #[test]
         fn preserve_aspect_ratio_mapping() {
-            let base = SceneImage::new(vec![], "png", 10, 10);
+            let base = img(10, 10);
             assert_eq!(base.preserve_aspect_ratio(), "xMidYMid meet");
             assert_eq!(
                 base.clone()
@@ -1304,13 +1312,29 @@ mod tests {
 
         #[test]
         fn default_object_fit_is_contain() {
-            let img = SceneImage::new(vec![], "png", 1, 1);
-            assert_eq!(img.object_fit, ObjectFit::Contain);
+            assert_eq!(img(1, 1).object_fit, ObjectFit::Contain);
+        }
+
+        #[test]
+        fn from_rgba8_validates_dimensions() {
+            assert!(SceneImage::from_rgba8(4, 4, vec![0u8; 64]).is_some());
+            // 长度不足 → None。
+            assert!(SceneImage::from_rgba8(4, 4, vec![0u8; 63]).is_none());
+        }
+
+        #[test]
+        fn from_png_roundtrips() {
+            let pm = crate::Pixmap::from_rgba8(2, 2, vec![255u8; 16]).unwrap();
+            let png = pm.to_png();
+            let img = SceneImage::from_png(&png).expect("有效 PNG 应可解码");
+            assert_eq!(img.width(), 2);
+            assert_eq!(img.height(), 2);
+            assert_eq!(img.pixmap.pixels(), pm.pixels());
         }
 
         #[test]
         fn image_element_constructs() {
-            let img = SceneImage::new(vec![0, 1, 2], "png", 4, 4);
+            let img = img(4, 4);
             let el = Element::image(img, Rect::new(0.0, 0.0, 10.0, 10.0));
             match &el {
                 Element::Image {
@@ -1318,7 +1342,8 @@ mod tests {
                     frame,
                     opacity,
                 } => {
-                    assert_eq!(image.width, 4);
+                    assert_eq!(image.width(), 4);
+                    assert_eq!(image.height(), 4);
                     assert_eq!(frame.width(), 10.0);
                     assert_eq!(*opacity, 1.0);
                 }

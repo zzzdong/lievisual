@@ -142,10 +142,10 @@ pub trait Renderer {
         layout: Option<&crate::text::TextLayout>,
     );
 
-    /// 绘制图片：`image` 为自包含资源，`frame` 为显示区域（pt/px 坐标）。
+    /// 绘制图片：`image` 为自包含 RGBA8 位图，`frame` 为显示区域（pt/px 坐标）。
     ///
-    /// 后端需解码 `image.data` 并按 `image.object_fit` 映射到 `frame`。
-    /// 默认实现为空（后端应 override 以真正绘制）。
+    /// 后端直接消费 `image.pixmap`（已解码，**无需再解码**）并按 `image.object_fit`
+    /// 映射到 `frame`。默认实现为空（后端应 override 以真正绘制）。
     fn draw_image(&mut self, image: &crate::SceneImage, frame: Rect, opacity: f64) {
         let _ = (image, frame, opacity);
     }

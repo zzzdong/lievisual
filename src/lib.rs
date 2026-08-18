@@ -24,7 +24,10 @@
 //!   / `scale`）。
 //! - [`render::VelloPixmapRenderer`]：vello_cpu 栅格化 → PNG 字节。
 
+pub mod builder;
 pub mod geometry;
+pub mod glyph;
+pub mod pixmap;
 pub mod render;
 pub mod scene;
 pub mod text;
@@ -34,13 +37,14 @@ pub mod text;
 pub use parley;
 
 pub use geometry::{Color, Point, Rect, Size, Transform, Vec2};
+pub use pixmap::Pixmap;
 pub use scene::{
     Clip, Element, Fill, FillStrokeStyle, GradientStop, Layer, LineCap, LineJoin, LinearGradient,
     ObjectFit, RadialGradient, Scene, SceneImage, SceneNode, Stroke,
 };
 pub use text::{
-    FontSource, FontStyle, Glyph, LineMetrics, RichSpan, TextAlign, TextBaseline,
-    TextDecoration, TextLayout, TextLine, TextMeasure, TextMetrics, TextRun, TextStyle,
-    compute_text_offset, layout_metrics, layout_text, measure_text, parse_generic_family,
-    register_font, register_font_generic,
+    FontSource, FontStyle, Glyph, LineMetrics, RichSpan, TextAlign, TextBaseline, TextDecoration,
+    TextLayout, TextLine, TextMeasure, TextMetrics, TextRun, TextStyle, compute_text_offset,
+    layout_metrics, layout_text, measure_text, parse_generic_family, register_font,
+    register_font_generic,
 };

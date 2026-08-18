@@ -22,5 +22,15 @@ kurbo = "0.13"
 vello_cpu = "0.2"
 # 文本排版（Canvas 风格 API 基于 parley）
 parley = "0.11"
-# 图片编解码：用于场景图片资源的 PNG/JPEG 解码与 PNG 编码
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+# 字形轮廓（glyph id → 贝塞尔路径，供 PDF/DOCX 矢量文本保真）
+skrifa = "0.44"
+# PNG 编解码：自包含位图（Pixmap）的 PNG 编码（SVG 内嵌 / render_png 导出）与解码（from_png）
+png = "0.18"
+# 额外图片编解码（jpeg/webp/gif 等解码），经 `extra-image-codecs` feature 开启。
+# 默认不启用：lievisual 图片以已解码 RGBA8 位图进入 IR，解码是调用方职责。
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+
+[features]
+default = []
+# 启用基于 `image` 的额外编解码：提供 `SceneImage::from_encoded` 等从非 PNG 字节解码的入口。
+extra-image-codecs = ["dep:image"]
