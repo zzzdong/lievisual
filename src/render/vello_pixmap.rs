@@ -67,8 +67,22 @@ impl VelloPixmapRenderer {
             self.ctx.set_paint(self.to_vello(&bg));
             self.ctx.fill_rect(&rect);
         }
+        // 场景坐标（范围 scene.width × scene.height）需映射到像素画布（self.width × self.height）。
+        // SVG 后端靠 viewBox + width/height 由浏览器自动缩放；vello 后端必须显式应用该 scale，
+        // 否则图形会画在画布左上角的 [0,scene.width]×[0,scene.height] 子区域内。
+        let s = if scene.width > 0.0 {
+            self.width as f64 / scene.width
+        } else {
+            1.0
+        };
+        let base = vello_cpu::kurbo::Affine::scale(s);
+        self.ctx.set_transform(base);
+        self.transform_stack.push(base);
         // 委托默认遍历（排序 + Group 递归 + 节点属性 + 局部变换）。
         self.render_scene(scene);
+        if self.transform_stack.pop().is_some() {
+            self.ctx.set_transform(vello_cpu::kurbo::Affine::IDENTITY);
+        }
 
         let mut pixmap = Pixmap::new(self.width as u16, self.height as u16);
         self.ctx.render(&mut pixmap, &mut self.resources);

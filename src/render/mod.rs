@@ -21,6 +21,36 @@ pub use vello_pixmap::VelloPixmapRenderer;
 mod svg;
 mod vello_pixmap;
 
+/// 在屏幕(y-down)坐标系下构造一段圆弧路径，与 SVG 后端的 `arc_path_d` 几何完全一致。
+///
+/// 场景（SVG/vello 一致）采用 y-down 坐标系：原点在左上、y 向下、0 角为 +x、正角为顺时针。
+/// 而 kurbo::Arc 按数学 y-up 采样：`start=(cx+r·cos a, cy+r·sin a)`、正 sweep 为逆时针。
+///
+/// 这里复用 kurbo 成熟的贝塞尔弧逼近（`to_path`），再做一次 y-up → y-down 的坐标映射，
+/// 使采样出的弧与 SVG 后端公式（`arc_path_d`）完全对齐，避免两端画出的圆弧/扇形垂直镜像：
+/// 1. 圆心 y、角度统一取负，在数学平面构造出"待翻转"的弧；
+/// 2. 整体应用 y 轴翻转 `Affine(1,0,0,-1)`，把数学坐标映回屏幕坐标。
+pub(crate) fn arc_path_y_down(
+    center: Point,
+    radii: Vec2,
+    start_angle: f64,
+    sweep_angle: f64,
+) -> kurbo::BezPath {
+    // 场景 y-down → 数学 y-up：圆心 y 与角度符号取反（0 角不变，顺/逆时针互换）。
+    let arc = kurbo::Arc::new(
+        (center.x, -center.y),
+        (radii.x, radii.y),
+        -start_angle,
+        -sweep_angle,
+        0.0,
+    )
+    .to_path(0.1);
+    // 数学 y-up → 场景 y-down：y 轴整体翻转（x 不变）。
+    let mut path = arc;
+    path.apply_affine(kurbo::Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, 0.0]));
+    path
+}
+
 /// 渲染后端接口（Canvas API 风格）。
 ///
 /// 调用者（liecharts / liemermaid / liepress）生成 [`Scene`] 后，选择一个 `Renderer`
@@ -80,14 +110,7 @@ pub trait Renderer {
         sweep_angle: f64,
         style: &Stroke,
     ) {
-        let path = kurbo::Arc::new(
-            (center.x, center.y),
-            (radii.x, radii.y),
-            start_angle,
-            sweep_angle,
-            0.0,
-        )
-        .to_path(0.1);
+        let path = crate::render::arc_path_y_down(center, radii, start_angle, sweep_angle);
         let style = FillStrokeStyle {
             fill: None,
             stroke: Some(style.clone()),
@@ -106,15 +129,24 @@ pub trait Renderer {
     ) {
         let mut path = kurbo::BezPath::new();
         path.move_to((center.x, center.y));
-        let arc = kurbo::Arc::new(
-            (center.x, center.y),
-            (radius, radius),
+        let arc = crate::render::arc_path_y_down(
+            center,
+            Vec2::new(radius, radius),
             start_angle,
             sweep_angle,
-            0.0,
-        )
-        .to_path(0.1);
-        path.extend(arc);
+        );
+        // arc 路径以 MoveTo(start) 开头，需替换为 LineTo(start)，
+        // 这样整体路径为 `M center L start [arc...] end Z` —— 真正的扇形
+        // （含圆心顶点和两条半径边），与 SVG 后端的 `M center L start A end Z` 一致。
+        let mut els = arc.elements().iter();
+        if let Some(kurbo::PathEl::MoveTo(p0)) = els.next() {
+            path.line_to(*p0);
+            for el in els {
+                path.push(*el);
+            }
+        } else {
+            path.extend(arc);
+        }
         path.close_path();
         self.draw_path(&path, style, false);
     }
@@ -327,5 +359,99 @@ pub trait Renderer {
         }
 
         self.pop_node_scope(node);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::geometry::{Point, Vec2};
+
+    /// 与 SVG 后端 `arc_path_d` 完全一致的屏幕(y-down)坐标端点公式。
+    /// start = (cx + rx·cos a, cy + ry·sin a)，end = (cx + rx·cos(a+s), cy + ry·sin(a+s))。
+    fn expected_screen_points(
+        center: Point,
+        radii: Vec2,
+        start_angle: f64,
+        sweep_angle: f64,
+    ) -> (Point, Point) {
+        let start = Point::new(
+            center.x + radii.x * start_angle.cos(),
+            center.y + radii.y * start_angle.sin(),
+        );
+        let end_angle = start_angle + sweep_angle;
+        let end = Point::new(
+            center.x + radii.x * end_angle.cos(),
+            center.y + radii.y * end_angle.sin(),
+        );
+        (start, end)
+    }
+
+    /// 校验 vello 后端 `arc_path_y_down` 生成的弧端点与 SVG `arc_path_d` 公式一致，
+    /// 确保两个后端画出的饼图/圆弧形状完全对齐（曾因 kurbo 数学坐标未翻转而垂直镜像）。
+    #[test]
+    fn arc_y_down_matches_svg_geometry() {
+        let cases = [
+            (
+                Point::new(300.0, 320.0),
+                Vec2::new(70.0, 70.0),
+                0.0f64,
+                std::f64::consts::FRAC_PI_2,
+            ),
+            (
+                Point::new(300.0, 320.0),
+                Vec2::new(70.0, 70.0),
+                std::f64::consts::FRAC_PI_2,
+                std::f64::consts::FRAC_PI_2,
+            ),
+            (
+                Point::new(300.0, 320.0),
+                Vec2::new(70.0, 70.0),
+                std::f64::consts::PI,
+                -std::f64::consts::FRAC_PI_2,
+            ),
+            (Point::new(100.0, 100.0), Vec2::new(40.0, 20.0), 0.4, 2.7),
+        ];
+        for (center, radii, a, s) in cases {
+            let path = crate::render::arc_path_y_down(center, radii, a, s);
+            // 纯弧路径：elements 以 MoveTo(start) 开头，后续 CurveTo 终点依次追加，
+            // 因此 pts[0] 是弧起点，pts[last] 是弧终点。
+            let pts: Vec<Point> = path
+                .elements()
+                .iter()
+                .filter_map(|el| match el {
+                    kurbo::PathEl::MoveTo(p)
+                    | kurbo::PathEl::LineTo(p)
+                    | kurbo::PathEl::QuadTo(_, p)
+                    | kurbo::PathEl::CurveTo(_, _, p) => Some(Point::new(p.x, p.y)),
+                    kurbo::PathEl::ClosePath => None,
+                })
+                .collect();
+            let n = pts.len();
+            assert!(n >= 2, "arc path should have at least 2 points");
+            let got_start = pts[0];
+            let got_end = pts[n - 1];
+            let (exp_start, exp_end) = expected_screen_points(center, radii, a, s);
+            let eps = 1e-6;
+            assert!(
+                (got_start.x - exp_start.x).abs() < eps && (got_start.y - exp_start.y).abs() < eps,
+                "start mismatch: got {:?} expected {:?} (center={:?} radii={:?} a={} s={})",
+                got_start,
+                exp_start,
+                center,
+                radii,
+                a,
+                s
+            );
+            assert!(
+                (got_end.x - exp_end.x).abs() < eps && (got_end.y - exp_end.y).abs() < eps,
+                "end mismatch: got {:?} expected {:?} (center={:?} radii={:?} a={} s={})",
+                got_end,
+                exp_end,
+                center,
+                radii,
+                a,
+                s
+            );
+        }
     }
 }

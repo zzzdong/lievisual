@@ -1,6 +1,6 @@
 [package]
 name = "lievisual"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 edition = "2024"
 rust-version = "1.92"
 authors = ["zzzdong <kuwater@163.com>"]
@@ -23,7 +23,7 @@ vello_cpu = "0.2"
 # 文本排版（Canvas 风格 API 基于 parley）
 parley = "0.11"
 # 字形轮廓（glyph id → 贝塞尔路径，供 PDF/DOCX 矢量文本保真）
-skrifa = "0.44"
+skrifa = "0.46"
 # PNG 编解码：自包含位图（Pixmap）的 PNG 编码（SVG 内嵌 / render_png 导出）与解码（from_png）
 png = "0.18"
 # 额外图片编解码（jpeg/webp/gif 等解码），经 `extra-image-codecs` feature 开启。

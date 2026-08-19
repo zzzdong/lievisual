@@ -170,15 +170,18 @@ impl Renderer for SvgRenderer {
     }
 
     fn draw_rounded_rect(&mut self, rect: Rect, radius: f64, style: &FillStrokeStyle) {
+        // 与 PNG 后端一致：用几何边界得到非负宽高（Rect 可能 min > max）。
+        let (x, y) = (
+            rect.min_x().min(rect.max_x()),
+            rect.min_y().min(rect.max_y()),
+        );
+        let w = (rect.max_x() - rect.min_x()).abs();
+        let h = (rect.max_y() - rect.min_y()).abs();
         let mut el = String::new();
         let _ = write!(
             el,
             r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="{:.2}" "#,
-            rect.min_x(),
-            rect.min_y(),
-            rect.width(),
-            rect.height(),
-            radius
+            x, y, w, h, radius
         );
         self.apply_fill_stroke(&mut el, style);
         let _ = writeln!(el, "/>");
