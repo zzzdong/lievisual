@@ -514,6 +514,8 @@ pub struct TextLine {
     pub bounds: Rect,
     /// 行内字体度量（ascent / descent / baseline / line_height）。
     pub metrics: LineMetrics,
+    /// 该行实际字形的 ink 边界（轮廓 bbox，相对 layout 原点），用于精准垂直居中。
+    pub ink_bounds: Rect,
 }
 
 /// 富文本排版结果 —— 包含排版后的行集合。
@@ -532,6 +534,19 @@ pub struct TextLayout {
     pub width: f64,
     /// 布局总高度。
     pub height: f64,
+    /// 全部行的实际字形 ink 边界（轮廓 bbox，相对 layout 原点），用于精准垂直居中。
+    pub ink_bounds: Rect,
+}
+
+impl TextLayout {
+    /// 实际字形的 ink 边界（轮廓 bbox，相对 layout 原点）。
+    ///
+    /// 由排版时在 [`layout_text`] / [`measure_text`] 中基于 skrifa 逐字形轮廓计算，
+    /// 比 parley 的 `LineMetrics`（含 ascent/descent 设计余量）更贴近真实视觉边界，
+    /// 用于文本垂直居中（`visual_height` 等）。
+    pub fn ink_bounds(&self) -> Rect {
+        self.ink_bounds
+    }
 }
 
 pub use measure::{
@@ -1134,10 +1149,23 @@ mod measure {
                 (row_top_rel + line_height) as f64,
             );
 
+            // 行级视觉 ink 边界（相对 layout 原点）。
+            // 顶 = 基线 - ascent；底 = 基线（忽略 descent 设计余量，节点文字无下伸部时最准）。
+            // 横向取整行 bounds（含字间距与对齐），与红框宽度一致。
+            let ascent = line_metrics.ascent as f64;
+            let baseline = line_metrics.baseline as f64;
+            let ink_bounds = Rect::new(
+                bounds.min_x(),
+                bounds.min_y() + baseline - ascent,
+                bounds.max_x(),
+                bounds.min_y() + baseline,
+            );
+
             lines.push(TextLine {
                 runs,
                 bounds,
                 metrics: line_metrics,
+                ink_bounds,
             });
 
             row_top_rel += line_height;
@@ -1145,10 +1173,25 @@ mod measure {
 
         let width = layout.width() as f64;
         let height = layout.height() as f64;
+        // 聚合所有行的 ink 边界（相对 layout 原点）。
+        let ink_bounds = lines
+            .iter()
+            .map(|l| l.ink_bounds)
+            .fold(None, |acc: Option<Rect>, r| match acc {
+                None => Some(r),
+                Some(a) => Some(Rect::new(
+                    a.min_x().min(r.min_x()),
+                    a.min_y().min(r.min_y()),
+                    a.max_x().max(r.max_x()),
+                    a.max_y().max(r.max_y()),
+                )),
+            })
+            .unwrap_or_else(|| Rect::new(0.0, 0.0, width, height));
         TextLayout {
             lines,
             width,
             height,
+            ink_bounds,
         }
     }
 
@@ -1304,8 +1347,26 @@ mod measure {
 
         let y_offset = match baseline {
             TextBaseline::Top => 0.0,
-            TextBaseline::Middle => -layout_height / 2.0,
-            TextBaseline::Bottom => -layout_height,
+            // 用 ink_bounds 的真实视觉高度居中，避免 parley layout.height 含 descent/leading
+            // 余量导致的文字偏上。ink_bounds.min_y 相对 layout 原点（即 Top 渲染时的 position）。
+            TextBaseline::Middle => {
+                let ib = layout.ink_bounds();
+                let vh = (ib.max_y() - ib.min_y()).max(0.0);
+                if vh > 0.0 {
+                    -(ib.min_y() + vh / 2.0)
+                } else {
+                    -layout_height / 2.0
+                }
+            }
+            TextBaseline::Bottom => {
+                let ib = layout.ink_bounds();
+                let vh = (ib.max_y() - ib.min_y()).max(0.0);
+                if vh > 0.0 {
+                    -(ib.min_y() + vh)
+                } else {
+                    -layout_height
+                }
+            }
             TextBaseline::Alphabetic => {
                 let first_line = layout.lines.first();
                 if let Some(line) = first_line {

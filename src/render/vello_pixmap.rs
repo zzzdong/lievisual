@@ -255,7 +255,7 @@ impl Renderer for VelloPixmapRenderer {
         self.ctx.stroke_path(&path);
     }
 
-    fn draw_polyline(&mut self, points: &[Point], style: &Stroke) {
+    fn draw_polyline(&mut self, points: &[Point], style: &Stroke, _marker_end: Option<&str>) {
         if points.len() < 2 {
             return;
         }
@@ -269,7 +269,7 @@ impl Renderer for VelloPixmapRenderer {
         self.ctx.stroke_path(&path);
     }
 
-    fn draw_path(&mut self, path: &BezPath, style: &FillStrokeStyle, closed: bool) {
+    fn draw_path(&mut self, path: &BezPath, style: &FillStrokeStyle, closed: bool, _marker_end: Option<&str>) {
         let path = if closed {
             let mut p = path.clone();
             p.close_path();

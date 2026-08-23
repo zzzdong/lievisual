@@ -66,7 +66,7 @@ pub trait Renderer {
     fn draw_ellipse(&mut self, center: Point, radii: Vec2, rotation: f64, style: &FillStrokeStyle) {
         let path =
             kurbo::Ellipse::new((center.x, center.y), (radii.x, radii.y), rotation).to_path(0.1);
-        self.draw_path(&path, style, true);
+        self.draw_path(&path, style, true, None);
     }
 
     /// 绘制圆角矩形（`radius` 为四角统一圆角半径）。
@@ -79,14 +79,14 @@ pub trait Renderer {
             radius,
         )
         .to_path(0.1);
-        self.draw_path(&path, style, true);
+        self.draw_path(&path, style, true, None);
     }
 
     /// 绘制线段。
     fn draw_line(&mut self, start: Point, end: Point, style: &Stroke);
 
     /// 绘制折线（多段线，开放，仅描边）。
-    fn draw_polyline(&mut self, points: &[Point], style: &Stroke);
+    fn draw_polyline(&mut self, points: &[Point], style: &Stroke, marker_end: Option<&str>);
 
     /// 绘制多边形（闭合，填充 + 可选描边）。
     fn draw_polygon(&mut self, points: &[Point], style: &FillStrokeStyle) {
@@ -98,7 +98,7 @@ pub trait Renderer {
             }
             path.close_path();
         }
-        self.draw_path(&path, style, false);
+        self.draw_path(&path, style, false, None);
     }
 
     /// 绘制圆弧（开放，仅描边）。
@@ -115,7 +115,7 @@ pub trait Renderer {
             fill: None,
             stroke: Some(style.clone()),
         };
-        self.draw_path(&path, &style, false);
+        self.draw_path(&path, &style, false, None);
     }
 
     /// 绘制扇形（闭合，含圆心到两端点的连线，填充 + 可选描边）。
@@ -148,11 +148,11 @@ pub trait Renderer {
             path.extend(arc);
         }
         path.close_path();
-        self.draw_path(&path, style, false);
+        self.draw_path(&path, style, false, None);
     }
 
     /// 绘制路径（可闭合填充或描边）。
-    fn draw_path(&mut self, path: &kurbo::BezPath, style: &FillStrokeStyle, closed: bool);
+    fn draw_path(&mut self, path: &kurbo::BezPath, style: &FillStrokeStyle, closed: bool, marker_end: Option<&str>);
 
     /// 绘制带线性渐变填充的路径。
     fn draw_gradient_path(
@@ -193,8 +193,9 @@ pub trait Renderer {
     /// 退出 [`Renderer::push_opacity`] 建立的作用域。
     fn pop_opacity(&mut self) {}
 
-    /// 进入一个命名作用域（带 `name` 的节点；SVG 端输出 `id`）。默认空实现。
-    fn push_name(&mut self, _name: &str) {}
+    /// 进入一个命名作用域（带 `name` 的节点；SVG 端输出 `id`，并附带 `class`）。
+    /// `name` 与 `class` 均为 `Option`：`None` 表示不输出对应属性。
+    fn push_name(&mut self, _name: Option<&str>, _class: Option<&str>) {}
     /// 退出 [`Renderer::push_name`] 建立的作用域。
     fn pop_name(&mut self) {}
 
@@ -215,14 +216,17 @@ pub trait Renderer {
         if node.opacity != 1.0 {
             self.push_opacity(node.opacity);
         }
-        if let Some(name) = &node.name {
-            self.push_name(name);
+        if node.name.is_some() || node.class.is_some() {
+            self.push_name(node.name.as_deref(), node.class.as_deref());
         }
     }
 
     /// 退出 [`Renderer::push_node_scope`] 建立的作用域（逆序 pop）。
     fn pop_node_scope(&mut self, node: &SceneNode) {
-        if node.name.is_some() {
+        // name 作用域的 pop 必须与 push 配对：push 在 `name.is_some() || class.is_some()`
+        // 时建立，故此处用相同条件判断，否则仅含 class 的节点（name 为 None）会漏 pop，
+        // 导致 SVG 的 <g> 未闭合（结构非法）。
+        if node.name.is_some() || node.class.is_some() {
             self.pop_name();
         }
         if node.opacity != 1.0 {
@@ -267,7 +271,7 @@ pub trait Renderer {
             self.push_opacity(layer.opacity);
         }
         if !layer.name.is_empty() {
-            self.push_name(&layer.name);
+            self.push_name(Some(&layer.name), None);
         }
 
         for node in layer.iter_ordered() {
@@ -319,7 +323,9 @@ pub trait Renderer {
                 style,
             } => self.draw_rounded_rect(*rect, *radius, style),
             Element::Line { start, end, style } => self.draw_line(*start, *end, style),
-            Element::Polyline { points, style } => self.draw_polyline(points, style),
+            Element::Polyline { points, style, marker_end } => {
+                self.draw_polyline(points, style, marker_end.as_deref())
+            }
             Element::Polygon { points, style } => self.draw_polygon(points, style),
             Element::Arc {
                 center,
@@ -339,7 +345,8 @@ pub trait Renderer {
                 path,
                 style,
                 closed,
-            } => self.draw_path(path, style, *closed),
+                marker_end,
+            } => self.draw_path(path, style, *closed, marker_end.as_deref()),
             Element::Image {
                 image,
                 frame,

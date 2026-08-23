@@ -111,6 +111,9 @@ impl Color {
     pub const BLACK: Color = Color::new(0.0, 0.0, 0.0, 1.0);
     pub const WHITE: Color = Color::new(1.0, 1.0, 1.0, 1.0);
     pub const TRANSPARENT: Color = Color::new(0.0, 0.0, 0.0, 0.0);
+    pub const RED: Color = Color::new(1.0, 0.0, 0.0, 1.0);
+    pub const GREEN: Color = Color::new(0.0, 1.0, 0.0, 1.0);
+    pub const BLUE: Color = Color::new(0.0, 0.0, 1.0, 1.0);
 
     /// CSS 十六进制字符串，如 `#0066cc`。
     /// 不透明时输出 `#rrggbb`，含 alpha 时输出 `#rrggbbaa`。
