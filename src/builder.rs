@@ -233,7 +233,6 @@ impl Ctx {
             path,
             style: self.fill_stroke(),
             closed,
-            marker_end: None,
         }
     }
 }
@@ -349,7 +348,6 @@ mod tests {
                 style,
                 closed,
                 path,
-                marker_end: None,
             } => {
                 assert!(closed);
                 assert!(style.fill.is_some() && style.stroke.is_some());

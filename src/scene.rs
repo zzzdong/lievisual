@@ -345,9 +345,6 @@ pub struct SceneNode {
     pub opacity: f64,
     /// 可选标识：调试、命中测试、SVG `id`。
     pub name: Option<String>,
-    /// 可选语义分类：SVG 端输出为 `<g class="...">`，用于分组 / 命中测试 /
-    /// 结构化 diff（如 `node` / `edge` / `label` / `actor`）。多个分类以空格分隔。
-    pub class: Option<String>,
     /// 是否可见，默认 `true`。`false` 时整棵子树跳过渲染。
     pub visible: bool,
     /// 可选裁剪形状：将整棵子树限制在其内部绘制。
@@ -362,7 +359,6 @@ impl SceneNode {
             transform: None,
             opacity: 1.0,
             name: None,
-            class: None,
             visible: true,
             clip: None,
         }
@@ -376,7 +372,6 @@ impl SceneNode {
             transform: None,
             opacity: 1.0,
             name: None,
-            class: None,
             visible: true,
             clip: None,
         }
@@ -413,23 +408,6 @@ impl SceneNode {
     #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
-        self
-    }
-
-    /// 设置语义分类（SVG 端输出为 `<g class="...">`），用于分组 / 命中测试 /
-    /// 结构化 diff。可多次调用以累积多个分类（空格分隔）。
-    #[must_use]
-    pub fn with_class(mut self, class: impl Into<String>) -> Self {
-        let c = class.into();
-        match self.class {
-            Some(ref mut existing) if !existing.is_empty() => {
-                if !existing.split(' ').any(|p| p == c) {
-                    existing.push(' ');
-                    existing.push_str(&c);
-                }
-            }
-            _ => self.class = Some(c),
-        }
         self
     }
 
@@ -737,8 +715,6 @@ pub enum Element {
     Polyline {
         points: Vec<Point>,
         style: Stroke,
-        /// 末端箭头 marker 引用（如 `arrow`）。为 `Some` 时后端输出 `marker-end`。
-        marker_end: Option<String>,
     },
     /// 闭合多边形（填充 + 可选描边）。
     Polygon {
@@ -767,8 +743,6 @@ pub enum Element {
         style: FillStrokeStyle,
         /// true 表示闭合路径（用于填充）。
         closed: bool,
-        /// 末端箭头 marker 引用（如 `arrow`）。为 `Some` 时后端输出 `marker-end`。
-        marker_end: Option<String>,
     },
     /// 图片：自包含二进制资源 + 显示框（pt/px 坐标）。
     ///
@@ -858,7 +832,6 @@ impl Element {
         Self::Polyline {
             points,
             style,
-            marker_end: None,
         }
     }
 

@@ -31,9 +31,6 @@ pub struct SvgRenderer {
     title: Option<String>,
     description: Option<String>,
     scale: f64,
-    /// 延迟累积的 `<marker>` 定义：仅当有边实际请求 `marker_end` 时才填充，
-    /// 避免每个文档都带上未使用的箭头 `<defs>`。
-    marker_defs: String,
 }
 
 impl SvgRenderer {
@@ -48,7 +45,6 @@ impl SvgRenderer {
             title: None,
             description: None,
             scale: 1.0,
-            marker_defs: String::new(),
         }
     }
 
@@ -95,23 +91,15 @@ impl SvgRenderer {
         if let Some(d) = &self.description {
             let _ = writeln!(out, "<desc>{}</desc>", escape_text(d));
         }
-        // 背景矩形（viewBox 坐标，随 scale 缩放）。背景完全透明时跳过，
-        // 避免多一层无意义的整画布矩形（mermaid 的默认 SVG 即不含背景 <rect>，
-        // 其底色由 CSS 的 background-color 决定）。
-        if self.background.a > 0.0 {
-            let _ = writeln!(
-                out,
-                r#"<rect x="0" y="0" width="{:.2}" height="{:.2}" fill="{}"/>"#,
-                self.width,
-                self.height,
-                self.background.to_hex()
-            );
-        }
-        // 共享箭头 marker：边通过 marker-end="url(#arrow)" 复用，避免每条边独立绘制箭头。
-        // 延迟输出：仅当场景中实际出现 marker_end 引用时才写入 <defs>。
-        if !self.marker_defs.is_empty() {
-            let _ = writeln!(out, "<defs>{}</defs>", self.marker_defs);
-        }
+        // 背景矩形（viewBox 坐标，随 scale 缩放）。始终输出整画布背景，
+        // 保证底色正确（透明背景也为可叠加层，符合通用库语义）。
+        let _ = writeln!(
+            out,
+            r#"<rect x="0" y="0" width="{:.2}" height="{:.2}" fill="{}"/>"#,
+            self.width,
+            self.height,
+            self.background.to_hex()
+        );
         // 内容
         out.push_str(&self.buf);
         out.push_str("</svg>\n");
@@ -122,19 +110,6 @@ impl SvgRenderer {
         let id = self.gradient_id;
         self.gradient_id += 1;
         id
-    }
-
-    /// 延迟注册箭头 marker：仅当某条边实际请求 `marker_end` 时才输出 `<defs>`，
-    /// 避免每个文档都带上未使用的箭头定义。按 id 去重，同 id 只输出一次。
-    fn ensure_marker(&mut self, id: &str) {
-        let needle = format!("id=\"{}\"", id);
-        if self.marker_defs.contains(&needle) {
-            return;
-        }
-        let _ = write!(
-            self.marker_defs,
-            r#"<marker id="{id}" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker>"#,
-        );
     }
 }
 
@@ -226,7 +201,7 @@ impl Renderer for SvgRenderer {
         self.buf.push_str(&el);
     }
 
-    fn draw_polyline(&mut self, points: &[Point], style: &Stroke, marker_end: Option<&str>) {
+    fn draw_polyline(&mut self, points: &[Point], style: &Stroke) {
         let pts: Vec<String> = points
             .iter()
             .map(|p| format!("{:.2},{:.2}", p.x, p.y))
@@ -234,10 +209,6 @@ impl Renderer for SvgRenderer {
         let mut el = String::new();
         let _ = write!(el, r#"<polyline points="{}" "#, pts.join(" "));
         self.apply_stroke_only(&mut el, style);
-        if let Some(id) = marker_end {
-            self.ensure_marker(id);
-            let _ = write!(el, r#" marker-end="url(#{})""#, id);
-        }
         let _ = writeln!(el, "/>");
         self.buf.push_str(&el);
     }
@@ -292,7 +263,7 @@ impl Renderer for SvgRenderer {
         self.buf.push_str(&el);
     }
 
-    fn draw_path(&mut self, path: &kurbo::BezPath, style: &FillStrokeStyle, closed: bool, marker_end: Option<&str>) {
+    fn draw_path(&mut self, path: &kurbo::BezPath, style: &FillStrokeStyle, closed: bool) {
         let d = if closed {
             let mut p = path.clone();
             p.close_path();
@@ -303,10 +274,6 @@ impl Renderer for SvgRenderer {
         let mut el = String::new();
         let _ = write!(el, r#"<path d="{}" "#, d);
         self.apply_fill_stroke(&mut el, style);
-        if let Some(id) = marker_end {
-            self.ensure_marker(id);
-            let _ = write!(el, r#" marker-end="url(#{})""#, id);
-        }
         let _ = writeln!(el, "/>");
         self.buf.push_str(&el);
     }
@@ -535,18 +502,12 @@ impl Renderer for SvgRenderer {
         self.buf.push_str("</g>");
     }
 
-    fn push_name(&mut self, name: Option<&str>, class: Option<&str>) {
-        let id = name.unwrap_or("");
-        let cls = class.unwrap_or("");
-        match (id.is_empty(), cls.is_empty()) {
-            (false, false) => self
+    fn push_name(&mut self, name: Option<&str>) {
+        match name {
+            Some(id) => self
                 .buf
-                .push_str(&format!(r#"<g id="{}" class="{}">"#, escape_attr(id), escape_attr(cls))),
-            (false, true) => self.buf.push_str(&format!(r#"<g id="{}">"#, escape_attr(id))),
-            (true, false) => self
-                .buf
-                .push_str(&format!(r#"<g class="{}">"#, escape_attr(cls))),
-            (true, true) => self.buf.push_str("<g>"),
+                .push_str(&format!(r#"<g id="{}">"#, escape_attr(id))),
+            None => self.buf.push_str("<g>"),
         }
     }
 
@@ -1053,7 +1014,6 @@ mod tests {
             path: open,
             style: FillStrokeStyle::stroke(Color::BLACK, 1.0),
             closed: false,
-            marker_end: None,
         });
         // 闭合路径
         let mut closed = BezPath::new();
@@ -1064,7 +1024,6 @@ mod tests {
             path: closed,
             style: FillStrokeStyle::stroke(Color::BLACK, 1.0),
             closed: true,
-            marker_end: None,
         });
         let out = render(&scene);
         // kurbo to_svg 输出格式：M0,0 L10,0（无空格、无小数补零）。
@@ -1079,42 +1038,6 @@ mod tests {
             "闭合路径 d 应以 Z 结尾: {}",
             out
         );
-    }
-
-    #[test]
-    fn marker_defs_emitted_only_when_used() {
-        // 无 marker_end：文本/普通折线场景不应出现 marker（回归保护：箭头 marker 惰性输出）。
-        let mut scene = Scene::new(100.0, 100.0);
-        scene.push(Element::poly(
-            vec![Point::new(0.0, 0.0), Point::new(10.0, 10.0)],
-            Stroke::new(Color::BLACK, 1.0),
-        ));
-        let out = render(&scene);
-        assert!(!out.contains("marker"), "无 marker_end 时不应输出 marker: {}", out);
-
-        // 有 marker_end：惰性输出一次 <defs><marker id="arrow">，折线引用 url(#arrow)。
-        let mut scene = Scene::new(100.0, 100.0);
-        let mut el = Element::poly(
-            vec![Point::new(0.0, 0.0), Point::new(10.0, 10.0)],
-            Stroke::new(Color::BLACK, 1.0),
-        );
-        if let Element::Polyline { marker_end, .. } = &mut el {
-            *marker_end = Some("arrow".to_string());
-        }
-        scene.push(el);
-        let out = render(&scene);
-        assert!(
-            out.contains(r#"<marker id="arrow""#),
-            "应输出箭头 marker: {}",
-            out
-        );
-        assert!(
-            out.contains(r#"marker-end="url(#arrow)""#),
-            "折线应引用 marker: {}",
-            out
-        );
-        // 同一 id 只输出一个 marker 定义。
-        assert_eq!(out.matches(r#"<marker id="arrow""#).count(), 1);
     }
 
     #[test]
