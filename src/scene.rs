@@ -829,10 +829,7 @@ impl Element {
     /// 折线图元（开放，仅描边）。
     #[must_use]
     pub fn poly(points: Vec<Point>, style: Stroke) -> Self {
-        Self::Polyline {
-            points,
-            style,
-        }
+        Self::Polyline { points, style }
     }
 
     /// 多边形图元（闭合，可填充 + 描边）。

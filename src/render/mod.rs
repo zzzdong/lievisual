@@ -320,9 +320,7 @@ pub trait Renderer {
                 style,
             } => self.draw_rounded_rect(*rect, *radius, style),
             Element::Line { start, end, style } => self.draw_line(*start, *end, style),
-            Element::Polyline { points, style } => {
-                self.draw_polyline(points, style)
-            }
+            Element::Polyline { points, style } => self.draw_polyline(points, style),
             Element::Polygon { points, style } => self.draw_polygon(points, style),
             Element::Arc {
                 center,

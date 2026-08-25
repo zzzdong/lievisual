@@ -36,7 +36,7 @@ pub mod text;
 /// 逐字形 / run / 字体字节等细粒度数据（lievisual 只封装高层测量与渲染）。
 pub use parley;
 
-pub use geometry::{Color, Point, Rect, Size, Transform, Vec2};
+pub use geometry::{BezPath, Color, Point, PointExt, Rect, RectExt, Size, Transform, Vec2};
 pub use pixmap::Pixmap;
 pub use scene::{
     Clip, Element, Fill, FillStrokeStyle, GradientStop, Layer, LineCap, LineJoin, LinearGradient,

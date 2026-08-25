@@ -1,19 +1,19 @@
 //! 几何与颜色基础类型。
 //!
-//! 坐标类型（[`Point`] / [`Rect`] / [`Vec2`] / [`Size`]）**直接 re-export kurbo**：
-//! 与渲染后端（vello / parley）及下游（如 liemermaid）的几何类型零转换互通，
-//! 消除"两套坐标"导致的 `to_lie_*` 缝合函数。布局方法（`min_x`/`max_x`/`union`/
-//! `inflate`/`from_points`/`center` 等）由 kurbo 直接提供。
+//! 坐标类型（[`Point`] / [`Rect`] / [`Vec2`] / [`Size`]）与贝塞尔路径 [`BezPath`]
+//! **直接 re-export kurbo**：与渲染后端（vello / parley）及下游（如 liemermaid）的
+//! 几何类型零转换互通，消除"两套坐标"导致的 `to_lie_*` 缝合函数。布局方法
+//! （`min_x`/`max_x`/`union`/`inflate`/`from_points`/`center` 等）由 kurbo 直接提供。
 //!
 //! [`Color`] / [`Transform`] 保留自定义（kurbo 无对应或需业务语义）。
 
-pub use kurbo::{Point, Rect, Size, Vec2};
+pub use kurbo::{BezPath, Point, Rect, Size, Vec2};
 
 use kurbo::Affine;
 
 /// [`Point`] 的便捷扩展方法（kurbo 缺失的辅助）。
 ///
-/// 使用时需 `use lievisual::geometry::PointExt`。
+/// 已随 crate 根 re-export（`use lievisual::PointExt`；也可 `use lievisual::geometry::PointExt`）。
 pub trait PointExt {
     /// 中点。
     #[must_use]
@@ -53,7 +53,7 @@ impl PointExt for Point {
 
 /// [`Rect`] 的便捷扩展方法（kurbo 0.13 缺失的辅助）。
 ///
-/// 使用时需 `use lievisual::geometry::RectExt`。
+/// 已随 crate 根 re-export（`use lievisual::RectExt`；也可 `use lievisual::geometry::RectExt`）。
 ///
 /// 注：外扩用 kurbo 自带 `Rect::inflate(width, height)`（x/y 各自外扩量）。
 pub trait RectExt {
