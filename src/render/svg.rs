@@ -1,16 +1,19 @@
-//! SVG 矢量输出后端。
+//! SVG vector output backend.
 //!
-//! 纯声明式，不依赖 vello / parley。将每个 [`Element`] 映射为原生 SVG 标签：
-//! - Rect/Circle/Ellipse/RoundedRect/Line/Polyline/Polygon → 对应 SVG 图形元素。
-//! - Arc/Pie → `<path d="...">`（SVG 原生圆弧指令 `A`）。
-//! - Path/GradientPath → 用 kurbo 的 SVG path 序列化（`d` 属性）。
-//! - Text → `<text>` 元素（不依赖 parley；`layout` 字段被忽略，由浏览器排版）。
+//! Purely declarative, without depending on vello / parley. Maps each [`Element`] to native
+//! SVG tags:
+//! - Rect/Circle/Ellipse/RoundedRect/Line/Polyline/Polygon → the corresponding SVG shape element.
+//! - Arc/Pie → `<path d="...">` (SVG's native arc command `A`).
+//! - Path/GradientPath → kurbo's SVG path serialization (`d` attribute).
+//! - Text → `<text>` element (no parley dependency; the `layout` field is ignored, the browser
+//!   does the typesetting).
 //!
-//! 变换通过 `<g transform="...">` 实现，与后端状态栈解耦；节点 `opacity` / `name`
-//! 分别输出 `<g opacity>` / `<g id>`；场景 `title` / `description` / `scale` 在
-//! [`Renderer::render_scene`] 时捕获。
+//! Transforms are realized via `<g transform="...">`, decoupled from a backend state stack; a
+//! node's `opacity` / `name` are emitted as `<g opacity>` / `<g id>`; the scene's `title` /
+//! `description` / `scale` are captured at [`Renderer::render_scene`].
 //!
-//! 渐变统一使用 `gradientUnits="userSpaceOnUse"`（用户坐标，与 IR 的绝对坐标一致）。
+//! Gradients uniformly use `gradientUnits="userSpaceOnUse"` (user coordinates, consistent with
+//! the IR's absolute coordinates).
 
 use crate::geometry::{Color, Point, Rect, Transform, Vec2};
 use crate::render::Renderer;
@@ -20,7 +23,7 @@ use crate::scene::{
 use crate::text::TextStyle;
 use std::fmt::Write;
 
-/// SVG 渲染器：累积 SVG 字符串。
+/// SVG renderer: accumulates the SVG string.
 pub struct SvgRenderer {
     buf: String,
     width: f64,
@@ -53,31 +56,32 @@ impl SvgRenderer {
         self
     }
 
-    /// 输出缩放（像素密度）：放大 `width`/`height` 而保持 `viewBox` 不变。
+    /// Output scale (pixel density): enlarges `width`/`height` while keeping `viewBox` unchanged.
     #[must_use]
     pub fn with_scale(mut self, scale: f64) -> Self {
         self.scale = scale;
         self
     }
 
-    /// 文档标题。
+    /// Document title.
     #[must_use]
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
         self
     }
 
-    /// 文档描述。
+    /// Document description.
     #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
     }
 
-    /// 取出完整 SVG 文档（含 `<svg>` 根与背景）。
+    /// Take the complete SVG document (including the `<svg>` root and background).
     pub fn into_string(self) -> String {
         let mut out = String::new();
-        // scale 只放大输出尺寸，viewBox 保持场景坐标，实现更高分辨率导出。
+        // scale only enlarges the output size; viewBox keeps the scene coordinates, achieving
+        // higher-resolution export.
         let sw = self.width * self.scale;
         let sh = self.height * self.scale;
         let _ = writeln!(
@@ -91,8 +95,9 @@ impl SvgRenderer {
         if let Some(d) = &self.description {
             let _ = writeln!(out, "<desc>{}</desc>", escape_text(d));
         }
-        // 背景矩形（viewBox 坐标，随 scale 缩放）。始终输出整画布背景，
-        // 保证底色正确（透明背景也为可叠加层，符合通用库语义）。
+        // Background rectangle (viewBox coordinates, scaled with scale). Always output the
+        // full-canvas background so the base color is correct (a transparent background is also
+        // an overlay layer, matching common-library semantics).
         let _ = writeln!(
             out,
             r#"<rect x="0" y="0" width="{:.2}" height="{:.2}" fill="{}"/>"#,
@@ -100,7 +105,7 @@ impl SvgRenderer {
             self.height,
             self.background.to_hex()
         );
-        // 内容
+        // content
         out.push_str(&self.buf);
         out.push_str("</svg>\n");
         out
@@ -115,7 +120,7 @@ impl SvgRenderer {
 
 impl Renderer for SvgRenderer {
     fn render_scene(&mut self, scene: &Scene) {
-        // 捕获场景元数据，再复用默认遍历。
+        // Capture scene metadata, then reuse the default traversal.
         self.title = scene.title.clone();
         self.description = scene.description.clone();
         self.scale = scene.scale;
@@ -171,7 +176,8 @@ impl Renderer for SvgRenderer {
     }
 
     fn draw_rounded_rect(&mut self, rect: Rect, radius: f64, style: &FillStrokeStyle) {
-        // 与 PNG 后端一致：用几何边界得到非负宽高（Rect 可能 min > max）。
+        // Consistent with the PNG backend: derive non-negative width/height from the geometry
+        // bounds (a Rect may have min > max).
         let (x, y) = (
             rect.min_x().min(rect.max_x()),
             rect.min_y().min(rect.max_y()),
@@ -315,20 +321,24 @@ impl Renderer for SvgRenderer {
         style: &TextStyle,
         layout: Option<&crate::text::TextLayout>,
     ) {
-        // SVG 使用原生 <text>，由浏览器排版；layout 仅用于背景矩形的精确尺寸。
-        // 纯文本由 spans 拼接推导，保证与 vello 后端的字形内容一致。
+        // SVG uses a native <text> element, typeset by the browser; layout is used only for the
+        // background rectangle's exact dimensions. Plain text is derived by concatenating spans,
+        // keeping glyph content consistent with the vello backend.
         let content = spans.iter().map(|s| s.text.as_str()).collect::<String>();
-        // 预排版 layout 可提供文本块精确尺寸；无则回退到近似。
+        // A pre-laid-out layout provides the text block's exact dimensions; fall back to an
+        // approximation when absent.
         let metrics = layout.map(crate::text::layout_metrics);
-        // 锚点：text-anchor（水平，对应 align）+ dominant-baseline（垂直，对应 baseline）。
+        // Anchor: text-anchor (horizontal, maps to align) + dominant-baseline (vertical, maps to
+        // baseline).
         let anchor = match style.align {
             crate::text::TextAlign::Left | crate::text::TextAlign::Justify => "start",
             crate::text::TextAlign::Center => "middle",
             crate::text::TextAlign::Right => "end",
         };
-        // SVG 的 dominant-baseline 没有 "top"/"bottom" 等值；统一转成 alphabetic
-        // baseline 坐标，让浏览器排版与 vello/parley 后端的 canvas fillText 语义一致。
-        // position.y 是锚点（由 baseline 决定含义），先算文本块顶部，再推到 alphabetic baseline。
+        // SVG's dominant-baseline has no "top"/"bottom" values; we uniformly convert to
+        // alphabetic-baseline coordinates so browser typesetting matches the canvas fillText
+        // semantics of the vello/parley backend. position.y is the anchor (its meaning decided by
+        // baseline); first compute the text-block top, then derive the alphabetic baseline.
         let (anchor_offset, alphabetic_baseline) = match &metrics {
             Some(m) => (style.baseline.anchor_offset(m), m.alphabetic_baseline),
             None => {
@@ -366,8 +376,9 @@ impl Renderer for SvgRenderer {
             Some(h) => format!(r#" style="line-height:{:.2}""#, h),
             None => String::new(),
         };
-        // 可选排版属性：字宽（font-stretch）、字间距（letter-spacing）、
-        // 文本装饰（下划线 / 删除线，按 style 块级默认值输出）。
+        // Optional typographic attributes: font width (font-stretch), letter spacing
+        // (letter-spacing), text decoration (underline / line-through, output per the style's
+        // block-level defaults).
         let fwidth = match style.font_width {
             Some(w) => format!(r#" font-stretch="{:.0}%""#, w * 100.0),
             None => String::new(),
@@ -388,14 +399,17 @@ impl Renderer for SvgRenderer {
         } else {
             format!(r#" text-decoration="{}""#, decoration.join(" "))
         };
-        // 基线偏移（上下标）：baseline-shift 正数=上移（上标），负数=下移（下标）。
+        // Baseline shift (superscript / subscript): positive baseline-shift = up (superscript),
+        // negative = down (subscript).
         let bshift = if style.baseline_shift != 0.0 {
             format!(r#" baseline-shift="{:.2}px""#, -style.baseline_shift)
         } else {
             String::new()
         };
-        // 文本背景（行内高亮）：优先用预排版 layout 的精确宽高；无 layout 时回退近似。
-        // 宽 = metrics.width（有 layout）或 字符数×0.6×font-size；高 = metrics.height 或 font-size×1.3。
+        // Text background (inline highlight): prefer the pre-laid-out layout's exact width/height;
+        // fall back to an approximation without layout.
+        // width = metrics.width (with layout) or char_count*0.6*font-size; height = metrics.height
+        // or font-size*1.3.
         if let Some(bg) = style.background_color {
             let (w, h) = match &metrics {
                 Some(m) => (m.width, m.height),
@@ -407,10 +421,11 @@ impl Renderer for SvgRenderer {
                     )
                 }
             };
-            // 背景矩形与文本块顶部对齐，和 vello 后端一致。
+            // The background rectangle aligns with the text-block top, consistent with the vello
+            // backend.
             let rx = position.x;
             let ry = block_top_y;
-            // 右对齐时背景向左扩展。
+            // For right alignment, the background extends leftward.
             let bx = match style.align {
                 crate::text::TextAlign::Right => rx - w,
                 crate::text::TextAlign::Center => rx - w / 2.0,
@@ -452,7 +467,8 @@ impl Renderer for SvgRenderer {
     }
 
     fn draw_image(&mut self, image: &crate::SceneImage, frame: Rect, opacity: f64) {
-        // 位图 → PNG 编码 → data: URI（base64）并输出 <image>，由浏览器负责解码与 object-fit。
+        // Bitmap → PNG encode → data: URI (base64), output as <image>, the browser decodes it
+        // and applies object-fit.
         let png = image.pixmap.to_png();
         let b64 = base64_encode(&png);
         let data_uri = format!("data:image/png;base64,{b64}");
@@ -461,8 +477,8 @@ impl Renderer for SvgRenderer {
         } else {
             String::new()
         };
-        // preserveAspectRatio 控制 object-fit；x/y/width/height 为显示框。
-        // None：不缩放，用原始像素尺寸放框左上角。
+        // preserveAspectRatio controls object-fit; x/y/width/height are the display frame.
+        // None: no scaling, place at the frame's top-left at original pixel size.
         let (w, h) = match image.object_fit {
             crate::ObjectFit::None => (image.pixmap.width() as f64, image.pixmap.height() as f64),
             _ => (frame.width(), frame.height()),
@@ -518,7 +534,7 @@ impl Renderer for SvgRenderer {
     fn push_clip(&mut self, clip: &crate::scene::Clip) {
         let id = self.clip_id;
         self.clip_id += 1;
-        // 将 Clip 映射为 <clipPath> 内的原生 SVG 元素。
+        // Map a Clip to a native SVG element inside <clipPath>.
         let inner = match clip {
             crate::scene::Clip::Rect(rect) => format!(
                 r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}"/>"#,
@@ -616,8 +632,8 @@ impl SvgRenderer {
     }
 
     fn apply_stroke_only(&self, el: &mut String, style: &Stroke) {
-        // SVG 形状的 fill 默认是 black；只描边的元素必须显式关闭填充，
-        // 否则浏览器会把 polyline/arc 等区域填充成黑色。
+        // SVG shapes default to a black fill; stroke-only elements must explicitly turn off the
+        // fill, otherwise the browser would fill the polyline/arc area black.
         let _ = write!(el, r#" fill="none""#);
         self.append_stroke(el, style);
     }
@@ -668,7 +684,8 @@ fn stop_svg(s: &GradientStop) -> String {
     )
 }
 
-/// 构造圆弧 / 扇形的 SVG path `d`（使用原生圆弧指令 `A`，而非贝塞尔近似）。
+/// Build the SVG path `d` for an arc / pie sector (using the native arc command `A` rather than
+/// a Bézier approximation).
 fn arc_path_d(
     center: Point,
     radii: Vec2,
@@ -690,7 +707,7 @@ fn arc_path_d(
     } else {
         0
     };
-    // y-down 坐标系：正 sweep = 顺时针 = SVG sweep-flag 1。
+    // y-down coordinate system: positive sweep = clockwise = SVG sweep-flag 1.
     let sweep_flag = if sweep_angle >= 0.0 { 1 } else { 0 };
     if sector {
         format!(
@@ -714,7 +731,7 @@ fn arc_path_d(
     }
 }
 
-/// XML 文本转义（用于 `<text>` 内容）。
+/// XML text escaping (for `<text>` content).
 fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -732,7 +749,7 @@ fn escape_attr(s: &str) -> String {
     escape_text(s).replace('"', "&quot;")
 }
 
-/// 最小化 base64 编码（用于 SVG `data:` URI），避免引入额外依赖。
+/// Minimal base64 encoding (for SVG `data:` URIs), avoiding an extra dependency.
 fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -779,7 +796,7 @@ mod tests {
         let out = render(&scene);
         assert!(out.contains("<title>T</title>"));
         assert!(out.contains("<desc>D</desc>"));
-        // scale 放大输出尺寸，viewBox 保持场景坐标。
+        // scale enlarges the output size; viewBox keeps the scene coordinates.
         assert!(out.contains(r#"width="200.00" height="100.00" viewBox="0 0 100.00 50.00""#));
     }
 
@@ -831,7 +848,8 @@ mod tests {
             FillStrokeStyle::fill(Color::BLACK),
         ));
         let out = render(&scene);
-        // 圆弧用 SVG 原生 A 指令；扇形含圆心起点与 Z 闭合。
+        // Arcs use the SVG native A command; a pie sector includes the center start point and a
+        // Z close.
         assert!(out.contains("A 40.00 30.00"));
         assert!(out.contains("M 50.00 50.00 L "));
         assert!(out.contains(" Z"));
@@ -890,7 +908,7 @@ mod tests {
         let out = render(&scene);
         assert!(out.contains(r#"<g id="a">"#));
         assert!(out.contains(r#"<g opacity="0.400">"#));
-        // 隐藏节点不应输出其矩形。
+        // Hidden nodes should not output their rectangle.
         assert!(!out.contains(r#"x="20.00""#));
     }
 
@@ -955,7 +973,7 @@ mod tests {
         use crate::geometry::Transform;
         use crate::scene::Layer;
         let mut scene = Scene::new(100.0, 100.0);
-        // 节点变换 → <g transform="matrix(...)">
+        // Node transform → <g transform="matrix(...)">
         scene.push_node(
             SceneNode::new(Element::rect(
                 Rect::new(0.0, 0.0, 10.0, 10.0),
@@ -963,7 +981,7 @@ mod tests {
             ))
             .with_transform(Transform::translate(5.0, 7.0)),
         );
-        // 图层变换
+        // Layer transform
         scene.push_layer(Layer::new("l").with_transform(Transform::translate(1.0, 2.0)));
         let out = render(&scene);
         assert!(out.contains(r#"matrix(1.000000 0.000000 0.000000 1.000000 5.000000 7.000000)"#));
@@ -974,7 +992,7 @@ mod tests {
     fn layer_render_order_bottom_to_top() {
         use crate::scene::Layer;
         let mut scene = Scene::new(100.0, 100.0);
-        // 默认层 nodes（最底）
+        // Default layer nodes (bottom-most)
         scene.push(Element::rect(
             Rect::new(0.0, 0.0, 10.0, 10.0),
             FillStrokeStyle::fill(Color::BLACK),
@@ -1006,7 +1024,7 @@ mod tests {
     fn path_closed_vs_open() {
         use kurbo::BezPath;
         let mut scene = Scene::new(100.0, 100.0);
-        // 开放路径
+        // open path
         let mut open = BezPath::new();
         open.move_to((0.0, 0.0));
         open.line_to((10.0, 0.0));
@@ -1015,7 +1033,7 @@ mod tests {
             style: FillStrokeStyle::stroke(Color::BLACK, 1.0),
             closed: false,
         });
-        // 闭合路径
+        // closed path
         let mut closed = BezPath::new();
         closed.move_to((20.0, 0.0));
         closed.line_to((30.0, 0.0));
@@ -1026,8 +1044,8 @@ mod tests {
             closed: true,
         });
         let out = render(&scene);
-        // kurbo to_svg 输出格式：M0,0 L10,0（无空格、无小数补零）。
-        // 开放路径 d 无 Z 闭合；闭合路径 d 以 Z 结尾。
+        // kurbo to_svg output format: M0,0 L10,0 (no spaces, no trailing-zero decimals).
+        // Open-path d has no Z close; closed-path d ends with Z.
         assert!(
             out.contains(r#"d="M0,0 L10,0""#),
             "开放路径 d 应为 M0,0 L10,0: {}",
@@ -1057,7 +1075,7 @@ mod tests {
             layout: Some(m.layout),
         });
         let out = render(&scene);
-        // SVG 从 spans 拼接纯文本输出 <text>，与预排版 layout 无关。
+        // SVG outputs <text> from concatenated spans, independent of the pre-laid-out layout.
         assert!(out.contains(">hello</text>"));
         assert!(!out.contains("path"));
     }
@@ -1066,8 +1084,9 @@ mod tests {
     fn font_family_attr_is_css_normalized_and_xml_escaped() {
         use crate::text::TextStyle;
         let mut scene = Scene::new(100.0, 100.0);
-        // 含空格族名 + 通用族 + 特殊字符，验证双层转义：
-        // CSS 层（font_family_css）：加引号；XML 层（escape_attr）：& → &amp;
+        // Space-containing family name + generic family + special characters, verifying the
+        // two-layer escaping:
+        // CSS layer (font_family_css): quoted; XML layer (escape_attr): & → &amp;
         let style = TextStyle::new(
             Color::BLACK,
             12.0,
@@ -1075,10 +1094,11 @@ mod tests {
         );
         scene.push(Element::text("x", Point::new(1.0, 2.0), style));
         let out = render(&scene);
-        // 期望属性值：'Helvetica Neue', 'Rock &amp; Roll', sans-serif
-        // （含空格 → 单引号；& 被 XML 转义；sans-serif 通用族不加引号）
+        // Expected attribute value: 'Helvetica Neue', 'Rock &amp; Roll', sans-serif
+        // (space → single quotes; & XML-escaped; sans-serif generic family unquoted)
         assert!(out.contains(r#"font-family="'Helvetica Neue', 'Rock &amp; Roll', sans-serif""#));
-        // 单引号族名不应被 XML 转义（单引号在双引号属性内安全）
+        // Single-quoted family names should not be XML-escaped (single quotes are safe inside
+        // double-quoted attributes)
         assert!(!out.contains("&apos;"));
     }
 
@@ -1093,7 +1113,7 @@ mod tests {
             .with_font_width(0.75);
         scene.push(Element::text("x", Point::new(1.0, 2.0), style));
         let out = render(&scene);
-        // 装饰 / 间距 / 字宽作为 SVG 属性输出。
+        // Decoration / spacing / font width are output as SVG attributes.
         assert!(out.contains(r#"text-decoration="underline line-through""#));
         assert!(out.contains(r#"letter-spacing="2.00""#));
         assert!(out.contains(r#"font-stretch="75%""#));
@@ -1103,7 +1123,7 @@ mod tests {
     fn clip_emits_clip_path_and_wraps_subtree() {
         use crate::scene::Clip;
         let mut scene = Scene::new(100.0, 100.0);
-        // 圆角矩形裁剪一个红色矩形
+        // A rounded rectangle clipping a red rectangle
         scene.push_node(
             SceneNode::new(Element::rect(
                 Rect::new(0.0, 0.0, 50.0, 50.0),
@@ -1112,17 +1132,17 @@ mod tests {
             .with_clip(Clip::circle(Point::new(25.0, 25.0), 10.0)),
         );
         let out = render(&scene);
-        // 应有 <clipPath id="clip0"> 内为 <circle>
+        // Should contain <clipPath id="clip0"> with a <circle> inside
         assert!(out.contains(
             r#"<clipPath id="clip0"><circle cx="25.00" cy="25.00" r="10.00"/></clipPath>"#
         ));
-        // 应有 <g clip-path="url(#clip0)"> 包裹
+        // Should be wrapped in <g clip-path="url(#clip0)">
         assert!(out.contains(r#"<g clip-path="url(#clip0)">"#));
     }
 
     #[test]
     fn base64_encode_standard_vectors() {
-        // RFC 4648 测试向量。
+        // RFC 4648 test vectors.
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"f"), "Zg==");
         assert_eq!(base64_encode(b"fo"), "Zm8=");
@@ -1132,7 +1152,7 @@ mod tests {
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
-    /// 构造一个实心单色 RGBA8 pixmap 图片。
+    /// Build a solid single-color RGBA8 pixmap image.
     fn test_image(w: u32, h: u32, fill: u8) -> crate::SceneImage {
         let pixels = vec![fill; (w * h * 4) as usize];
         crate::SceneImage::from_rgba8(w, h, pixels).unwrap()
@@ -1146,7 +1166,7 @@ mod tests {
             Rect::new(0.0, 0.0, 10.0, 20.0),
         ));
         let out = render(&scene);
-        // 位图 → PNG → data:image/png;base64,<real PNG>
+        // bitmap → PNG → data:image/png;base64,<real PNG>
         assert!(out.contains(r#"href="data:image/png;base64,"#));
         assert!(out.contains(r#"width="10.00" height="20.00""#));
         assert!(out.contains(r#"preserveAspectRatio="xMidYMid meet""#));
@@ -1160,7 +1180,7 @@ mod tests {
             Rect::new(5.0, 6.0, 105.0, 106.0),
         ));
         let out = render(&scene);
-        // None：preserveAspectRatio="none" 且 width/height 用原始像素尺寸（30x40）。
+        // None: preserveAspectRatio="none" and width/height use the original pixel size (30x40).
         assert!(out.contains(r#"x="5.00" y="6.00" width="30.00" height="40.00""#));
         assert!(out.contains(r#"preserveAspectRatio="none""#));
     }
@@ -1173,7 +1193,7 @@ mod tests {
             Rect::new(0.0, 0.0, 10.0, 10.0),
         ));
         let out = render(&scene);
-        // Fill：用 frame 尺寸 + preserveAspectRatio="none"。
+        // Fill: use frame size + preserveAspectRatio="none".
         assert!(out.contains(r#"width="10.00" height="10.00""#));
         assert!(out.contains(r#"preserveAspectRatio="none""#));
     }
@@ -1196,10 +1216,10 @@ mod tests {
     fn text_baseline_shift_and_background_emitted() {
         use crate::text::TextStyle;
         let mut scene = Scene::new(200.0, 100.0);
-        // 上标：baseline_shift 正 → baseline-shift 负（上移）。
+        // Superscript: positive baseline_shift → negative baseline-shift (move up).
         let sup = TextStyle::new(Color::BLACK, 12.0, "sans-serif").with_baseline_shift(6.0);
         scene.push(Element::text("x²", Point::new(10.0, 50.0), sup));
-        // 行内背景：输出背景 <rect>。
+        // Inline background: outputs a background <rect>.
         let code = TextStyle::new(Color::BLACK, 12.0, "sans-serif")
             .with_background_color(Some(Color::rgb(0xf0, 0xf0, 0xf0)));
         scene.push(Element::text("code", Point::new(30.0, 50.0), code));
@@ -1218,7 +1238,7 @@ mod tests {
             std::slice::from_ref(&RichSpan::new("code", style.clone())),
             None,
         );
-        // 提供预排版 layout → 背景 <rect> 应使用精确的 layout 宽度。
+        // Providing a pre-laid-out layout → the background <rect> should use the exact layout width.
         let mut scene = Scene::new(200.0, 100.0);
         scene.push(Element::Text {
             spans: vec![RichSpan::new("code", style.clone())],
@@ -1246,7 +1266,7 @@ mod tests {
             TextStyle::new(Color::BLACK, 12.0, "sans-serif"),
         ));
         let out = render(&scene);
-        // 无 background_color 时只有画布背景 1 个 <rect>（无文本背景矩形）。
+        // Without background_color, only the canvas background <rect> exists (no text background rect).
         assert_eq!(out.matches("<rect ").count(), 1);
     }
 }

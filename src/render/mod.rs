@@ -1,15 +1,18 @@
-//! 渲染后端 trait 与默认遍历逻辑。
+//! Rendering backend trait and default traversal logic.
 //!
-//! [`Renderer`] 定义原子绘制方法（Canvas API 风格）。默认方法 [`Renderer::render_scene`]
-//! 负责：经 [`crate::scene::Scene::iter_ordered`] 按 `z_index` 稳定排序 → 应用节点属性
-//! （`visible` / `opacity` / `name` / `clip`）与 `Transform` → 对 `Group` 递归（内部复用
-//! [`crate::scene::SceneNode::ordered`]）。此外还会先绘制默认层 `nodes`，再按序绘制
-//! 各 [`crate::scene::Layer`]（[`Renderer::render_layer`]，整体应用 `visible` / `opacity` /
-//! `transform` / `name`）。后端只需实现原子方法。
+//! [`Renderer`] defines the atomic drawing methods (Canvas API style). The default
+//! method [`Renderer::render_scene`] is responsible for: sorting nodes stably by
+//! `z_index` via [`crate::scene::Scene::iter_ordered`] → applying node attributes
+//! (`visible` / `opacity` / `name` / `clip`) and `Transform` → recursing into `Group`s
+//! (internally reusing [`crate::scene::SceneNode::ordered`]). It also draws the default
+//! `nodes` layer first, then each [`crate::scene::Layer`] in order
+//! ([`Renderer::render_layer`], applying `visible` / `opacity` / `transform` / `name`
+//! to the whole layer). A backend only needs to implement the atomic methods.
 //!
-//! 新增图元的约定：`draw_*` 均提供默认实现（把几何转为 [`kurbo::BezPath`] 后走
-//! [`Renderer::draw_path`]），因此新后端不实现也能正确渲染；后端可按需 override 以输出
-//! 原生标签（如 SVG 的 `<ellipse>` / `<rect rx>`）。
+//! Convention for new primitives: every `draw_*` has a default implementation that
+//! converts the geometry into a [`kurbo::BezPath`] and delegates to [`Renderer::draw_path`],
+//! so a new backend renders correctly even without overriding them. Backends may override
+//! these to emit native markup (e.g. SVG `<ellipse>` / `<rect rx>`).
 
 use crate::geometry::{Point, Rect, Transform, Vec2};
 use crate::scene::{Element, FillStrokeStyle, Layer, Scene, SceneNode, Stroke};
@@ -21,22 +24,27 @@ pub use vello_pixmap::VelloPixmapRenderer;
 mod svg;
 mod vello_pixmap;
 
-/// 在屏幕(y-down)坐标系下构造一段圆弧路径，与 SVG 后端的 `arc_path_d` 几何完全一致。
+/// Build an arc path in the screen (y-down) coordinate system, geometrically identical to the
+/// SVG backend's `arc_path_d`.
 ///
-/// 场景（SVG/vello 一致）采用 y-down 坐标系：原点在左上、y 向下、0 角为 +x、正角为顺时针。
-/// 而 kurbo::Arc 按数学 y-up 采样：`start=(cx+r·cos a, cy+r·sin a)`、正 sweep 为逆时针。
+/// The scene (consistent across SVG / vello) uses a y-down coordinate system: origin at the
+/// top-left, y downward, 0 angle along +x, and positive angles clockwise. kurbo::Arc, however,
+/// samples mathematically in y-up: `start=(cx+r·cos a, cy+r·sin a)` with a positive sweep being
+/// counterclockwise.
 ///
-/// 这里复用 kurbo 成熟的贝塞尔弧逼近（`to_path`），再做一次 y-up → y-down 的坐标映射，
-/// 使采样出的弧与 SVG 后端公式（`arc_path_d`）完全对齐，避免两端画出的圆弧/扇形垂直镜像：
-/// 1. 圆心 y、角度统一取负，在数学平面构造出"待翻转"的弧；
-/// 2. 整体应用 y 轴翻转 `Affine(1,0,0,-1)`，把数学坐标映回屏幕坐标。
+/// Here we reuse kurbo's mature Bézier arc approximation (`to_path`) and then apply a
+/// y-up → y-down coordinate mapping so the sampled arc aligns exactly with the SVG backend's
+/// `arc_path_d` formula, avoiding a vertical mirror between the two backends' arcs / pies:
+/// 1. Negate the center y and angles to construct the "to-be-flipped" arc in the math plane;
+/// 2. Apply a whole y-axis flip `Affine(1,0,0,-1)` to map math coordinates back to screen.
 pub(crate) fn arc_path_y_down(
     center: Point,
     radii: Vec2,
     start_angle: f64,
     sweep_angle: f64,
 ) -> kurbo::BezPath {
-    // 场景 y-down → 数学 y-up：圆心 y 与角度符号取反（0 角不变，顺/逆时针互换）。
+    // Scene y-down → math y-up: negate the center y and angle signs (0 angle unchanged,
+    // clockwise/counterclockwise swap).
     let arc = kurbo::Arc::new(
         (center.x, -center.y),
         (radii.x, radii.y),
@@ -45,31 +53,33 @@ pub(crate) fn arc_path_y_down(
         0.0,
     )
     .to_path(0.1);
-    // 数学 y-up → 场景 y-down：y 轴整体翻转（x 不变）。
+    // Math y-up → scene y-down: flip the whole y-axis (x unchanged).
     let mut path = arc;
     path.apply_affine(kurbo::Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, 0.0]));
     path
 }
 
-/// 渲染后端接口（Canvas API 风格）。
+/// Rendering backend interface (Canvas API style).
 ///
-/// 调用者（liecharts / liemermaid / liepress）生成 [`Scene`] 后，选择一个 `Renderer`
-/// 实现即可输出到目标媒介。新增后端不影响 IR。
+/// Callers (liecharts / liemermaid / liepress) build a [`Scene`] and then pick a
+/// `Renderer` implementation to emit the target medium. Adding a backend does not affect
+/// the intermediate representation.
 pub trait Renderer {
-    /// 绘制矩形。
+    /// Draw an axis-aligned rectangle.
     fn draw_rect(&mut self, rect: Rect, style: &FillStrokeStyle);
 
-    /// 绘制圆。
+    /// Draw a circle.
     fn draw_circle(&mut self, center: Point, radius: f64, style: &FillStrokeStyle);
 
-    /// 绘制椭圆（`radii` 为两半轴长，`rotation` 绕中心旋转）。
+    /// Draw an ellipse (`radii` are the two semi-axis lengths, `rotation` is the angle
+    /// around the center).
     fn draw_ellipse(&mut self, center: Point, radii: Vec2, rotation: f64, style: &FillStrokeStyle) {
         let path =
             kurbo::Ellipse::new((center.x, center.y), (radii.x, radii.y), rotation).to_path(0.1);
         self.draw_path(&path, style, true);
     }
 
-    /// 绘制圆角矩形（`radius` 为四角统一圆角半径）。
+    /// Draw a rounded rectangle (`radius` is the uniform corner radius).
     fn draw_rounded_rect(&mut self, rect: Rect, radius: f64, style: &FillStrokeStyle) {
         let path = kurbo::RoundedRect::new(
             rect.min_x(),
@@ -82,13 +92,13 @@ pub trait Renderer {
         self.draw_path(&path, style, true);
     }
 
-    /// 绘制线段。
+    /// Draw a line segment.
     fn draw_line(&mut self, start: Point, end: Point, style: &Stroke);
 
-    /// 绘制折线（多段线，开放，仅描边）。
+    /// Draw a polyline (multiple connected segments, open, stroke only).
     fn draw_polyline(&mut self, points: &[Point], style: &Stroke);
 
-    /// 绘制多边形（闭合，填充 + 可选描边）。
+    /// Draw a polygon (closed, filled + optional stroke).
     fn draw_polygon(&mut self, points: &[Point], style: &FillStrokeStyle) {
         let mut path = kurbo::BezPath::new();
         if let Some(p0) = points.first() {
@@ -101,7 +111,7 @@ pub trait Renderer {
         self.draw_path(&path, style, false);
     }
 
-    /// 绘制圆弧（开放，仅描边）。
+    /// Draw an arc (open, stroke only).
     fn draw_arc(
         &mut self,
         center: Point,
@@ -118,7 +128,8 @@ pub trait Renderer {
         self.draw_path(&path, &style, false);
     }
 
-    /// 绘制扇形（闭合，含圆心到两端点的连线，填充 + 可选描边）。
+    /// Draw a pie sector (closed, including the two radius edges from the center to the
+    /// arc endpoints, filled + optional stroke).
     fn draw_pie(
         &mut self,
         center: Point,
@@ -135,9 +146,9 @@ pub trait Renderer {
             start_angle,
             sweep_angle,
         );
-        // arc 路径以 MoveTo(start) 开头，需替换为 LineTo(start)，
-        // 这样整体路径为 `M center L start [arc...] end Z` —— 真正的扇形
-        // （含圆心顶点和两条半径边），与 SVG 后端的 `M center L start A end Z` 一致。
+        // The arc path starts with MoveTo(start); replace it with LineTo(start) so the whole
+        // path becomes `M center L start [arc...] end Z` -- a true pie sector (with the center
+        // vertex and the two radius edges), matching the SVG backend's `M center L start A end Z`.
         let mut els = arc.elements().iter();
         if let Some(kurbo::PathEl::MoveTo(p0)) = els.next() {
             path.line_to(*p0);
@@ -151,10 +162,10 @@ pub trait Renderer {
         self.draw_path(&path, style, false);
     }
 
-    /// 绘制路径（可闭合填充或描边）。
+    /// Draw a path (optionally closed for fill or stroke).
     fn draw_path(&mut self, path: &kurbo::BezPath, style: &FillStrokeStyle, closed: bool);
 
-    /// 绘制带线性渐变填充的路径。
+    /// Draw a path with a linear-gradient fill.
     fn draw_gradient_path(
         &mut self,
         path: &kurbo::BezPath,
@@ -162,10 +173,12 @@ pub trait Renderer {
         stroke: Option<&crate::scene::Stroke>,
     );
 
-    /// 绘制文本。以样式化片段（`spans`）为核心；若 `layout` 提供则优先使用。
+    /// Draw text. The styled `spans` are the core content; when `layout` is provided it
+    /// takes precedence.
     ///
-    /// 非 parley 后端（如 SVG）应从 `spans` 拼接纯文本；`style` 提供块级定位
-    /// （`align` / `baseline` / `rotation` / `max_width`）。
+    /// Non-parley backends (e.g. SVG) should concatenate the `spans` into plain text;
+    /// `style` provides block-level placement (`align` / `baseline` / `rotation` /
+    /// `max_width`).
     fn draw_text(
         &mut self,
         spans: &[crate::text::RichSpan],
@@ -174,38 +187,42 @@ pub trait Renderer {
         layout: Option<&crate::text::TextLayout>,
     );
 
-    /// 绘制图片：`image` 为自包含 RGBA8 位图，`frame` 为显示区域（pt/px 坐标）。
+    /// Draw an image: `image` is a self-contained RGBA8 bitmap and `frame` is the display
+    /// rectangle (pt/px coordinates).
     ///
-    /// 后端直接消费 `image.pixmap`（已解码，**无需再解码**）并按 `image.object_fit`
-    /// 映射到 `frame`。默认实现为空（后端应 override 以真正绘制）。
+    /// The backend consumes `image.pixmap` directly (already decoded, **no further
+    /// decoding needed**) and maps it onto `frame` according to `image.object_fit`.
+    /// The default implementation is empty (backends should override it to actually draw).
     fn draw_image(&mut self, image: &crate::SceneImage, frame: Rect, opacity: f64) {
         let _ = (image, frame, opacity);
     }
 
-    /// 进入一个变换作用域（Group 或节点局部变换）。
-    /// 默认空实现；支持栈式状态的后端（vello/svg group）应 override。
+    /// Enter a transform scope (for a Group or node-local transform).
+    /// Empty by default; backends with stack-based state (vello / svg group) should
+    /// override.
     fn push_transform(&mut self, _t: Transform) {}
-    /// 退出 [`Renderer::push_transform`] 建立的作用域。
+    /// Exit the scope established by [`Renderer::push_transform`].
     fn pop_transform(&mut self) {}
 
-    /// 进入一个透明度作用域（`opacity < 1` 的节点/子树）。默认空实现。
+    /// Enter an opacity scope (for a node / subtree with `opacity < 1`). Empty by default.
     fn push_opacity(&mut self, _opacity: f64) {}
-    /// 退出 [`Renderer::push_opacity`] 建立的作用域。
+    /// Exit the scope established by [`Renderer::push_opacity`].
     fn pop_opacity(&mut self) {}
 
-    /// 进入一个命名作用域（带 `name` 的节点；SVG 端输出 `id`）。
-    /// `name` 为 `Option`：`None` 表示不输出 `id` 属性。
+    /// Enter a named scope (for a node with `name`; emits `id` on the SVG side).
+    /// `name` is an `Option`: `None` means no `id` attribute is emitted.
     fn push_name(&mut self, _name: Option<&str>) {}
-    /// 退出 [`Renderer::push_name`] 建立的作用域。
+    /// Exit the scope established by [`Renderer::push_name`].
     fn pop_name(&mut self) {}
 
-    /// 进入一个裁剪作用域（带 `clip` 的节点/子树）。默认空实现。
+    /// Enter a clip scope (for a node / subtree with `clip`). Empty by default.
     fn push_clip(&mut self, _clip: &crate::scene::Clip) {}
-    /// 退出 [`Renderer::push_clip`] 建立的作用域。
+    /// Exit the scope established by [`Renderer::push_clip`].
     fn pop_clip(&mut self) {}
 
-    /// 进入节点级作用域：按顺序叠加变换、裁剪、透明度、命名。
-    /// 默认组合 `push_transform` / `push_clip` / `push_opacity` / `push_name`；后端一般无需 override。
+    /// Enter the node-level scope: stacks transform, clip, opacity, and name in order.
+    /// The default combines `push_transform` / `push_clip` / `push_opacity` /
+    /// `push_name`; backends rarely need to override this.
     fn push_node_scope(&mut self, node: &SceneNode) {
         if let Some(t) = node.transform {
             self.push_transform(t);
@@ -221,7 +238,7 @@ pub trait Renderer {
         }
     }
 
-    /// 退出 [`Renderer::push_node_scope`] 建立的作用域（逆序 pop）。
+    /// Exit the scope established by [`Renderer::push_node_scope`] (pops in reverse order).
     fn pop_node_scope(&mut self, node: &SceneNode) {
         if node.name.is_some() {
             self.pop_name();
@@ -237,15 +254,16 @@ pub trait Renderer {
         }
     }
 
-    /// 渲染整个场景：默认实现处理排序与递归。
-    /// 后端可在 override 中捕获 [`Scene`] 元数据（title/description/scale）后，
-    /// 再调用 [`Renderer::render_scene_ordered`] 复用默认遍历。
+    /// Render the whole scene: the default implementation handles sorting and recursion.
+    /// A backend may override this to capture [`Scene`] metadata (title / description /
+    /// scale), then call [`Renderer::render_scene_ordered`] to reuse the default traversal.
     fn render_scene(&mut self, scene: &Scene) {
         self.render_scene_ordered(scene);
     }
 
-    /// 默认遍历：先绘制默认层 `nodes`（最底，按 `z_index` 稳定升序），
-    /// 再按数组顺序从底到顶绘制各图层 [`Layer`]。
+    /// Default traversal: draws the default `nodes` layer first (bottommost, sorted
+    /// stably by ascending `z_index`), then each [`Layer`] in array order from bottom to
+    /// top.
     fn render_scene_ordered(&mut self, scene: &Scene) {
         for node in scene.iter_ordered() {
             self.render_node(node);
@@ -255,8 +273,9 @@ pub trait Renderer {
         }
     }
 
-    /// 渲染单个图层：应用图层级 `visible` / `opacity` / `transform` / `name` 作用域，
-    /// 层内按 `z_index` 稳定升序逐节点渲染（含 Group 递归）。一般无需 override。
+    /// Render a single layer: applies the layer-level `visible` / `opacity` /
+    /// `transform` / `name` scope, then renders each node inside the layer stably by
+    /// ascending `z_index` (including Group recursion). Rarely needs to be overridden.
     fn render_layer(&mut self, layer: &Layer) {
         if !layer.visible {
             return;
@@ -286,18 +305,20 @@ pub trait Renderer {
         }
     }
 
-    /// 渲染单个节点（含节点属性、局部变换与 Group 递归）。一般无需 override。
+    /// Render a single node (node attributes, local transform, and Group recursion
+    /// included). Rarely needs to be overridden.
     fn render_node(&mut self, node: &SceneNode) {
-        // 隐藏节点整棵子树跳过。
+        // Skip the whole subtree for a hidden node.
         if !node.visible {
             return;
         }
-        // 进入节点作用域（变换 + 透明度 + 命名）。
+        // Enter the node scope (transform + opacity + name).
         self.push_node_scope(node);
 
         match &node.element {
             Element::Group { children } => {
-                // Group 内子节点按 z_index 稳定升序绘制（复用 SceneNode::ordered）。
+                // Children inside a Group are drawn stably by ascending z_index
+                // (reusing SceneNode::ordered).
                 for child in SceneNode::ordered(children) {
                     self.render_node(child);
                 }
@@ -367,8 +388,8 @@ pub trait Renderer {
 mod tests {
     use crate::geometry::{Point, Vec2};
 
-    /// 与 SVG 后端 `arc_path_d` 完全一致的屏幕(y-down)坐标端点公式。
-    /// start = (cx + rx·cos a, cy + ry·sin a)，end = (cx + rx·cos(a+s), cy + ry·sin(a+s))。
+    /// The screen (y-down) endpoint formula, identical to the SVG backend's `arc_path_d`.
+    /// start = (cx + rx·cos a, cy + ry·sin a), end = (cx + rx·cos(a+s), cy + ry·sin(a+s)).
     fn expected_screen_points(
         center: Point,
         radii: Vec2,
@@ -387,8 +408,10 @@ mod tests {
         (start, end)
     }
 
-    /// 校验 vello 后端 `arc_path_y_down` 生成的弧端点与 SVG `arc_path_d` 公式一致，
-    /// 确保两个后端画出的饼图/圆弧形状完全对齐（曾因 kurbo 数学坐标未翻转而垂直镜像）。
+    /// Verify that the arc endpoints generated by the vello backend's `arc_path_y_down` match
+    /// the SVG `arc_path_d` formula, ensuring the pie/arc shapes drawn by both backends align
+    /// exactly (they were once vertically mirrored because kurbo's math coordinates were not
+    /// flipped).
     #[test]
     fn arc_y_down_matches_svg_geometry() {
         let cases = [
@@ -414,8 +437,8 @@ mod tests {
         ];
         for (center, radii, a, s) in cases {
             let path = crate::render::arc_path_y_down(center, radii, a, s);
-            // 纯弧路径：elements 以 MoveTo(start) 开头，后续 CurveTo 终点依次追加，
-            // 因此 pts[0] 是弧起点，pts[last] 是弧终点。
+            // Pure arc path: elements start with MoveTo(start), then CurveTo endpoints are
+            // appended in order, so pts[0] is the arc start and pts[last] is the arc end.
             let pts: Vec<Point> = path
                 .elements()
                 .iter()

@@ -1,24 +1,30 @@
-//! Canvas 风格便捷构造层（builder / sugar）。
+//! Canvas-style convenience construction layer (builder / sugar).
 //!
-//! 本模块在底层声明式 IR（[`crate::scene`] / [`crate::text`]）之上提供一层可选糖衣，
-//! 参考 Web Canvas 2D API 的心智模型（`ctx.fillStyle` / `ctx.font` / `ctx.fillText`），
-//! 让"从浏览器迁移"或"快速搭一个图"更顺手。
+//! This module provides an optional layer of sugar on top of the lower-level declarative IR
+//! ([`crate::scene`] / [`crate::text`]), following the mental model of the Web Canvas 2D API
+//! (`ctx.fillStyle` / `ctx.font` / `ctx.fillText`), so that "migrating from the browser" or
+//! "quickly building a diagram" feels familiar.
 //!
-//! ## 定位与边界
-//! - **纯构造**：所有方法都**消费不可变的 [`Ctx`] 并返回 [`Element`]**，不做任何即时绘制；
-//!   与声明式 IR 完全兼容，产出可直接 `scene.push(...)`（经 `From<Element>` 自动转 `SceneNode`）。
-//! - **不引入可变状态**：Canvas 的 `ctx` 是可变命令式状态，本层刻意不模拟。`with_*` 返回
-//!   新的 `Ctx`（构建者模式），如需"同画布多种样式"就复制/链式派生，互不污染。
-//! - **不破坏 IR**：所有便捷方法最终落到 `Element::*` / `RichSpan`，未新增任何 IR 类型。
-//!   核心 value：文本锚点语义（`fillText` 的 `textAlign`/`textBaseline` 定位）由渲染端
-//!   内部统一计算，本层直接转发，无需调用方手动算偏移。
+//! ## Scope and boundaries
+//! - **Pure construction**: every method **consumes an immutable [`Ctx`] and returns an
+//!   [`Element`]**, performing no immediate drawing; fully compatible with the declarative IR,
+//!   and the result can be pushed directly via `scene.push(...)` (auto-converted to `SceneNode`
+//!   through `From<Element>`).
+//! - **No mutable state**: Canvas's `ctx` is mutable, imperative state, which this layer
+//!   deliberately does not simulate. `with_*` returns a new `Ctx` (builder pattern); to use
+//!   "multiple styles on one canvas", copy / chain-derive so they don't interfere.
+//! - **No IR breakage**: all convenience methods eventually land on `Element::*` / `RichSpan`,
+//!   introducing no new IR types. Its core value: text-anchor semantics (`fillText`'s
+//!   `textAlign`/`textBaseline` positioning) are computed uniformly inside the renderer, and this
+//!   layer just forwards, so the caller needn't compute offsets by hand.
 //!
-//! ## 文本锚点（对齐 Canvas `fillText`）
-//! [`Ctx::fill_text`] 的 `(x, y)` 是**锚点**：由 [`TextStyle`] 的 `align` / `baseline`
-//! 决定锚点落在文本块的哪个位置（默认 `Left` + `Alphabetic`，即 `(x,y)` 在首行基线）。
-//! 渲染端内部按 [`crate::text::compute_text_offset`] 统一算偏移，调用方无需手动定位。
+//! ## Text anchors (aligned with Canvas `fillText`)
+//! The `(x, y)` of [`Ctx::fill_text`] is an **anchor**: [`TextStyle`]'s `align` / `baseline`
+//! decide where the anchor lands within the text block (default `Left` + `Alphabetic`, i.e.
+//! `(x,y)` is on the first-line baseline). The renderer computes the offset internally via
+//! [`crate::text::compute_text_offset`], so the caller needn't position manually.
 //!
-//! 使用范式：
+//! Usage pattern:
 //! ```
 //! use lievisual::builder::Ctx;
 //! use lievisual::geometry::{Color, Point};
@@ -29,8 +35,8 @@
 //! let ctx = Ctx::new()
 //!     .with_fill(Color::rgb(0x33, 0x66, 0x99))
 //!     .with_font(TextStyle::new(Color::rgb(0x33, 0x66, 0x99), 24.0, "sans-serif"));
-//! scene.push(ctx.fill_rect(10.0, 10.0, 80.0, 40.0));   // 填充矩形（用 with_fill 的色）
-//! scene.push(ctx.fill_text(50.0, 50.0, "Hi"));          // 文本（用字体色，锚点=首行基线）
+//! scene.push(ctx.fill_rect(10.0, 10.0, 80.0, 40.0));   // filled rect (uses with_fill color)
+//! scene.push(ctx.fill_text(50.0, 50.0, "Hi"));          // text (uses font color, anchor = first-line baseline)
 //! ```
 
 use crate::geometry::{Color, Point, Rect, Size, Vec2};
@@ -38,18 +44,22 @@ use crate::scene::{Element, Fill, FillStrokeStyle, Stroke};
 use crate::text::{TextStyle, measure_text};
 use kurbo::BezPath;
 
-/// Canvas 风格构造上下文：持有默认填充色 / 描边 / 字体，供便捷方法使用。
+/// Canvas-style construction context: holds the default fill color / stroke / font for the
+/// convenience methods.
 ///
-/// 不可变、可链式派生（`with_*` 返回新实例）；不携带任何绘制目标。
+/// Immutable and chain-derivable (`with_*` returns a new instance); carries no drawing target.
 #[derive(Debug, Clone)]
 pub struct Ctx {
-    /// 默认填充色（Canvas `fillStyle`）。仅用于**形状**（矩形/圆/多边形/路径）的填充；
-    /// 文本颜色由 [`Self::font`] 的 `color` 决定（见 [`Ctx::fill_text`]）。`None` 时
-    /// 形状方法不填充、描边回退用字体的 `color`。
+    /// Default fill color (Canvas `fillStyle`). Used only for **shape** (rect / circle / polygon
+    /// / path) fills; text color is decided by [`Self::font`]'s `color` (see
+    /// [`Ctx::fill_text`]). When `None`, shape methods skip filling and strokes fall back to the
+    /// font's `color`.
     pub fill: Option<Color>,
-    /// 默认描边（Canvas `strokeStyle` + `lineWidth`）。`None` 时形状方法不描边、线类方法回退 1px。
+    /// Default stroke (Canvas `strokeStyle` + `lineWidth`). When `None`, shape methods skip
+    /// stroking and line methods fall back to 1px.
     pub stroke: Option<Stroke>,
-    /// 默认文本样式（Canvas `font` + `textAlign` + `textBaseline`）；文本色取其 `color`。
+    /// Default text style (Canvas `font` + `textAlign` + `textBaseline`); text color is its
+    /// `color`.
     pub font: TextStyle,
 }
 
@@ -64,54 +74,57 @@ impl Default for Ctx {
 }
 
 impl Ctx {
-    /// 构造默认上下文（填充黑、无描边、12px sans-serif 文本）。
+    /// Construct the default context (black fill, no stroke, 12px sans-serif text).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 设置默认填充色（`fillStyle`）。
+    /// Set the default fill color (`fillStyle`).
     #[must_use]
     pub fn with_fill(mut self, color: Color) -> Self {
         self.fill = Some(color);
         self
     }
 
-    /// 设置默认描边（`strokeStyle` + `lineWidth`）。
+    /// Set the default stroke (`strokeStyle` + `lineWidth`).
     #[must_use]
     pub fn with_stroke(mut self, stroke: Stroke) -> Self {
         self.stroke = Some(stroke);
         self
     }
 
-    /// 设置默认文本样式（`font`）。
+    /// Set the default text style (`font`).
     #[must_use]
     pub fn with_font(mut self, font: TextStyle) -> Self {
         self.font = font;
         self
     }
 
-    /// 便捷：仅设置文本颜色（写入 `self.font.color`；不影响形状填充 [`Self::fill`]）。
+    /// Convenience: set only the text color (writes `self.font.color`; does not affect shape
+    /// fill [`Self::fill`]).
     #[must_use]
     pub fn with_text_color(mut self, color: Color) -> Self {
         self.font.color = color;
         self
     }
 
-    /// 文本颜色 = 字体自带色（`TextStyle::color`；`with_text_color` 即改此字段）。
+    /// Text color = the font's own color (`TextStyle::color`; `with_text_color` edits this
+    /// field).
     ///
-    /// 与 Canvas `fillStyle` 决定文本色不同，lievisual 把文本色并入 `TextStyle.color`，
-    /// 故文本色与形状填充（[`Self::shape_fill`]）解耦，避免 `with_fill` 意外覆盖文本。
+    /// Unlike Canvas where `fillStyle` decides text color, lievisual folds text color into
+    /// `TextStyle.color`, so text color is decoupled from the shape fill ([`Self::shape_fill`]),
+    /// avoiding `with_fill` accidentally overriding text.
     fn text_color(&self) -> Color {
         self.font.color
     }
 
-    /// 形状填充色：默认填充色 > 字体自带色。
+    /// Shape fill color: default fill > font's own color.
     fn shape_fill(&self) -> Color {
         self.fill.unwrap_or(self.font.color)
     }
 
-    /// 用默认填充 + 描边构造 `FillStrokeStyle`。
+    /// Build a `FillStrokeStyle` from the default fill + stroke.
     fn fill_stroke(&self) -> FillStrokeStyle {
         FillStrokeStyle {
             fill: self.fill.map(Fill::Solid),
@@ -119,10 +132,10 @@ impl Ctx {
         }
     }
 
-    // ---- 文本 ----
+    // ---- text ----
 
-    /// 绘制文本（`ctx.fillText`）。`(x, y)` 为锚点，由 `self.font` 的
-    /// `align` / `baseline` 决定（默认：首行基线）。
+    /// Draw text (`ctx.fillText`). `(x, y)` is the anchor, decided by `self.font`'s
+    /// `align` / `baseline` (default: first-line baseline).
     #[must_use]
     pub fn fill_text(&self, x: f64, y: f64, text: impl Into<String>) -> Element {
         let mut style = self.font.clone();
@@ -130,7 +143,7 @@ impl Ctx {
         Element::text(text, Point::new(x, y), style)
     }
 
-    /// 测量文本（`ctx.measureText`），返回宽/高（由 `self.font` 排版）。
+    /// Measure text (`ctx.measureText`), returning width / height (typeset with `self.font`).
     #[must_use]
     pub fn measure_text(&self, text: impl AsRef<str>) -> Size {
         let style = self.font.clone();
@@ -141,9 +154,9 @@ impl Ctx {
         .size
     }
 
-    // ---- 形状：矩形 ----
+    // ---- shapes: rectangle ----
 
-    /// 填充矩形（`fillRect`）。`(x, y)` 为左上角，`w`/`h` 为宽高。
+    /// Filled rectangle (`fillRect`). `(x, y)` is the top-left corner, `w`/`h` are width/height.
     #[must_use]
     pub fn fill_rect(&self, x: f64, y: f64, w: f64, h: f64) -> Element {
         Element::rect(
@@ -152,7 +165,7 @@ impl Ctx {
         )
     }
 
-    /// 描边矩形（`strokeRect`）。描边居中于边线（Canvas 语义）。
+    /// Stroked rectangle (`strokeRect`). The stroke is centered on the edge (Canvas semantics).
     #[must_use]
     pub fn stroke_rect(&self, x: f64, y: f64, w: f64, h: f64) -> Element {
         Element::rect(
@@ -167,9 +180,9 @@ impl Ctx {
         )
     }
 
-    // ---- 形状：圆 / 椭圆 ----
+    // ---- shapes: circle / ellipse ----
 
-    /// 填充圆（`arc` 全周 + `fill`）。`(x, y)` 为圆心，`r` 为半径。
+    /// Filled circle (`arc` full turn + `fill`). `(x, y)` is the center, `r` is the radius.
     #[must_use]
     pub fn fill_circle(&self, x: f64, y: f64, r: f64) -> Element {
         Element::circle(
@@ -179,7 +192,8 @@ impl Ctx {
         )
     }
 
-    /// 填充椭圆。`(x, y)` 为圆心，`rx`/`ry` 为两半轴，`rotation` 为绕心旋转（弧度）。
+    /// Filled ellipse. `(x, y)` is the center, `rx`/`ry` are the two semi-axes, `rotation` is
+    /// the rotation about the center (radians).
     #[must_use]
     pub fn fill_ellipse(&self, x: f64, y: f64, rx: f64, ry: f64, rotation: f64) -> Element {
         Element::ellipse(
@@ -190,9 +204,9 @@ impl Ctx {
         )
     }
 
-    // ---- 形状：线 / 折线 / 多边形 ----
+    // ---- shapes: line / polyline / polygon ----
 
-    /// 线段（`beginPath + moveTo + lineTo + stroke`）。
+    /// Line segment (`beginPath + moveTo + lineTo + stroke`).
     #[must_use]
     pub fn line(&self, x0: f64, y0: f64, x1: f64, y1: f64) -> Element {
         Element::line(
@@ -204,7 +218,7 @@ impl Ctx {
         )
     }
 
-    /// 折线（`polyline`，仅描边）。`pts` 为 `(x, y)` 序列。
+    /// Polyline (`polyline`, stroke only). `pts` is the `(x, y)` sequence.
     #[must_use]
     pub fn polyline(&self, pts: &[(f64, f64)]) -> Element {
         Element::poly(
@@ -215,7 +229,7 @@ impl Ctx {
         )
     }
 
-    /// 闭合多边形（可填充 + 描边）。
+    /// Closed polygon (fill + optional stroke).
     #[must_use]
     pub fn polygon(&self, pts: &[(f64, f64)]) -> Element {
         Element::polygon(
@@ -224,9 +238,9 @@ impl Ctx {
         )
     }
 
-    // ---- 形状：路径 ----
+    // ---- shapes: path ----
 
-    /// 贝塞尔路径（`beginPath + 路径 + fill`）。`closed` 决定是否闭合后再填充。
+    /// Bézier path (`beginPath + path + fill`). `closed` decides whether to close before fill.
     #[must_use]
     pub fn path(&self, path: BezPath, closed: bool) -> Element {
         Element::Path {
@@ -245,7 +259,8 @@ mod tests {
         Ctx::new().with_fill(Color::rgb(0x33, 0x66, 0x99))
     }
 
-    /// 文本锚点：默认 Left/Alphabetic，`position` 即锚点；颜色取字体自带色（非 `with_fill`）。
+    /// Text anchor: default Left/Alphabetic, `position` is the anchor; color uses the font's
+    /// own color (not `with_fill`).
     #[test]
     fn fill_text_anchors_and_color() {
         let ctx =
@@ -269,7 +284,7 @@ mod tests {
         }
     }
 
-    /// `with_text_color` 修改字体色（文本色），不影响形状填充色。
+    /// `with_text_color` changes the font color (text color) without affecting the shape fill color.
     #[test]
     fn text_color_independent_of_shape_fill() {
         let ctx = default_ctx().with_text_color(Color::rgb(0xff, 0, 0));
@@ -277,7 +292,7 @@ mod tests {
             Element::Text { spans, .. } => assert_eq!(spans[0].style.color, Color::rgb(0xff, 0, 0)),
             _ => panic!("expected Text"),
         }
-        // 形状填充仍用默认填充色。
+        // shape fill still uses the default fill color.
         match ctx.fill_rect(0.0, 0.0, 1.0, 1.0) {
             Element::Rect { style, .. } => {
                 assert_eq!(style.fill, Some(Fill::Solid(Color::rgb(0x33, 0x66, 0x99))));
@@ -286,7 +301,7 @@ mod tests {
         }
     }
 
-    /// 矩形：(x, y) 为左上角，w/h 为尺寸。
+    /// Rectangle: `(x, y)` is the top-left corner, `w`/`h` are dimensions.
     #[test]
     fn rect_builders() {
         let ctx = default_ctx();
@@ -307,7 +322,7 @@ mod tests {
         }
     }
 
-    /// 线 / 折线 / 多边形 / 圆。
+    /// Line / polyline / polygon / circle.
     #[test]
     fn shape_builders() {
         let ctx = Ctx::new()
@@ -332,7 +347,7 @@ mod tests {
         ));
     }
 
-    /// 路径：`closed` 透传，样式取 fill+stroke。
+    /// Path: `closed` is forwarded, style takes fill+stroke.
     #[test]
     fn path_builder() {
         let ctx = Ctx::new()
@@ -357,7 +372,7 @@ mod tests {
         }
     }
 
-    /// 测量：宽高应 > 0。
+    /// Measurement: width / height should be > 0.
     #[test]
     fn measure_returns_size() {
         let ctx = default_ctx().with_font(TextStyle::new(Color::BLACK, 20.0, "sans-serif"));
@@ -365,7 +380,7 @@ mod tests {
         assert!(size.width > 0.0 && size.height > 0.0);
     }
 
-    /// builder 产出可 push 进 Scene（Element → SceneNode 自动转换）。
+    /// Builder output can be pushed into a Scene (Element → SceneNode auto-conversion).
     #[test]
     fn elements_are_pushable() {
         use crate::scene::Scene;

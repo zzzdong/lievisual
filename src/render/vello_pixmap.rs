@@ -1,13 +1,16 @@
-//! 基于 `vello_cpu` 的栅格化后端。
+//! Rasterization backend based on `vello_cpu`.
 //!
-//! 将 [`Scene`] 渲染为 `vello_cpu::Pixmap`，可进一步导出 PNG。
-//! 文本优先使用调用者提供的 [`text::TextLayout`]；若未提供则现场用 [`text::measure_text`] 排版。
+//! Renders a [`Scene`] into a `vello_cpu::Pixmap`, which can be further exported to PNG.
+//! Text prefers the caller-provided [`text::TextLayout`]; if absent, it is laid out on the fly
+//! via [`text::measure_text`].
 //!
-//! 说明：
-//! - 填充统一走 [`paint_path`](VelloPixmapRenderer::paint_path)，支持 `Solid` / 线性渐变 /
-//!   径向渐变；描边支持虚线（`dash_pattern`）与 `miter_limit`。
-//! - 变换用独立栈维护（`push_transform` 与父变换复合，`pop_transform` 恢复），支持嵌套 Group。
-//! - 节点透明度通过把当前 `opacity` 乘入颜色 alpha 实现。
+//! Notes:
+//! - Filling uniformly goes through [`paint_path`](VelloPixmapRenderer::paint_path), supporting
+//!   `Solid` / linear gradient / radial gradient; strokes support dashes (`dash_pattern`) and
+//!   `miter_limit`.
+//! - Transforms are maintained with an independent stack (`push_transform` composes with the
+//!   parent transform, `pop_transform` restores it), supporting nested Groups.
+//! - Node opacity is applied by multiplying the current `opacity` into the color's alpha.
 
 use kurbo::{BezPath, Circle, Point as VPoint, Rect as VRect, Shape, Stroke as KurboStroke};
 use vello_cpu::peniko::color::AlphaColor;
@@ -20,7 +23,7 @@ use crate::scene::{
 };
 use crate::text::TextStyle;
 
-/// vello_cpu 栅格化渲染器。
+/// vello_cpu rasterization renderer.
 #[derive(Debug)]
 pub struct VelloPixmapRenderer {
     ctx: RenderContext,
@@ -28,9 +31,9 @@ pub struct VelloPixmapRenderer {
     width: u32,
     height: u32,
     background: Option<Color>,
-    /// 变换栈：栈顶为当前生效的复合变换。
+    /// Transform stack: top is the currently active composed transform.
     transform_stack: Vec<vello_cpu::kurbo::Affine>,
-    /// 透明度栈：栈顶为当前生效的复合透明度（各层相乘）。
+    /// Opacity stack: top is the currently active composed opacity (layers multiplied together).
     opacity_stack: Vec<f64>,
 }
 
@@ -52,12 +55,14 @@ impl VelloPixmapRenderer {
         self
     }
 
-    /// 渲染场景并返回 Pixmap。
+    /// Render the scene and return a Pixmap.
     ///
-    /// 复用同一 `RenderContext` / `Resources`（字形、图集缓存跨帧保留）；
-    /// 每次渲染前 `reset()` 清空上一帧场景，因此同一渲染器可重复渲染多帧。
+    /// Reuses the same `RenderContext` / `Resources` (glyph, atlas caches persist across frames);
+    /// `reset()` clears the previous frame's scene before each render, so the same renderer can
+    /// render multiple frames repeatedly.
     pub fn render_scene_to_pixmap(&mut self, scene: &Scene) -> Pixmap {
-        // 清空上一帧场景与状态（含变换/透明度栈，防止上一帧异常中断后残留）。
+        // Clear the previous frame's scene and state (including transform/opacity stacks, to
+        // avoid residue after an abnormal interruption of the previous frame).
         self.ctx.reset();
         self.transform_stack.clear();
         self.opacity_stack.clear();
@@ -67,9 +72,11 @@ impl VelloPixmapRenderer {
             self.ctx.set_paint(self.to_vello(&bg));
             self.ctx.fill_rect(&rect);
         }
-        // 场景坐标（范围 scene.width × scene.height）需映射到像素画布（self.width × self.height）。
-        // SVG 后端靠 viewBox + width/height 由浏览器自动缩放；vello 后端必须显式应用该 scale，
-        // 否则图形会画在画布左上角的 [0,scene.width]×[0,scene.height] 子区域内。
+        // Scene coordinates (range scene.width × scene.height) must map to the pixel canvas
+        // (self.width × self.height). The SVG backend relies on viewBox + width/height for the
+        // browser to scale automatically; the vello backend must apply this scale explicitly,
+        // otherwise the graphics would be drawn in the top-left [0,scene.width]×[0,scene.height]
+        // sub-region of the canvas.
         let s = if scene.width > 0.0 {
             self.width as f64 / scene.width
         } else {
@@ -78,7 +85,8 @@ impl VelloPixmapRenderer {
         let base = vello_cpu::kurbo::Affine::scale(s);
         self.ctx.set_transform(base);
         self.transform_stack.push(base);
-        // 委托默认遍历（排序 + Group 递归 + 节点属性 + 局部变换）。
+        // Delegate the default traversal (sorting + Group recursion + node attributes + local
+        // transform).
         self.render_scene(scene);
         if self.transform_stack.pop().is_some() {
             self.ctx.set_transform(vello_cpu::kurbo::Affine::IDENTITY);
@@ -89,18 +97,18 @@ impl VelloPixmapRenderer {
         pixmap
     }
 
-    /// 渲染场景并导出 PNG 字节（依赖 `png` 常驻编码）。
+    /// Render the scene and export PNG bytes (depends on the permanent `png` encoder).
     pub fn render_png(&mut self, scene: &Scene) -> Vec<u8> {
         let pixmap = self.render_scene_to_pixmap(scene);
         pixmap_to_png(&pixmap)
     }
 
-    /// 当前生效的复合透明度（默认 1.0）。
+    /// The currently active composed opacity (default 1.0).
     fn current_opacity(&self) -> f64 {
         self.opacity_stack.last().copied().unwrap_or(1.0)
     }
 
-    /// 转为 vello 颜色；乘入当前透明度。
+    /// Convert to a vello color, multiplying in the current opacity.
     fn to_vello(&self, color: &Color) -> AlphaColor<vello_cpu::color::Srgb> {
         let a = (color.a * self.current_opacity()).clamp(0.0, 1.0);
         AlphaColor::from_rgba8(
@@ -137,7 +145,7 @@ impl VelloPixmapRenderer {
         k
     }
 
-    /// 构造带当前透明度的 peniko 色标。
+    /// Build peniko color stops carrying the current opacity.
     fn peniko_stops(&self, stops: &[GradientStop]) -> Vec<vello_cpu::peniko::ColorStop> {
         stops
             .iter()
@@ -150,7 +158,7 @@ impl VelloPixmapRenderer {
             .collect()
     }
 
-    /// 设置渐变填充（保持用户空间坐标，抵消节点/图层变换）。
+    /// Set a gradient fill (keeping user-space coordinates, cancelling node/layer transforms).
     fn paint_gradient(&mut self, kind: vello_cpu::peniko::GradientKind, stops: &[GradientStop]) {
         use vello_cpu::peniko::{
             ColorStops, Extend, Gradient, InterpolationAlphaSpace, color::ColorSpaceTag,
@@ -169,7 +177,8 @@ impl VelloPixmapRenderer {
         self.ctx.set_paint(gradient);
     }
 
-    /// 当前生效的场景（复合）变换：栈顶，未变换时为单位矩阵。
+    /// The currently active scene (composed) transform: the top of the stack, or identity when
+    /// no transform is applied.
     fn current_transform(&self) -> vello_cpu::kurbo::Affine {
         self.transform_stack
             .last()
@@ -177,9 +186,10 @@ impl VelloPixmapRenderer {
             .unwrap_or(vello_cpu::kurbo::Affine::IDENTITY)
     }
 
-    /// 设置 paint transform，使渐变坐标保持在用户（根）坐标空间，
-    /// 抵消节点/图层已应用的 `set_transform`（与 SVG `gradientUnits="userSpaceOnUse"` 一致）。
-    /// 奇异变换（det=0）下逆无意义，回退单位矩阵（渐变随图形走）。
+    /// Set the paint transform so gradient coordinates stay in user (root) space, cancelling the
+    /// `set_transform` already applied by nodes/layers (consistent with SVG
+    /// `gradientUnits="userSpaceOnUse"`). Under a singular transform (det=0) the inverse is
+    /// meaningless, so we fall back to the identity matrix (gradient follows the shape).
     fn set_user_space_paint(&mut self) {
         use vello_cpu::kurbo::Affine;
         let scene = self.current_transform();
@@ -190,7 +200,7 @@ impl VelloPixmapRenderer {
         }
     }
 
-    /// 依据 `Fill` 设置当前画笔（Solid / 线性 / 径向渐变）。
+    /// Set the current brush according to `Fill` (Solid / linear / radial gradient).
     fn set_fill(&mut self, fill: &Fill) {
         use vello_cpu::peniko::{GradientKind, LinearGradientPosition, RadialGradientPosition};
         match fill {
@@ -212,12 +222,12 @@ impl VelloPixmapRenderer {
         }
     }
 
-    /// 统一绘制：填充（任意类型）+ 可选描边（含虚线）。
+    /// Unified drawing: fill (any type) + optional stroke (including dashes).
     fn paint_path(&mut self, path: &BezPath, style: &FillStrokeStyle) {
         if let Some(fill) = &style.fill {
             self.set_fill(fill);
             self.ctx.fill_path(path);
-            // 渐变 fill 设置了 user-space paint transform，绘制后复位。
+            // A gradient fill set a user-space paint transform; reset it after drawing.
             self.ctx.reset_paint_transform();
         }
         if let Some(s) = &style.stroke {
@@ -349,7 +359,9 @@ impl Renderer for VelloPixmapRenderer {
                 (frame_w * frame_h) as usize
             ];
         let src_pixels: Vec<vello_cpu::color::PremulRgba8> = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| {
                 let [r, g, b, a] = [p[0], p[1], p[2], p[3]];
                 let a = ((a as f64) * op) as u8;
@@ -655,7 +667,9 @@ mod tests {
         assert_eq!(d1, d2, "多帧渲染结果应一致");
         // 非全白背景：渐变矩形应覆盖部分像素。
         let non_white = d1
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] < 250 || px[1] < 250 || px[2] < 250)
             .count();
         assert!(non_white > 0, "渐变矩形未渲染出来");

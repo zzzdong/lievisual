@@ -1,56 +1,64 @@
-//! 声明式场景图 IR。
+//! Declarative scene-graph IR.
 //!
-//! 设计原则（参见 crate 文档）：
-//! - `z_index` 与 [`Transform`] 提升为 [`SceneNode`] 字段，而非每个图元重复携带。
-//!   同理，`opacity` / `name` / `visible` 也属于节点（或整棵子树）属性。
-//! - [`Element`] 枚举只描述几何与样式；新增图元变体时不影响层级/变换逻辑。
-//! - 节点级 `opacity` 作用于整棵子树（Group 递归时逐层复合），`visible = false`
-//!   时整棵子树跳过。
-//! - 图层：`Scene` 可携带一组有序 [`Layer`]（从底到顶）。图层整体控制
-//!   `visible` / `opacity` / `transform`，层内节点再按 `z_index` 稳定排序；
-//!   `Scene::nodes` 作为"默认层"（最底）保留，向后兼容。
-//! - [`Element::Text`] 以样式化片段（[`crate::text::RichSpan`]）为核心表达文本，可携带
-//!   预排版的 [`crate::text::TextLayout`]；纯文本由 `spans` 拼接推导，各后端渲染一致。
-//! - 统一排序助手：[`SceneNode::ordered`] 按 `z_index` 稳定升序遍历节点（同层保持插入次序），
-//!   [`Scene::iter_ordered`] 为顶层集合的便捷入口；渲染与调用方复用同一套遍历逻辑。
+//! Design principles (see the crate-level docs):
+//! - `z_index` and [`Transform`] are promoted to [`SceneNode`] fields rather than carried
+//!   by every primitive. Likewise, `opacity` / `name` / `visible` are node (or whole-subtree)
+//!   attributes.
+//! - The [`Element`] enum only describes geometry and style; adding a new primitive variant
+//!   does not affect layering / transform logic.
+//! - Node-level `opacity` applies to the whole subtree (composed level-by-level during Group
+//!   recursion); when `visible = false`, the whole subtree is skipped.
+//! - Layers: a [`Scene`] may carry an ordered set of [`Layer`] (bottom to top). A layer controls
+//!   `visible` / `opacity` / `transform` for the whole layer, while nodes inside are stably
+//!   sorted by `z_index`; `Scene::nodes` is kept as the "default layer" (bottom-most) for
+//!   backward compatibility.
+//! - [`Element::Text`] expresses text via styled spans ([`crate::text::RichSpan`]) and may carry
+//!   a pre-laid-out [`crate::text::TextLayout`]; plain text is derived by concatenating `spans`,
+//!   keeping all backends consistent.
+//! - Unified ordering helper: [`SceneNode::ordered`] iterates nodes in stable ascending `z_index`
+//!   order (preserving insertion order within the same level), and [`Scene::iter_ordered`] is a
+//!   convenience entry for the top-level collection; rendering and callers share the same
+//!   traversal logic.
 
 use crate::geometry::{Color, Point, Rect, Transform, Vec2};
 use crate::render::Renderer;
 use crate::text::{RichSpan, TextLayout};
 use kurbo::BezPath;
 
-/// 图片在目标框（`Element::Image.frame`，pt/px 坐标）内的适应方式。
+/// How an image fits inside its target frame (`Element::Image.frame`, pt/px coordinates).
 ///
-/// 与 liepress 的 [`crate::document::types::ObjectFit`] 一一对应，但作为
-/// lievisual IR 的自包含枚举，避免渲染层依赖文档层。
+/// Mirrors the `ObjectFit` concept used by downstream crates such as liepress, but is a
+/// self-contained enum in the lievisual IR so the rendering layer does not depend on a
+/// document layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ObjectFit {
-    /// 等比缩放，完整显示（可能在框内留白）。对应 SVG `meet`。
+    /// Scale to fit while preserving aspect ratio, fully visible (may pad inside the frame).
+    /// Corresponds to SVG `meet`.
     #[default]
     Contain,
-    /// 等比缩放，填满框并裁剪溢出部分。对应 SVG `slice`。
+    /// Scale to fill while preserving aspect ratio, cropping the overflow. Corresponds to SVG `slice`.
     Cover,
-    /// 拉伸填满框（可能变形）。
+    /// Stretch to fill the frame (may distort).
     Fill,
-    /// 不缩放，按原始像素尺寸放置于框左上角（可能溢出或留白）。
+    /// No scaling; place at the frame's top-left at original pixel size (may overflow or pad).
     None,
 }
 
-/// 场景中的图片资源（自包含 RGBA8 位图）。
+/// Image resource inside a scene (self-contained RGBA8 bitmap).
 ///
-/// 持有已解码的像素位图（[`crate::Pixmap`]），**lievisual 不做解码**——解码是调用方 /
-/// 资源加载层的职责。`frame` 为显示区域（在 [`Element::Image`] 中给出），`object_fit`
-/// 决定图片如何映射到 `frame`。
+/// Holds an already-decoded pixel bitmap ([`crate::Pixmap`]); **lievisual does not decode** —
+/// decoding is the caller's / resource-loading layer's responsibility. `frame` (given in
+/// [`Element::Image`]) is the display area; `object_fit` decides how the image maps onto `frame`.
 #[derive(Debug, Clone)]
 pub struct SceneImage {
-    /// 已解码的 RGBA8 位图。
+    /// Decoded RGBA8 bitmap.
     pub pixmap: crate::Pixmap,
-    /// 适应方式。
+    /// Fit mode.
     pub object_fit: ObjectFit,
 }
 
 impl SceneImage {
-    /// 由已解码的 RGBA8 位图构造（默认 `object_fit = Contain`）。
+    /// Construct from an already-decoded RGBA8 bitmap (default `object_fit = Contain`).
     #[must_use]
     pub fn from_pixmap(pixmap: crate::Pixmap) -> Self {
         Self {
@@ -59,9 +67,9 @@ impl SceneImage {
         }
     }
 
-    /// 便捷：由 RGBA8 像素构造位图（自动推导默认 `object_fit = Contain`）。
+    /// Convenience: build a bitmap from RGBA8 pixels (default `object_fit = Contain`).
     ///
-    /// 长度必须为 `4 * width * height`，否则返回 `None`。
+    /// The length must be `4 * width * height`, otherwise `None` is returned.
     #[must_use]
     pub fn from_rgba8(
         width: u32,
@@ -71,16 +79,17 @@ impl SceneImage {
         crate::Pixmap::from_rgba8(width, height, pixels).map(Self::from_pixmap)
     }
 
-    /// 便捷：由 PNG 字节解码构造（`png` 常驻依赖）。非 PNG / 解码失败返回 `None`。
+    /// Convenience: decode from PNG bytes (`png` is a permanent dependency). Returns `None`
+    /// for non-PNG input or decode failure.
     #[must_use]
     pub fn from_png(bytes: &[u8]) -> Option<Self> {
         crate::Pixmap::decode_png(bytes).map(Self::from_pixmap)
     }
 
-    /// 由任意编码字节解码构造（`jpeg` / `webp` / `gif` 等，经 `image`）。
+    /// Decode from arbitrary-encoded bytes (`jpeg` / `webp` / `gif`, etc. via `image`).
     ///
-    /// 仅在启用 `extra-image-codecs` feature 时可用。默认 lievisual 不做解码，
-    /// 图片以已解码 RGBA8 位图进入 IR。
+    /// Only available when the `extra-image-codecs` feature is enabled. By default lievisual
+    /// does not decode; images enter the IR as already-decoded RGBA8 bitmaps.
     #[cfg(feature = "extra-image-codecs")]
     #[must_use]
     pub fn from_encoded(bytes: &[u8]) -> Option<Self> {
@@ -90,28 +99,29 @@ impl SceneImage {
         Self::from_rgba8(w, h, rgba.into_raw())
     }
 
-    /// 原始像素宽。
+    /// Original pixel width.
     #[must_use]
     pub fn width(&self) -> u32 {
         self.pixmap.width()
     }
 
-    /// 原始像素高。
+    /// Original pixel height.
     #[must_use]
     pub fn height(&self) -> u32 {
         self.pixmap.height()
     }
 
-    /// 设置适应方式。
+    /// Set the fit mode.
     #[must_use]
     pub fn with_object_fit(mut self, fit: ObjectFit) -> Self {
         self.object_fit = fit;
         self
     }
 
-    /// SVG 输出用的 `preserveAspectRatio` 片段（无前缀）。
+    /// The `preserveAspectRatio` fragment (without prefix) used for SVG output.
     ///
-    /// `None` 配合 `"none"` + SVG 侧原始像素宽高，实现"不缩放、左上角"。
+    /// `None` together with `"none"` plus the raw pixel width/height on the SVG side
+    /// achieves "no scaling, top-left".
     #[must_use]
     pub fn preserve_aspect_ratio(&self) -> &'static str {
         match self.object_fit {
@@ -123,23 +133,24 @@ impl SceneImage {
     }
 }
 
-/// 一个完整的可渲染场景。
+/// A complete, renderable scene.
 #[derive(Debug, Clone)]
 pub struct Scene {
     pub width: f64,
     pub height: f64,
     pub background: Color,
-    /// 顶层图元集合（"默认层"，位于所有 `layers` 之下）。`render_scene` 会先按 `z_index` 排序再绘制。
+    /// Top-level primitive collection (the "default layer", below all `layers`). `render_scene`
+    /// sorts by `z_index` before drawing.
     pub nodes: Vec<SceneNode>,
-    /// 有序图层（从底到顶）。每个图层整体控制 `visible` / `opacity` / `transform`，
-    /// 层内节点按 `z_index` 稳定升序绘制。
+    /// Ordered layers (bottom to top). Each layer controls `visible` / `opacity` / `transform`
+    /// for the whole layer, and nodes inside are drawn in stable ascending `z_index` order.
     pub layers: Vec<Layer>,
-    /// 文档标题（SVG 输出为 `<title>`，供无障碍/导出名使用）。
+    /// Document title (emitted as `<title>` in SVG, for accessibility / export naming).
     pub title: Option<String>,
-    /// 文档描述（SVG 输出为 `<desc>`）。
+    /// Document description (emitted as `<desc>` in SVG).
     pub description: Option<String>,
-    /// 输出缩放（像素密度）。默认 1.0；SVG 端同时放大 `width`/`height` 而保持
-    /// `viewBox` 不变，得到更高分辨率的位图导出。
+    /// Output scale (pixel density). Default 1.0; the SVG side scales up `width`/`height` while
+    /// keeping `viewBox` unchanged, yielding a higher-resolution bitmap export.
     pub scale: f64,
 }
 
@@ -172,98 +183,101 @@ impl Scene {
         }
     }
 
-    /// 便捷构造器：背景 + 尺寸。
+    /// Convenience constructor: background + size.
     #[must_use]
     pub fn with_background(mut self, bg: Color) -> Self {
         self.background = bg;
         self
     }
 
-    /// 便捷构造器：文档标题。
+    /// Convenience constructor: document title.
     #[must_use]
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
         self
     }
 
-    /// 便捷构造器：文档描述。
+    /// Convenience constructor: document description.
     #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
     }
 
-    /// 便捷构造器：输出缩放（像素密度）。
+    /// Convenience constructor: output scale (pixel density).
     #[must_use]
     pub fn with_scale(mut self, scale: f64) -> Self {
         self.scale = scale;
         self
     }
 
-    /// 追加一个图元或节点（默认 z_index = 0，无变换）。
-    /// 同时接受 [`Element`]（经 `From<Element>` 自动转为 [`SceneNode`]）与已配置的 [`SceneNode`]。
+    /// Append a primitive or node (default `z_index = 0`, no transform).
+    /// Accepts both [`Element`] (auto-converted to [`SceneNode`] via `From<Element>`) and an
+    /// already-configured [`SceneNode`].
     pub fn push(&mut self, node: impl Into<SceneNode>) {
         self.nodes.push(node.into());
     }
 
-    /// 追加一个带层级/变换的图元。
+    /// Append a primitive with explicit layer / transform as a node.
     pub fn push_node(&mut self, node: SceneNode) {
         self.nodes.push(node);
     }
 
-    /// 追加一个递归组合（Group）：子节点在父变换与层级下绘制。
+    /// Append a recursive group: children are drawn under the parent transform and layer.
     pub fn push_group(&mut self, children: Vec<SceneNode>) {
         self.nodes.push(SceneNode::group(children));
     }
 
-    /// 追加一个图层（越后 push 越靠上）。
+    /// Append a layer (later `push` draws higher).
     pub fn push_layer(&mut self, layer: Layer) {
         self.layers.push(layer);
     }
 
-    /// 所有图层（从底到顶）。
+    /// All layers (bottom to top).
     pub fn layers(&self) -> &[Layer] {
         &self.layers
     }
 
-    /// 按名称查找图层。
+    /// Find a layer by name.
     pub fn layer(&self, name: &str) -> Option<&Layer> {
         self.layers.iter().find(|l| l.name == name)
     }
 
-    /// 按名称查找图层（可变）。
+    /// Find a layer by name (mutable).
     pub fn layer_mut(&mut self, name: &str) -> Option<&mut Layer> {
         self.layers.iter_mut().find(|l| l.name == name)
     }
 
-    /// 渲染到任意后端。
+    /// Render to any backend.
     pub fn render(&self, renderer: &mut dyn Renderer) {
         renderer.render_scene(self);
     }
 
-    /// 顶层图元按 `z_index` 升序遍历（稳定：同层保持插入次序）。
-    /// 仅覆盖默认层 `nodes`；图层的遍历见 [`Layer::iter_ordered`] 与 [`Renderer::render_layer`]。
+    /// Iterate top-level primitives in ascending `z_index` order (stable: insertion order is
+    /// preserved within the same level). Covers only the default `nodes` layer; for layers see
+    /// [`Layer::iter_ordered`] and [`Renderer::render_layer`].
     pub fn iter_ordered(&self) -> impl Iterator<Item = &SceneNode> {
         SceneNode::ordered(&self.nodes)
     }
 }
 
-/// 一个命名图层：一组节点 + 图层级整体属性。
+/// A named layer: a set of nodes plus layer-wide attributes.
 ///
-/// 图层按数组顺序从底到顶绘制；图层级 `visible = false` 时整层跳过，`opacity` /
-/// `transform` 作用于层内所有节点（与 Group 的子树语义一致）。层内节点再按各自
-/// `z_index` 稳定升序绘制。
+/// Layers are drawn in array order from bottom to top; when a layer's `visible = false` the
+/// whole layer is skipped, and `opacity` / `transform` apply to all nodes inside it (consistent
+/// with a Group's subtree semantics). Nodes inside are then drawn in stable ascending `z_index`
+/// order.
 #[derive(Debug, Clone)]
 pub struct Layer {
-    /// 图层名（SVG 端输出为 `<g id>`；可为空字符串以不输出）。
+    /// Layer name (emitted as `<g id>` on the SVG side; may be empty to omit).
     pub name: String,
-    /// 是否可见，默认 `true`。`false` 时整层跳过渲染。
+    /// Whether visible; default `true`. When `false` the whole layer is skipped.
     pub visible: bool,
-    /// 图层整体透明度，0.0–1.0，默认 1.0。
+    /// Layer-wide opacity, 0.0–1.0; default 1.0.
     pub opacity: f64,
-    /// 图层整体变换（应用于层内所有节点）。
+    /// Layer-wide transform (applied to all nodes inside).
     pub transform: Option<Transform>,
-    /// 层内图元集合（按 `z_index` 稳定排序后绘制）。
+    /// Nodes inside the layer (drawn after stable `z_index` sorting).
     pub nodes: Vec<SceneNode>,
 }
 
@@ -278,28 +292,29 @@ impl Layer {
         }
     }
 
-    /// 带初始图元的图层。
+    /// Layer with initial nodes.
     pub fn with_nodes(mut self, nodes: Vec<SceneNode>) -> Self {
         self.nodes = nodes;
         self
     }
 
-    /// 层内追加一个图元或节点。
+    /// Append a primitive or node inside the layer.
     pub fn push(&mut self, node: impl Into<SceneNode>) {
         self.nodes.push(node.into());
     }
 
-    /// 层内追加一个带层级/变换的节点。
+    /// Append a node with explicit layer / transform inside the layer.
     pub fn push_node(&mut self, node: SceneNode) {
         self.nodes.push(node);
     }
 
-    /// 层内追加一个递归组合。
+    /// Append a recursive group inside the layer.
     pub fn push_group(&mut self, children: Vec<SceneNode>) {
         self.nodes.push(SceneNode::group(children));
     }
 
-    /// 层内按 `z_index` 升序遍历（稳定：同层保持插入次序）。
+    /// Iterate inside the layer in ascending `z_index` order (stable: insertion order is
+    /// preserved within the same level).
     pub fn iter_ordered(&self) -> impl Iterator<Item = &SceneNode> {
         SceneNode::ordered(&self.nodes)
     }
@@ -310,21 +325,21 @@ impl Layer {
         self
     }
 
-    /// 设置整层可见性。
+    /// Set the layer's visibility.
     #[must_use]
     pub fn with_visible(mut self, visible: bool) -> Self {
         self.visible = visible;
         self
     }
 
-    /// 设置整层透明度（0.0–1.0）。
+    /// Set the layer's opacity (0.0–1.0).
     #[must_use]
     pub fn with_opacity(mut self, opacity: f64) -> Self {
         self.opacity = opacity.clamp(0.0, 1.0);
         self
     }
 
-    /// 设置整层变换。
+    /// Set the layer's transform.
     #[must_use]
     pub fn with_transform(mut self, t: Transform) -> Self {
         self.transform = Some(t);
@@ -332,22 +347,23 @@ impl Layer {
     }
 }
 
-/// 场景中的单个节点：图元 + 层级 + 局部变换 + 节点属性。
+/// A single node in the scene: primitive + layer + local transform + node attributes.
 ///
-/// 除 `element` 外的字段都是"子树级"属性：`transform` / `opacity` / `name` /
-/// `visible` 对 `Group` 同样生效（`opacity` 与 `transform` 会随递归复合）。
+/// All fields except `element` are "subtree-level" attributes: `transform` / `opacity` / `name`
+/// / `visible` also apply to a `Group` (and `opacity` / `transform` are composed through
+/// recursion).
 #[derive(Debug, Clone)]
 pub struct SceneNode {
     pub element: Element,
     pub z_index: i32,
     pub transform: Option<Transform>,
-    /// 节点（及 Group 子树）整体透明度，0.0–1.0，默认 1.0。
+    /// Opacity for the node (and Group subtree), 0.0–1.0; default 1.0.
     pub opacity: f64,
-    /// 可选标识：调试、命中测试、SVG `id`。
+    /// Optional identifier: debugging, hit-testing, SVG `id`.
     pub name: Option<String>,
-    /// 是否可见，默认 `true`。`false` 时整棵子树跳过渲染。
+    /// Whether visible; default `true`. When `false` the whole subtree is skipped.
     pub visible: bool,
-    /// 可选裁剪形状：将整棵子树限制在其内部绘制。
+    /// Optional clip shape: restrict the whole subtree to its interior.
     pub clip: Option<Clip>,
 }
 
@@ -364,7 +380,7 @@ impl SceneNode {
         }
     }
 
-    /// 构造递归组合节点（children 在父变换与层级下绘制）。
+    /// Construct a recursive group node (children drawn under the parent transform and layer).
     pub fn group(children: Vec<SceneNode>) -> Self {
         Self {
             element: Element::Group { children },
@@ -377,10 +393,11 @@ impl SceneNode {
         }
     }
 
-    /// 按 `z_index` 升序产出节点引用（稳定：同层保持插入次序）。
+    /// Yield node references in ascending `z_index` order (stable: insertion order is preserved
+    /// within the same level).
     pub fn ordered(nodes: &[SceneNode]) -> impl Iterator<Item = &SceneNode> {
         let mut order: Vec<usize> = (0..nodes.len()).collect();
-        // 稳定排序：`sort_by_key` 对相等 z_index 保持相对次序。
+        // Stable sort: `sort_by_key` preserves relative order for equal `z_index`.
         order.sort_by_key(|&i| nodes[i].z_index);
         order.into_iter().map(move |i| &nodes[i])
     }
@@ -397,28 +414,28 @@ impl SceneNode {
         self
     }
 
-    /// 设置节点透明度（0.0–1.0）。
+    /// Set the node opacity (0.0–1.0).
     #[must_use]
     pub fn with_opacity(mut self, opacity: f64) -> Self {
         self.opacity = opacity.clamp(0.0, 1.0);
         self
     }
 
-    /// 设置节点名称（调试 / 命中测试 / SVG `id`）。
+    /// Set the node name (debugging / hit-testing / SVG `id`).
     #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
-    /// 设置可见性。`false` 时整棵子树跳过渲染。
+    /// Set visibility. When `false` the whole subtree is skipped.
     #[must_use]
     pub fn with_visible(mut self, visible: bool) -> Self {
         self.visible = visible;
         self
     }
 
-    /// 设置裁剪形状：整棵子树限制在 `clip` 内部绘制。
+    /// Set a clip shape: restrict the whole subtree to the interior of `clip`.
     #[must_use]
     pub fn with_clip(mut self, clip: Clip) -> Self {
         self.clip = Some(clip);
@@ -426,34 +443,36 @@ impl SceneNode {
     }
 }
 
-/// 由 [`Element`] 构造节点（默认 z_index = 0，无变换），供 `Scene::push` 等接受 `Element`。
+/// Construct a node from an [`Element`] (default `z_index = 0`, no transform), enabling
+/// `Scene::push` etc. to accept `Element`.
 impl From<Element> for SceneNode {
     fn from(element: Element) -> Self {
         SceneNode::new(element)
     }
 }
 
-/// 裁剪形状：将节点（及整棵子树）限制在形状内部绘制。
+/// A clip shape: restrict a node (and its whole subtree) to drawing inside the shape.
 ///
-/// 作为节点级属性（[`SceneNode::clip`]），作用于子树；形状坐标为局部用户坐标，
-/// 与节点 `transform` 复合（先变换后裁剪）。复用现有几何/路径类型，跨后端一致：
-/// - SVG：`<clipPath>` + `clip-path="url(#...)"`
-/// - vello：`push_clip_path` / `pop_clip_path`
+/// As a node-level attribute ([`SceneNode::clip`]) it acts on the subtree; the shape coordinates
+/// are local user coordinates, composed with the node `transform` (transform first, then clip).
+/// Reuses existing geometry / path types for cross-backend consistency:
+/// - SVG: `<clipPath>` + `clip-path="url(#...)"`
+/// - vello: `push_clip_path` / `pop_clip_path`
 #[derive(Debug, Clone, PartialEq)]
 pub enum Clip {
-    /// 矩形裁剪。
+    /// Rectangular clip.
     Rect(Rect),
-    /// 圆角矩形裁剪。
+    /// Rounded-rectangle clip.
     RoundedRect { rect: Rect, radius: f64 },
-    /// 圆形裁剪。
+    /// Circular clip.
     Circle { center: Point, radius: f64 },
-    /// 椭圆裁剪（可旋转）。
+    /// Elliptical clip (rotatable).
     Ellipse {
         center: Point,
         radii: Vec2,
         rotation: f64,
     },
-    /// 任意贝塞尔路径裁剪（支持多子路径，默认 nonzero 填充规则）。
+    /// Arbitrary Bézier-path clip (supports multiple sub-paths, default nonzero fill rule).
     Path(BezPath),
 }
 
@@ -487,7 +506,7 @@ impl Clip {
         Self::Path(path)
     }
 
-    /// 转为 kurbo 贝塞尔路径（供需要路径的渲染后端，如 vello）。
+    /// Convert to a kurbo Bézier path (for path-consuming backends such as vello).
     #[must_use]
     pub fn to_bezpath(&self) -> BezPath {
         use kurbo::Shape;
@@ -523,7 +542,7 @@ impl Clip {
     }
 }
 
-/// 填充 + 描边样式。
+/// Fill + stroke style.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FillStrokeStyle {
     pub fill: Option<Fill>,
@@ -531,7 +550,7 @@ pub struct FillStrokeStyle {
 }
 
 impl FillStrokeStyle {
-    /// 纯填充样式。
+    /// Solid-fill style.
     #[must_use]
     pub fn fill(color: Color) -> Self {
         Self {
@@ -540,7 +559,7 @@ impl FillStrokeStyle {
         }
     }
 
-    /// 线性渐变填充样式。
+    /// Linear-gradient fill style.
     #[must_use]
     pub fn fill_gradient(gradient: impl Into<Fill>) -> Self {
         Self {
@@ -549,7 +568,7 @@ impl FillStrokeStyle {
         }
     }
 
-    /// 纯描边样式。
+    /// Pure-stroke style.
     #[must_use]
     pub fn stroke(color: Color, width: f64) -> Self {
         Self {
@@ -563,7 +582,7 @@ impl FillStrokeStyle {
     }
 }
 
-/// 填充定义。
+/// Fill definition.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fill {
     Solid(Color),
@@ -589,7 +608,7 @@ impl From<RadialGradient> for Fill {
     }
 }
 
-/// 线性渐变（`GradientPath` 与 `Fill::LinearGradient` 共用）。
+/// Linear gradient (shared by `GradientPath` and `Fill::LinearGradient`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearGradient {
     pub start: Point,
@@ -597,7 +616,7 @@ pub struct LinearGradient {
     pub stops: Vec<GradientStop>,
 }
 
-/// 径向渐变：从 `center` 以 `radius` 为外圈半径向外铺色。
+/// Radial gradient: spreads outward from `center` with `radius` as the outer circle radius.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RadialGradient {
     pub center: Point,
@@ -611,20 +630,20 @@ pub struct GradientStop {
     pub color: Color,
 }
 
-/// 描边定义。
+/// Stroke definition.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stroke {
     pub color: Color,
     pub width: f64,
-    /// 线帽：butt / round / square。
+    /// Line cap: butt / round / square.
     pub line_cap: LineCap,
-    /// 连接：miter / round / bevel。
+    /// Line join: miter / round / bevel.
     pub line_join: LineJoin,
-    /// 虚线数组（on/off 交替，单位与 `width` 相同）。空表示实线。
+    /// Dash array (alternating on/off lengths, same unit as `width`). Empty means solid.
     pub dash_array: Vec<f64>,
-    /// 虚线起点偏移。
+    /// Dash start offset.
     pub dash_offset: f64,
-    /// 尖角连接上限（miter join）。默认 10.0，与 SVG / kurbo 对齐。
+    /// Miter-join limit. Default 10.0, aligned with SVG / kurbo.
     pub miter_limit: f64,
 }
 
@@ -659,7 +678,7 @@ pub enum LineJoin {
 }
 
 impl Stroke {
-    /// 便捷构造：纯色描边。
+    /// Convenience constructor: solid-color stroke.
     #[must_use]
     pub fn new(color: Color, width: f64) -> Self {
         Self {
@@ -669,7 +688,7 @@ impl Stroke {
         }
     }
 
-    /// 便捷构造：虚线描边（`dash_array` 为 on/off 交替长度）。
+    /// Convenience constructor: dashed stroke (`dash_array` is the alternating on/off lengths).
     #[must_use]
     pub fn dashed(color: Color, width: f64, dash_array: Vec<f64>) -> Self {
         Self {
@@ -681,7 +700,7 @@ impl Stroke {
     }
 }
 
-/// 声明式图元枚举。仅描述几何与样式。
+/// Declarative primitive enum. Describes geometry and style only.
 #[derive(Debug, Clone)]
 pub enum Element {
     Rect {
@@ -693,14 +712,15 @@ pub enum Element {
         radius: f64,
         style: FillStrokeStyle,
     },
-    /// 椭圆（可旋转）：`radii` 为两个半轴长，`rotation` 为绕中心的旋转（弧度）。
+    /// Ellipse (rotatable): `radii` are the two semi-axis lengths, `rotation` is the rotation
+    /// about the center (radians).
     Ellipse {
         center: Point,
         radii: Vec2,
         rotation: f64,
         style: FillStrokeStyle,
     },
-    /// 圆角矩形：`radius` 为四角统一圆角半径。
+    /// Rounded rectangle: `radius` is the uniform corner radius.
     RoundedRect {
         rect: Rect,
         radius: f64,
@@ -711,17 +731,17 @@ pub enum Element {
         end: Point,
         style: Stroke,
     },
-    /// 开放折线（仅描边）。
+    /// Open polyline (stroke only).
     Polyline {
         points: Vec<Point>,
         style: Stroke,
     },
-    /// 闭合多边形（填充 + 可选描边）。
+    /// Closed polygon (fill + optional stroke).
     Polygon {
         points: Vec<Point>,
         style: FillStrokeStyle,
     },
-    /// 圆弧（开放，仅描边）。`radii` 为两半轴长，角度单位为弧度。
+    /// Arc (open, stroke only). `radii` are the two semi-axis lengths; angles are in radians.
     Arc {
         center: Point,
         radii: Vec2,
@@ -729,7 +749,8 @@ pub enum Element {
         sweep_angle: f64,
         style: Stroke,
     },
-    /// 扇形（闭合，含圆心到两端点的连线，填充 + 可选描边）。适合饼图。
+    /// Pie sector (closed, with lines from center to both endpoints; fill + optional stroke).
+    /// Suitable for pie charts.
     Pie {
         center: Point,
         radius: f64,
@@ -737,59 +758,64 @@ pub enum Element {
         sweep_angle: f64,
         style: FillStrokeStyle,
     },
-    /// 闭合/开放路径，使用 kurbo 贝塞尔路径。
+    /// Closed / open path, using a kurbo Bézier path.
     Path {
         path: BezPath,
         style: FillStrokeStyle,
-        /// true 表示闭合路径（用于填充）。
+        /// `true` means a closed path (used for filling).
         closed: bool,
     },
-    /// 图片：自包含二进制资源 + 显示框（pt/px 坐标）。
+    /// Image: self-contained binary resource + display frame (pt/px coordinates).
     ///
-    /// - `image`：图片字节与原始像素尺寸、适应方式（见 [`SceneImage`]）；
-    /// - `frame`：显示区域，后端按 `image.object_fit` 将图片映射到该框；
-    /// - `opacity`：整体透明度（0–1），默认 1.0。
+    /// - `image`: image bytes, original pixel size, and fit mode (see [`SceneImage`]);
+    /// - `frame`: display area; the backend maps the image onto this frame per `image.object_fit`;
+    /// - `opacity`: overall opacity (0–1), default 1.0.
     ///
-    /// - SVG：`<image>` 标签（`data:` URI + `preserveAspectRatio`）；
-    /// - vello：解码为位图后以 image paint 绘制（受 `object_fit` 与 `frame` 裁剪）。
+    /// - SVG: `<image>` tag (`data:` URI + `preserveAspectRatio`);
+    /// - vello: decoded to a bitmap then drawn with an image paint (clipped by `object_fit`
+    ///   and `frame`).
     Image {
         image: SceneImage,
         frame: Rect,
         opacity: f64,
     },
-    /// 带渐变填充的路径。
+    /// Path with a gradient fill.
     GradientPath {
         path: BezPath,
         gradient: LinearGradient,
         stroke: Option<Stroke>,
     },
-    /// 文本：以样式化片段（[`RichSpan`]）为核心，可选预排版 layout。
+    /// Text: built around styled spans ([`RichSpan`]), with an optional pre-laid-out `layout`.
     ///
-    /// - `spans`：样式化片段（vello 等后端据此排版字形），单文本即单个片段；
-    /// - `style`：块级定位样式（`align` / `baseline` / `rotation` / `max_width`）与默认字体；
-    /// - `layout`：预排版结果，存在时后端应优先使用（精确字形定位）。
+    /// - `spans`: styled spans (backends such as vello typeset glyphs from these); a single text
+    ///   is one span;
+    /// - `style`: block-level positioning style (`align` / `baseline` / `rotation` / `max_width`)
+    ///   and the default font;
+    /// - `layout`: pre-laid-out result; when present the backend should prefer it (precise glyph
+    ///   positioning).
     ///
-    /// 纯文本内容（SVG 后端）由 `spans` 拼接推导，保证各后端渲染一致。
+    /// Plain text content (SVG backend) is derived by concatenating `spans`, keeping all backends
+    /// consistent.
     Text {
         spans: Vec<RichSpan>,
         position: Point,
         style: crate::text::TextStyle,
         layout: Option<std::sync::Arc<TextLayout>>,
     },
-    /// 递归组合：子节点在父变换与层级下绘制。
+    /// Recursive group: children are drawn under the parent transform and layer.
     Group {
         children: Vec<SceneNode>,
     },
 }
 
 impl Element {
-    /// 矩形图元。
+    /// Rectangle primitive.
     #[must_use]
     pub fn rect(rect: Rect, style: FillStrokeStyle) -> Self {
         Self::Rect { rect, style }
     }
 
-    /// 圆图元。
+    /// Circle primitive.
     #[must_use]
     pub fn circle(center: Point, radius: f64, style: FillStrokeStyle) -> Self {
         Self::Circle {
@@ -799,7 +825,7 @@ impl Element {
         }
     }
 
-    /// 椭圆图元。
+    /// Ellipse primitive.
     #[must_use]
     pub fn ellipse(center: Point, radii: Vec2, rotation: f64, style: FillStrokeStyle) -> Self {
         Self::Ellipse {
@@ -810,7 +836,7 @@ impl Element {
         }
     }
 
-    /// 圆角矩形图元。
+    /// Rounded-rectangle primitive.
     #[must_use]
     pub fn rounded_rect(rect: Rect, radius: f64, style: FillStrokeStyle) -> Self {
         Self::RoundedRect {
@@ -820,25 +846,25 @@ impl Element {
         }
     }
 
-    /// 线段图元。
+    /// Line segment primitive.
     #[must_use]
     pub fn line(start: Point, end: Point, style: Stroke) -> Self {
         Self::Line { start, end, style }
     }
 
-    /// 折线图元（开放，仅描边）。
+    /// Polyline primitive (open, stroke only).
     #[must_use]
     pub fn poly(points: Vec<Point>, style: Stroke) -> Self {
         Self::Polyline { points, style }
     }
 
-    /// 多边形图元（闭合，可填充 + 描边）。
+    /// Polygon primitive (closed, fill + optional stroke).
     #[must_use]
     pub fn polygon(points: Vec<Point>, style: FillStrokeStyle) -> Self {
         Self::Polygon { points, style }
     }
 
-    /// 圆弧图元（开放，仅描边）。
+    /// Arc primitive (open, stroke only).
     #[must_use]
     pub fn arc(
         center: Point,
@@ -856,7 +882,7 @@ impl Element {
         }
     }
 
-    /// 扇形图元（闭合，填充 + 可选描边）。
+    /// Pie-sector primitive (closed, fill + optional stroke).
     #[must_use]
     pub fn pie(
         center: Point,
@@ -874,10 +900,10 @@ impl Element {
         }
     }
 
-    /// 纯文本图元（layout 为空，由后端自行排版）。
+    /// Plain-text primitive (empty `layout`, typeset by the backend itself).
     ///
-    /// `style` 既作为块级定位（`align` / `baseline` / `rotation` / `max_width`），
-    /// 也作为默认字体样式；内部生成单个 [`RichSpan`]。
+    /// `style` serves both as block-level positioning (`align` / `baseline` / `rotation` /
+    /// `max_width`) and as the default font style; internally a single [`RichSpan`] is produced.
     #[must_use]
     pub fn text(
         content: impl Into<String>,
@@ -892,7 +918,8 @@ impl Element {
         }
     }
 
-    /// 富文本图元：由一段段样式化片段组成（`style` 提供块级定位与默认字体）。
+    /// Rich-text primitive: composed of styled spans (`style` provides block-level positioning
+    /// and the default font).
     #[must_use]
     pub fn rich_text(spans: Vec<RichSpan>, position: Point, style: crate::text::TextStyle) -> Self {
         Self::Text {
@@ -903,9 +930,10 @@ impl Element {
         }
     }
 
-    /// 图片图元：`image` 为自包含资源，`frame` 为显示区域（pt/px 坐标）。
+    /// Image primitive: `image` is the self-contained resource, `frame` is the display area
+    /// (pt/px coordinates).
     ///
-    /// `opacity` 默认 1.0；`object_fit` 由 [`SceneImage::object_fit`] 控制。
+    /// `opacity` defaults to 1.0; `object_fit` is controlled by [`SceneImage::object_fit`].
     #[must_use]
     pub fn image(image: SceneImage, frame: Rect) -> Self {
         Self::Image {
@@ -920,7 +948,8 @@ impl Element {
 mod tests {
     use super::*;
 
-    /// 构造一个 x 坐标可区分、z_index 可指定的矩形节点（用于稳定性断言）。
+    /// Build a rectangle node with a distinguishable x coordinate and a specified z_index
+    /// (used for stability assertions).
     fn rect_node(x: f64, z: i32) -> SceneNode {
         SceneNode::new(Element::rect(
             Rect::new(x, 0.0, x + 1.0, 1.0),
@@ -936,7 +965,7 @@ mod tests {
         }
     }
 
-    /// 元素构造器、节点构建器与默认值。
+    /// Element constructors, node builders, and defaults.
     mod element {
         use super::*;
 
@@ -1122,7 +1151,7 @@ mod tests {
 
         #[test]
         fn rect_center_helper() {
-            // kurbo Rect::new(x0, y0, x1, y1)；origin(2,4) 宽10 高6 → (2,4)-(12,10)。
+            // kurbo Rect::new(x0, y0, x1, y1); origin(2,4) width 10 height 6 → (2,4)-(12,10).
             assert_eq!(
                 Rect::new(2.0, 4.0, 12.0, 10.0).center(),
                 Point::new(7.0, 7.0)
@@ -1133,7 +1162,7 @@ mod tests {
         fn clip_constructors_and_bezpath() {
             let c = Clip::circle(Point::new(1.0, 2.0), 5.0);
             assert!(matches!(c, Clip::Circle { radius: 5.0, .. }));
-            // to_bezpath 应产出闭合的圆路径
+            // to_bezpath should produce a closed circle path
             let p = c.to_bezpath();
             assert!(!p.is_empty());
 
@@ -1163,7 +1192,7 @@ mod tests {
             ))
             .with_clip(Clip::circle(Point::new(5.0, 5.0), 3.0));
             assert!(node.clip.is_some());
-            // 默认无 clip
+            // no clip by default
             let n = SceneNode::new(Element::rect(
                 Rect::new(0.0, 0.0, 1.0, 1.0),
                 FillStrokeStyle::fill(Color::BLACK),
@@ -1172,7 +1201,7 @@ mod tests {
         }
     }
 
-    /// 排序：z_index 升序与同 z 稳定性。
+    /// Ordering: ascending z_index with same-z stability.
     mod ordering {
         use super::*;
 
@@ -1188,7 +1217,8 @@ mod tests {
 
         #[test]
         fn ordered_is_stable_within_same_z() {
-            // 同 z_index 的三个节点，用可区分的 x 坐标验证保持插入次序。
+            // three nodes with the same z_index; use distinguishable x coordinates to verify
+            // insertion order is preserved.
             let nodes = vec![rect_node(10.0, 0), rect_node(20.0, 0), rect_node(30.0, 0)];
             let xs: Vec<f64> = SceneNode::ordered(&nodes).map(rect_x).collect();
             assert_eq!(xs, vec![10.0, 20.0, 30.0]);
@@ -1206,7 +1236,7 @@ mod tests {
         }
     }
 
-    /// Scene 元数据、分组、图层装载与查询。
+    /// Scene metadata, grouping, layer loading, and queries.
     mod scene {
         use super::*;
 
@@ -1254,7 +1284,7 @@ mod tests {
         }
     }
 
-    /// Layer 默认值与构建器。
+    /// Layer defaults and builders.
     mod layer {
         use super::*;
 
@@ -1277,7 +1307,7 @@ mod tests {
         }
     }
 
-    /// 图片资源：SceneImage 的 object-fit 映射与构造。
+    /// Image resource: SceneImage object-fit mapping and construction.
     mod image {
         use super::*;
 
@@ -1318,7 +1348,7 @@ mod tests {
         #[test]
         fn from_rgba8_validates_dimensions() {
             assert!(SceneImage::from_rgba8(4, 4, vec![0u8; 64]).is_some());
-            // 长度不足 → None。
+            // insufficient length → None.
             assert!(SceneImage::from_rgba8(4, 4, vec![0u8; 63]).is_none());
         }
 

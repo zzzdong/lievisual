@@ -1,36 +1,40 @@
-//! 自包含的 RGBA8 位图（pixmap）。
+//! Self-contained RGBA8 bitmap (pixmap).
 //!
-//! lievisual 的图片统一以**已解码的 RGBA8 位图**进入 IR，渲染库**不做解码**——
-//! 与文本层"调用方排版、渲染端消费自闭环 [`TextLayout`]"的原则一致。解码（PNG 解析或
-//! 其它格式）是调用方 / 资源加载层的职责；lievisual 只负责持有并绘制就绪的像素。
+//! Images in lievisual enter the IR as **already-decoded RGBA8 bitmaps**; the rendering
+//! library **does not decode** — consistent with the text layer's principle of "the caller
+//! lays out, the renderer consumes a self-contained [`TextLayout`]". Decoding (PNG parsing or
+//! other formats) is the caller's / resource-loading layer's responsibility; lievisual only
+//! holds and draws ready pixels.
 //!
-//! 本类型与具体渲染后端（vello / SVG / …）**解耦**，自有 `Arc<[u8]>` + 宽高，
-//! 各后端按需消费：
-//! - 栅格后端（vello）直接取 RGBA8 像素做缩放 / blit；
-//! - SVG 经 [`Pixmap::to_png`] 编码为 PNG 后内嵌。
+//! This type is **decoupled** from any specific rendering backend (vello / SVG / …), owning its
+//! own `Arc<[u8]>` plus width/height, and each backend consumes it as needed:
+//! - Raster backends (vello) take the RGBA8 pixels directly for scaling / blit;
+//! - SVG encodes them to PNG via [`Pixmap::to_png`] and embeds the result.
 //!
-//! ## PNG 编解码
-//! - [`Pixmap::to_png`]：RGBA8 → PNG 字节（供 SVG 内嵌、`render_png` 导出）。
-//! - [`Pixmap::decode_png`]：PNG 字节 → RGBA8（便捷入口，默认可用）。
-//! - 其它格式（jpeg / webp / gif …）解码需启用 `extra-image-codecs` feature（依赖 `image`）。
+//! ## PNG codec
+//! - [`Pixmap::to_png`]: RGBA8 → PNG bytes (for SVG embedding or raster export paths).
+//! - [`Pixmap::decode_png`]: PNG bytes → RGBA8 (convenience entry, available by default).
+//! - Decoding other formats (jpeg / webp / gif …) requires the `extra-image-codecs`
+//!   feature (depends on `image`).
 //!
-//! ## 坐标 / 内存约定
-//! - RGBA8 紧排：`stride = 4 * width`，行优先，从左上角开始。
-//! - 无颜色空间/伽马处理；透明为常规 alpha（未预乘）。
+//! ## Coordinate / memory conventions
+//! - RGBA8 is tightly packed: `stride = 4 * width`, row-major, starting from the top-left.
+//! - No color-space / gamma handling; transparency is plain (non-premultiplied) alpha.
 
 use std::sync::Arc;
 
-/// RGBA8 位图。
+/// RGBA8 bitmap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pixmap {
     width: u32,
     height: u32,
-    /// RGBA8 像素，长度恒为 `4 * width * height`。
+    /// RGBA8 pixels; length is always `4 * width * height`.
     pixels: Arc<[u8]>,
 }
 
 impl Pixmap {
-    /// 由已解码的 RGBA8 像素构造。长度必须为 `4 * width * height`，否则返回 `None`。
+    /// Construct from already-decoded RGBA8 pixels. The length must be
+    /// `4 * width * height`, otherwise `None` is returned.
     #[must_use]
     pub fn from_rgba8(width: u32, height: u32, pixels: impl Into<Arc<[u8]>>) -> Option<Self> {
         let pixels = pixels.into();
@@ -47,25 +51,25 @@ impl Pixmap {
         })
     }
 
-    /// 像素宽。
+    /// Pixel width.
     #[must_use]
     pub fn width(&self) -> u32 {
         self.width
     }
 
-    /// 像素高。
+    /// Pixel height.
     #[must_use]
     pub fn height(&self) -> u32 {
         self.height
     }
 
-    /// RGBA8 像素切片（`len = 4 * width * height`）。
+    /// RGBA8 pixel slice (`len = 4 * width * height`).
     #[must_use]
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
 
-    /// 编码为 PNG 字节（`png` 常驻依赖，RGBA8 → PNG）。
+    /// Encode to PNG bytes (`png` is a permanent dependency: RGBA8 → PNG).
     #[must_use]
     pub fn to_png(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.pixels.len() + 64);
@@ -75,15 +79,15 @@ impl Pixmap {
             enc.set_depth(png::BitDepth::Eight);
             let mut writer = enc
                 .write_header()
-                .expect("[lievisual] PNG 编码：写入头失败");
+                .expect("[lievisual] PNG encoding: write header failed");
             writer
                 .write_image_data(&self.pixels)
-                .expect("[lievisual] PNG 编码：写入像素失败");
+                .expect("[lievisual] PNG encoding: write image data failed");
         }
         out
     }
 
-    /// 从 PNG 字节解码为 RGBA8。非 PNG / 解码失败返回 `None`。
+    /// Decode PNG bytes into RGBA8. Returns `None` for non-PNG input or decode failure.
     #[must_use]
     pub fn decode_png(bytes: &[u8]) -> Option<Self> {
         let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
@@ -91,7 +95,7 @@ impl Pixmap {
         let mut buf = vec![0u8; reader.output_buffer_size()?];
         let info = reader.next_frame(&mut buf).ok()?;
         buf.truncate(info.buffer_size());
-        // 归一化为 RGBA8：expand 到 RGBA / 剥 16bit。
+        // Normalize to RGBA8: expand to RGBA / strip 16-bit.
         let (color, depth) = reader.output_color_type();
         let (w, h) = (info.width, info.height);
         let rgba = normalize_to_rgba8(buf, color, depth, w, h)?;
@@ -99,7 +103,8 @@ impl Pixmap {
     }
 }
 
-/// 把解码原始缓冲归一化为 RGBA8（处理灰度/调色板/16bit/缺 alpha 等组合）。
+/// Normalize a decoded raw buffer to RGBA8 (handles grayscale / palette / 16-bit /
+/// missing-alpha combinations).
 fn normalize_to_rgba8(
     buf: Vec<u8>,
     color: png::ColorType,
@@ -115,7 +120,7 @@ fn normalize_to_rgba8(
         png::ColorType::GrayscaleAlpha => 2,
         png::ColorType::Rgba => 4,
     };
-    // 8bit（normalize 后应恒为 8bit）每像素字节数。
+    // Bytes per pixel after normalization (should always be 8-bit).
     let chan = if depth == png::BitDepth::Eight { 1 } else { 2 };
     if buf.len() < n * bpp * chan {
         return None;
@@ -123,7 +128,7 @@ fn normalize_to_rgba8(
     let mut out = Vec::with_capacity(n * 4);
     for i in 0..n {
         let base = i * bpp * chan;
-        // 8bit 取该通道字节；16bit 取高字节（MSB 在前）。
+        // 8-bit: take that channel byte; 16-bit: take the high byte (MSB first).
         let byte = |idx: usize| buf[base + idx * chan];
         let (r, g, b, a) = match color {
             png::ColorType::Grayscale => {
@@ -137,8 +142,9 @@ fn normalize_to_rgba8(
             png::ColorType::Rgb => (byte(0), byte(1), byte(2), 255),
             png::ColorType::Rgba => (byte(0), byte(1), byte(2), byte(3)),
             png::ColorType::Indexed => {
-                // `normalize_to_color8` 的 EXPAND 应已展开调色板；理论上不到这里。
-                // 保守：视为灰度（避免错误读索引）。
+                // EXPAND in `normalize_to_color8` should already have expanded the
+                // palette; in theory we never reach here.
+                // Conservatively treat as grayscale (avoid misreading the index).
                 let v = byte(0);
                 (v, v, v, 255)
             }
