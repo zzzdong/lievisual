@@ -35,11 +35,13 @@
 
 pub mod builder;
 pub mod geometry;
-pub mod glyph;
 pub mod pixmap;
 pub mod render;
 pub mod scene;
 pub mod text;
+
+// Re-expose the glyph-outline extractor at the crate root (it lives under `text` now).
+pub use text::glyph;
 
 // re-export parley
 pub use parley;

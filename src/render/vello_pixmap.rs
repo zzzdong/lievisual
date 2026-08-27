@@ -110,13 +110,9 @@ impl VelloPixmapRenderer {
 
     /// Convert to a vello color, multiplying in the current opacity.
     fn to_vello(&self, color: &Color) -> AlphaColor<vello_cpu::color::Srgb> {
-        let a = (color.a * self.current_opacity()).clamp(0.0, 1.0);
-        AlphaColor::from_rgba8(
-            (color.r.clamp(0.0, 1.0) * 255.0) as u8,
-            (color.g.clamp(0.0, 1.0) * 255.0) as u8,
-            (color.b.clamp(0.0, 1.0) * 255.0) as u8,
-            (a * 255.0) as u8,
-        )
+        // `color` stores exact 8-bit channels; only the alpha is modulated by opacity.
+        let a = (color.a as f64 / 255.0 * self.current_opacity()).clamp(0.0, 1.0);
+        AlphaColor::from_rgba8(color.r, color.g, color.b, (a * 255.0) as u8)
     }
 
     fn kurbo_stroke(stroke: &Stroke) -> KurboStroke {

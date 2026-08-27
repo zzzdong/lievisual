@@ -99,70 +99,135 @@ impl RectExt for Rect {
     }
 }
 
-/// Color (RGBA, components in the range 0.0–1.0, consistent with vello / CSS).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+/// Color (RGBA, 8-bit components 0–255, matching the RGBA8 bitmaps and CSS hex output).
+///
+/// Stored as `u8` so the representation is lossless and exact for the 8-bit backends
+/// (SVG hex / `vello_cpu` `from_rgba8` / `Pixmap` RGBA8). The `0.0–1.0` range is kept as a
+/// convenience only at the construction boundary (`new` / `as_f64`); all output paths read the
+/// integer channels directly, avoiding the repeated `clamp × 255 + round` that a `f64` storage
+/// would require and the rounding drift it introduces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Color {
-    pub r: f64,
-    pub g: f64,
-    pub b: f64,
-    pub a: f64,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
 }
 
 impl Color {
-    pub const fn new(r: f64, g: f64, b: f64, a: f64) -> Self {
+    /// 8-bit RGBA.
+    pub const fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self { r, g, b, a }
     }
 
     /// Opaque 8-bit RGB.
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self {
-            r: r as f64 / 255.0,
-            g: g as f64 / 255.0,
-            b: b as f64 / 255.0,
-            a: 1.0,
-        }
+        Self { r, g, b, a: 255 }
     }
 
-    /// 8-bit RGBA.
+    /// 8-bit RGBA (with an explicit alpha channel, `0–255`).
     pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Self {
-            r: r as f64 / 255.0,
-            g: g as f64 / 255.0,
-            b: b as f64 / 255.0,
-            a: a as f64 / 255.0,
-        }
+        Self { r, g, b, a }
     }
 
-    pub fn r(&self) -> u8 {
-        (self.r.clamp(0.0, 1.0) * 255.0).round() as u8
+    /// Red channel as `0.0–1.0` (for backends that consume floating-point color, e.g. vello).
+    pub fn rf(&self) -> f64 {
+        self.r as f64 / 255.0
     }
 
-    pub fn g(&self) -> u8 {
-        (self.g.clamp(0.0, 1.0) * 255.0).round() as u8
+    /// Green channel as `0.0–1.0`.
+    pub fn gf(&self) -> f64 {
+        self.g as f64 / 255.0
     }
 
-    pub fn b(&self) -> u8 {
-        (self.b.clamp(0.0, 1.0) * 255.0).round() as u8
+    /// Blue channel as `0.0–1.0`.
+    pub fn bf(&self) -> f64 {
+        self.b as f64 / 255.0
     }
 
-    pub const BLACK: Color = Color::new(0.0, 0.0, 0.0, 1.0);
-    pub const WHITE: Color = Color::new(1.0, 1.0, 1.0, 1.0);
-    pub const TRANSPARENT: Color = Color::new(0.0, 0.0, 0.0, 0.0);
-    pub const RED: Color = Color::new(1.0, 0.0, 0.0, 1.0);
-    pub const GREEN: Color = Color::new(0.0, 1.0, 0.0, 1.0);
-    pub const BLUE: Color = Color::new(0.0, 0.0, 1.0, 1.0);
+    pub const TRANSPARENT: Color = Color::rgba(0, 0, 0, 0);
+    pub const BLACK: Color = Color::rgb(0, 0, 0);
+    pub const WHITE: Color = Color::rgb(255, 255, 255);
+    pub const RED: Color = Color::rgb(255, 0, 0);
+    pub const GREEN: Color = Color::rgb(0, 255, 0);
+    pub const BLUE: Color = Color::rgb(0, 0, 255);
+
+    // CSS extended color keywords (a useful subset of the CSS named colors).
+    pub const GRAY: Color = Color::rgb(128, 128, 128);
+    pub const GREY: Color = Color::rgb(128, 128, 128);
+    pub const DARK_GRAY: Color = Color::rgb(169, 169, 169);
+    pub const LIGHT_GRAY: Color = Color::rgb(211, 211, 211);
+    pub const SLATE_GRAY: Color = Color::rgb(112, 128, 144);
+    pub const DIM_GRAY: Color = Color::rgb(105, 105, 105);
+    pub const GAINSBORO: Color = Color::rgb(220, 220, 220);
+    pub const SILVER: Color = Color::rgb(192, 192, 192);
+
+    pub const YELLOW: Color = Color::rgb(255, 255, 0);
+    pub const ORANGE: Color = Color::rgb(255, 165, 0);
+    pub const ORANGE_RED: Color = Color::rgb(255, 69, 0);
+    pub const GOLD: Color = Color::rgb(255, 215, 0);
+    pub const GOLDENROD: Color = Color::rgb(218, 165, 32);
+    pub const KHAKI: Color = Color::rgb(240, 230, 140);
+    pub const OLIVE: Color = Color::rgb(128, 128, 0);
+
+    pub const CYAN: Color = Color::rgb(0, 255, 255);
+    pub const TEAL: Color = Color::rgb(0, 128, 128);
+    pub const AQUA: Color = Color::rgb(0, 255, 255);
+    pub const NAVY: Color = Color::rgb(0, 0, 128);
+    pub const ROYAL_BLUE: Color = Color::rgb(65, 105, 225);
+    pub const SKY_BLUE: Color = Color::rgb(135, 206, 235);
+    pub const STEEL_BLUE: Color = Color::rgb(70, 130, 180);
+    pub const DODGER_BLUE: Color = Color::rgb(30, 144, 255);
+    pub const CORNFLOWER_BLUE: Color = Color::rgb(100, 149, 237);
+    pub const TURQUOISE: Color = Color::rgb(64, 224, 208);
+
+    pub const MAGENTA: Color = Color::rgb(255, 0, 255);
+    pub const FUCHSIA: Color = Color::rgb(255, 0, 255);
+    pub const PINK: Color = Color::rgb(255, 192, 203);
+    pub const HOT_PINK: Color = Color::rgb(255, 105, 180);
+    pub const PURPLE: Color = Color::rgb(128, 0, 128);
+    pub const VIOLET: Color = Color::rgb(238, 130, 238);
+    pub const INDIGO: Color = Color::rgb(75, 0, 130);
+    pub const LAVENDER: Color = Color::rgb(230, 230, 250);
+    pub const PLUM: Color = Color::rgb(221, 160, 221);
+
+    pub const MAROON: Color = Color::rgb(128, 0, 0);
+    pub const CRIMSON: Color = Color::rgb(220, 20, 60);
+    pub const TOMATO: Color = Color::rgb(255, 99, 71);
+    pub const CORAL: Color = Color::rgb(255, 127, 80);
+    pub const SALMON: Color = Color::rgb(250, 128, 114);
+    pub const INDIAN_RED: Color = Color::rgb(205, 92, 92);
+    pub const FIREBRICK: Color = Color::rgb(178, 34, 34);
+    pub const BROWN: Color = Color::rgb(165, 42, 42);
+    pub const SADDLE_BROWN: Color = Color::rgb(139, 69, 19);
+    pub const PERU: Color = Color::rgb(205, 133, 63);
+    pub const CHOCOLATE: Color = Color::rgb(210, 105, 30);
+    pub const TAN: Color = Color::rgb(210, 180, 140);
+    pub const BEIGE: Color = Color::rgb(245, 245, 220);
+    pub const SNOW: Color = Color::rgb(255, 250, 250);
+    pub const MINT_CREAM: Color = Color::rgb(245, 255, 250);
+    pub const IVORY: Color = Color::rgb(255, 255, 240);
+
+    pub const LIME: Color = Color::rgb(0, 255, 0);
+    pub const LIME_GREEN: Color = Color::rgb(50, 205, 50);
+    pub const SPRING_GREEN: Color = Color::rgb(0, 255, 127);
+    pub const FOREST_GREEN: Color = Color::rgb(34, 139, 34);
+    pub const GREEN_YELLOW: Color = Color::rgb(173, 255, 47);
+    pub const OLIVE_DRAB: Color = Color::rgb(107, 142, 35);
+    pub const SEA_GREEN: Color = Color::rgb(46, 139, 87);
+    pub const DARK_GREEN: Color = Color::rgb(0, 100, 0);
+    pub const DARK_OLIVE_GREEN: Color = Color::rgb(85, 107, 47);
+    pub const DARK_SEA_GREEN: Color = Color::rgb(143, 188, 143);
+    pub const PALE_GREEN: Color = Color::rgb(152, 251, 152);
+    pub const MEDIUM_SPRING_GREEN: Color = Color::rgb(0, 250, 154);
 
     /// CSS hex string, e.g. `#0066cc`.
     /// Emits `#rrggbb` when opaque, or `#rrggbbaa` when an alpha component is present.
     pub fn to_hex(&self) -> String {
-        let r = (self.r.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let g = (self.g.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let b = (self.b.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let a = (self.a.clamp(0.0, 1.0) * 255.0).round() as u8;
-        if a == 255 {
-            format!("#{:02x}{:02x}{:02x}", r, g, b)
+        if self.a == 255 {
+            format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
         } else {
-            format!("#{:02x}{:02x}{:02x}{:02x}", r, g, b, a)
+            format!("#{:02x}{:02x}{:02x}{:02x}", self.r, self.g, self.b, self.a)
         }
     }
 }
