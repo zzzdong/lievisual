@@ -133,6 +133,18 @@ impl Color {
         }
     }
 
+    pub fn r(&self) -> u8 {
+        (self.r.clamp(0.0, 1.0) * 255.0).round() as u8
+    }
+
+    pub fn g(&self) -> u8 {
+        (self.g.clamp(0.0, 1.0) * 255.0).round() as u8
+    }
+
+    pub fn b(&self) -> u8 {
+        (self.b.clamp(0.0, 1.0) * 255.0).round() as u8
+    }
+
     pub const BLACK: Color = Color::new(0.0, 0.0, 0.0, 1.0);
     pub const WHITE: Color = Color::new(1.0, 1.0, 1.0, 1.0);
     pub const TRANSPARENT: Color = Color::new(0.0, 0.0, 0.0, 0.0);
