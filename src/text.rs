@@ -107,6 +107,218 @@ pub enum FontStyle {
     Oblique,
 }
 
+impl FontStyle {
+    /// CSS `font-style` keyword for this variant (`normal`, `italic`, `oblique`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FontStyle::Normal => "normal",
+            FontStyle::Italic => "italic",
+            FontStyle::Oblique => "oblique",
+        }
+    }
+
+    /// Parse a [`FontStyle`] from a string, accepting the CSS keywords `normal`,
+    /// `italic`, `oblique` (case-insensitive, `-`/`_` optional). Returns `None`
+    /// if the string is not recognized.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let t = s.trim().to_ascii_lowercase();
+        let t = t.replace(['-', '_'], "");
+        match t.as_str() {
+            "normal" | "n" => Some(FontStyle::Normal),
+            "italic" | "i" => Some(FontStyle::Italic),
+            "oblique" | "o" => Some(FontStyle::Oblique),
+            _ => None,
+        }
+    }
+}
+
+/// Font weight, analogous to the CSS `font-weight` keyword values.
+///
+/// Each variant maps to the corresponding numeric weight (100–900) accepted by
+/// the canvas `font-weight` property; use [`FontWeight::value`] to obtain the
+/// `f32` and [`FontWeight::from_value`] to recover the nearest keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontWeight {
+    /// Thin (100).
+    Thin,
+    /// Extra light (200).
+    ExtraLight,
+    /// Light (300).
+    Light,
+    /// Normal / regular (400, default).
+    #[default]
+    Normal,
+    /// Medium (500).
+    Medium,
+    /// Semi bold (600).
+    SemiBold,
+    /// Bold (700).
+    Bold,
+    /// Extra bold (800).
+    ExtraBold,
+    /// Black / heavy (900).
+    Black,
+}
+
+impl FontWeight {
+    /// Numeric weight (100–900) as used by the canvas `font-weight` property.
+    pub fn value(self) -> f32 {
+        match self {
+            FontWeight::Thin => 100.0,
+            FontWeight::ExtraLight => 200.0,
+            FontWeight::Light => 300.0,
+            FontWeight::Normal => 400.0,
+            FontWeight::Medium => 500.0,
+            FontWeight::SemiBold => 600.0,
+            FontWeight::Bold => 700.0,
+            FontWeight::ExtraBold => 800.0,
+            FontWeight::Black => 900.0,
+        }
+    }
+
+    /// Recover the nearest [`FontWeight`] keyword for a numeric weight (clamped
+    /// to the 100–900 range and snapped to the nearest 100-step keyword).
+    pub fn from_value(weight: f32) -> Self {
+        let step = (weight.clamp(100.0, 900.0) / 100.0).round() as i32 * 100;
+        match step {
+            100 => FontWeight::Thin,
+            200 => FontWeight::ExtraLight,
+            300 => FontWeight::Light,
+            400 => FontWeight::Normal,
+            500 => FontWeight::Medium,
+            600 => FontWeight::SemiBold,
+            700 => FontWeight::Bold,
+            800 => FontWeight::ExtraBold,
+            900 => FontWeight::Black,
+            _ => FontWeight::Normal,
+        }
+    }
+
+    /// Parse a [`FontWeight`] from a string, accepting either:
+    /// - a keyword: `thin`, `extralight`/`extra-light`, `light`, `normal`,
+    ///   `medium`, `semibold`/`semi-bold`, `bold`, `extrabold`/`extra-bold`,
+    ///   `black` (case-insensitive, `-`/`_` optional); or
+    /// - a numeric weight in the 100–900 range (`100`, `400`, `700`, …).
+    ///
+    /// Returns `None` if the string is not recognized or the numeric weight is
+    /// outside the 100–900 range.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let t = s.trim().to_ascii_lowercase();
+        let t = t.replace(['-', '_'], "");
+        match t.as_str() {
+            "thin" => Some(FontWeight::Thin),
+            "extralight" => Some(FontWeight::ExtraLight),
+            "light" => Some(FontWeight::Light),
+            "normal" => Some(FontWeight::Normal),
+            "medium" => Some(FontWeight::Medium),
+            "semibold" => Some(FontWeight::SemiBold),
+            "bold" => Some(FontWeight::Bold),
+            "extrabold" => Some(FontWeight::ExtraBold),
+            "black" => Some(FontWeight::Black),
+            _ => {
+                let w = t.parse::<f32>().ok()?;
+                if !(100.0..=900.0).contains(&w) {
+                    return None;
+                }
+                Some(FontWeight::from_value(w))
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for FontWeight {
+    type Err = FontWeightParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        FontWeight::parse(s).ok_or(FontWeightParseError)
+    }
+}
+
+/// Error returned when a string cannot be parsed into a [`FontWeight`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FontWeightParseError;
+
+impl std::fmt::Display for FontWeightParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid font weight")
+    }
+}
+
+impl std::error::Error for FontWeightParseError {}
+
+/// Font width (stretch), analogous to the CSS `font-stretch` keyword values.
+///
+/// Each variant maps to a width ratio relative to the normal (unstretched) face,
+/// where `1.0` is normal. Use [`FontWidth::ratio`] to obtain the `f32` ratio and
+/// [`FontWidth::from_ratio`] to recover the nearest keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontWidth {
+    /// Ultra condensed (0.5×).
+    UltraCondensed,
+    /// Extra condensed (0.625×).
+    ExtraCondensed,
+    /// Condensed (0.75×).
+    Condensed,
+    /// Semi condensed (0.875×).
+    SemiCondensed,
+    /// Normal / regular width (1.0×, default).
+    #[default]
+    Normal,
+    /// Semi expanded (1.125×).
+    SemiExpanded,
+    /// Expanded (1.25×).
+    Expanded,
+    /// Extra expanded (1.5×).
+    ExtraExpanded,
+    /// Ultra expanded (2.0×).
+    UltraExpanded,
+}
+
+impl FontWidth {
+    /// Width ratio relative to the normal face (`1.0` = normal).
+    pub fn ratio(self) -> f32 {
+        match self {
+            FontWidth::UltraCondensed => 0.5,
+            FontWidth::ExtraCondensed => 0.625,
+            FontWidth::Condensed => 0.75,
+            FontWidth::SemiCondensed => 0.875,
+            FontWidth::Normal => 1.0,
+            FontWidth::SemiExpanded => 1.125,
+            FontWidth::Expanded => 1.25,
+            FontWidth::ExtraExpanded => 1.5,
+            FontWidth::UltraExpanded => 2.0,
+        }
+    }
+
+    /// Recover the nearest [`FontWidth`] keyword for a width ratio (clamped to
+    /// the 0.5–2.0 range and rounded to the nearest keyword on the log-ish
+    /// scale above).
+    pub fn from_ratio(ratio: f32) -> Self {
+        let r = ratio.clamp(0.5, 2.0);
+        if r < 0.5625 {
+            FontWidth::UltraCondensed
+        } else if r < 0.6875 {
+            FontWidth::ExtraCondensed
+        } else if r < 0.8125 {
+            FontWidth::Condensed
+        } else if r < 0.9375 {
+            FontWidth::SemiCondensed
+        } else if r < 1.0625 {
+            FontWidth::Normal
+        } else if r < 1.1875 {
+            FontWidth::SemiExpanded
+        } else if r < 1.375 {
+            FontWidth::Expanded
+        } else if r < 1.75 {
+            FontWidth::ExtraExpanded
+        } else {
+            FontWidth::UltraExpanded
+        }
+    }
+}
+
 /// Text style. Maps to Canvas `ctx.font` + `textAlign` + `textBaseline`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextStyle {
@@ -118,12 +330,12 @@ pub struct TextStyle {
     /// Font size in px (canvas `font-size`).
     pub font_size: f64,
     /// Font weight, 100–900 (canvas `font-weight`), default 400.
-    pub font_weight: f32,
+    pub font_weight: FontWeight,
     /// Font style (canvas `font-style`).
     pub font_style: FontStyle,
     /// Font stretch as a ratio (1.0 = normal; 0.75 = condensed; 1.25 = expanded).
     /// `None` uses the font's default (1.0).
-    pub font_width: Option<f32>,
+    pub font_width: FontWidth,
     /// Line height in px. `None` uses the font's default line height (as when canvas
     /// `line-height` is omitted).
     pub line_height: Option<f64>,
@@ -172,9 +384,9 @@ impl TextStyle {
             color,
             font_family: font_family.into(),
             font_size,
-            font_weight: 400.0,
+            font_weight: FontWeight::Normal,
             font_style: FontStyle::Normal,
-            font_width: None,
+            font_width: FontWidth::Normal,
             line_height: None,
             letter_spacing: 0.0,
             underline: false,
@@ -203,9 +415,8 @@ impl TextStyle {
         self
     }
 
-    /// Font weight (100–900).
     #[must_use]
-    pub fn with_weight(mut self, weight: f32) -> Self {
+    pub fn with_weight(mut self, weight: FontWeight) -> Self {
         self.font_weight = weight;
         self
     }
@@ -218,8 +429,8 @@ impl TextStyle {
 
     /// Font stretch as a ratio (1.0 = normal, 0.75 = condensed, 1.25 = expanded).
     #[must_use]
-    pub fn with_font_width(mut self, ratio: f32) -> Self {
-        self.font_width = Some(ratio);
+    pub fn with_font_width(mut self, width: FontWidth) -> Self {
+        self.font_width = width;
         self
     }
 
@@ -336,7 +547,7 @@ impl TextStyle {
 ///     RichSpan::new("Hello ", TextStyle::new(Color::BLACK, 20.0, "sans-serif")),
 ///     // mixed styling: bold + underline + strikethrough + letter spacing
 ///     RichSpan::new("World", TextStyle::new(Color::rgb(0, 0, 0xff), 20.0, "sans-serif")
-///         .with_weight(700.0)
+///         .with_weight(FontWeight::Bold)
 ///         .with_underline(true)
 ///         .with_strikethrough(true)
 ///         .with_letter_spacing(2.0)),
@@ -821,16 +1032,16 @@ mod measure {
         builder.push_default(StyleProperty::FontSize(style.font_size as f32));
         builder.push_default(StyleProperty::Brush(style.color));
         builder.push_default(StyleProperty::FontWeight(parley::style::FontWeight::new(
-            style.font_weight,
+            style.font_weight.value(),
         )));
         builder.push_default(StyleProperty::FontStyle(parley_font_style(
             style.font_style,
         )));
-        if let Some(w) = style.font_width {
-            builder.push_default(StyleProperty::FontWidth(
-                parley::style::FontWidth::from_ratio(w),
-            ));
-        }
+
+        builder.push_default(StyleProperty::FontWidth(
+            parley::style::FontWidth::from_ratio(style.font_width.ratio()),
+        ));
+
         if let Some(lh) = style.line_height {
             builder.push_default(StyleProperty::LineHeight(parley_line_height(
                 lh,
@@ -866,9 +1077,9 @@ mod measure {
         if s.color != base.color {
             builder.push(StyleProperty::Brush(s.color), range.clone());
         }
-        if (s.font_weight - base.font_weight).abs() > f32::EPSILON {
+        if s.font_weight != base.font_weight {
             builder.push(
-                StyleProperty::FontWeight(parley::style::FontWeight::new(s.font_weight)),
+                StyleProperty::FontWeight(parley::style::FontWeight::new(s.font_weight.value())),
                 range.clone(),
             );
         }
@@ -879,18 +1090,12 @@ mod measure {
             );
         }
         if s.font_width != base.font_width {
-            if let Some(w) = s.font_width {
-                builder.push(
-                    StyleProperty::FontWidth(parley::style::FontWidth::from_ratio(w)),
-                    range.clone(),
-                );
-            } else {
-                // Explicitly fall back to the default normal width.
-                builder.push(
-                    StyleProperty::FontWidth(parley::style::FontWidth::from_ratio(1.0)),
-                    range.clone(),
-                );
-            }
+            builder.push(
+                StyleProperty::FontWidth(parley::style::FontWidth::from_ratio(
+                    s.font_width.ratio(),
+                )),
+                range.clone(),
+            );
         }
         if s.line_height != base.line_height {
             builder.push(
@@ -1537,6 +1742,43 @@ mod tests {
         )
     }
 
+    /// FontWeight keyword / numeric parsing.
+    mod font_weight_parse {
+        use super::*;
+        use std::str::FromStr;
+
+        #[test]
+        fn parses_keywords() {
+            assert_eq!(FontWeight::parse("bold"), Some(FontWeight::Bold));
+            assert_eq!(FontWeight::parse("normal"), Some(FontWeight::Normal));
+            assert_eq!(FontWeight::parse("Thin"), Some(FontWeight::Thin));
+            assert_eq!(FontWeight::parse("EXTRA-BOLD"), Some(FontWeight::ExtraBold));
+            assert_eq!(FontWeight::parse("semi_bold"), Some(FontWeight::SemiBold));
+            assert_eq!(FontWeight::parse("black"), Some(FontWeight::Black));
+        }
+
+        #[test]
+        fn parses_numeric() {
+            assert_eq!(FontWeight::parse("100"), Some(FontWeight::Thin));
+            assert_eq!(FontWeight::parse("400"), Some(FontWeight::Normal));
+            assert_eq!(FontWeight::parse("700"), Some(FontWeight::Bold));
+            assert_eq!(FontWeight::parse("750"), Some(FontWeight::ExtraBold));
+            assert_eq!(FontWeight::parse(" 900 "), Some(FontWeight::Black));
+        }
+
+        #[test]
+        fn rejects_invalid() {
+            assert_eq!(FontWeight::parse("xxx"), None);
+            assert_eq!(FontWeight::parse(""), None);
+            assert_eq!(FontWeight::parse("1000"), None);
+            assert!(FontWeight::from_str("nope").is_err());
+            assert_eq!(
+                FontWeight::from_str("bold").unwrap(),
+                FontWeight::Bold
+            );
+        }
+    }
+
     /// Convenience: lay out a plain string.
     fn layout_one(text: &str, style: &TextStyle, max_width: Option<f64>) -> Arc<TextLayout> {
         layout_text(
@@ -1907,7 +2149,7 @@ mod tests {
         #[ignore = "environment lacks a font with a wdth variation axis; FontWidth cannot pick a narrower font"]
         fn condensed_font_width_is_narrower() {
             let normal = TextStyle::new(Color::BLACK, 20.0, "sans-serif");
-            let condensed = normal.clone().with_font_width(0.75);
+            let condensed = normal.clone().with_font_width(FontWidth::Condensed);
             let a = measure_one("MMMM", &normal, None).metrics.width;
             let b = measure_one("MMMM", &condensed, None).metrics.width;
             // A condensed width should make the glyphs narrower.
@@ -1936,7 +2178,7 @@ mod tests {
         #[test]
         fn builder_defaults() {
             let s = TextStyle::new(Color::BLACK, 12.0, "sans-serif");
-            assert_eq!(s.font_width, None);
+            assert_eq!(s.font_width, FontWidth::Normal);
             assert_eq!(s.letter_spacing, 0.0);
             assert!(!s.underline);
             assert!(!s.strikethrough);

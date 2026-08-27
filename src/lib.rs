@@ -60,8 +60,8 @@ pub use scene::{
     ObjectFit, RadialGradient, Scene, SceneImage, SceneNode, Stroke,
 };
 pub use text::{
-    FontSource, FontStyle, Glyph, LineMetrics, RichSpan, TextAlign, TextBaseline, TextDecoration,
-    TextLayout, TextLine, TextMeasure, TextMetrics, TextRun, TextStyle, compute_text_offset,
-    layout_metrics, layout_text, measure_text, parse_generic_family, register_font,
-    register_font_generic,
+    FontSource, FontStyle, FontWeight, FontWidth, Glyph, LineMetrics, RichSpan, TextAlign,
+    TextBaseline, TextDecoration, TextLayout, TextLine, TextMeasure, TextMetrics, TextRun,
+    TextStyle, compute_text_offset, layout_metrics, layout_text, measure_text,
+    parse_generic_family, register_font, register_font_generic,
 };

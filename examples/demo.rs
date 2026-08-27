@@ -202,7 +202,7 @@ fn build_scene() -> Scene {
 
     // ---------- labels 层（顶部文本；演示 baseline/weight/align 与 measure_text） ----------
     let title_style = TextStyle::new(Color::rgb(0x11, 0x11, 0x11), 20.0, "sans-serif")
-        .with_weight(700.0)
+        .with_weight(lievisual::FontWeight::Bold)
         .with_align(lievisual::TextAlign::Left);
     // 先测量再做水平居中（canvas 风格：measureText → 用 width 定位锚点）。
     // 文本以样式化片段表达：单个 RichSpan 即单文本。

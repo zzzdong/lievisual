@@ -379,9 +379,13 @@ impl Renderer for SvgRenderer {
         // Optional typographic attributes: font width (font-stretch), letter spacing
         // (letter-spacing), text decoration (underline / line-through, output per the style's
         // block-level defaults).
-        let fwidth = match style.font_width {
-            Some(w) => format!(r#" font-stretch="{:.0}%""#, w * 100.0),
-            None => String::new(),
+        let fwidth = if style.font_width != crate::text::FontWidth::Normal {
+            format!(
+                r#" font-stretch="{:.0}%""#,
+                style.font_width.ratio() * 100.0
+            )
+        } else {
+            String::new()
         };
         let letter = if style.letter_spacing != 0.0 {
             format!(r#" letter-spacing="{:.2}""#, style.letter_spacing)
@@ -452,7 +456,7 @@ impl Renderer for SvgRenderer {
             escape_attr(&style.font_family_css()),
             style.font_size,
             fstyle,
-            style.font_weight,
+            style.font_weight.value(),
             style.color.to_hex(),
             fwidth,
             letter,
@@ -779,7 +783,7 @@ mod tests {
     use super::*;
     use crate::geometry::Vec2;
     use crate::scene::{Element, Scene, SceneNode};
-    use crate::text::{FontStyle, TextAlign, TextBaseline, TextStyle};
+    use crate::text::{FontStyle, FontWeight, FontWidth, TextAlign, TextBaseline, TextStyle};
 
     fn render(scene: &Scene) -> String {
         let mut svg = SvgRenderer::new(scene.width, scene.height).with_background(scene.background);
@@ -957,7 +961,7 @@ mod tests {
             Point::new(10.0, 10.0),
             TextStyle::new(Color::BLACK, 12.0, "sans-serif")
                 .with_baseline(TextBaseline::Middle)
-                .with_weight(700.0)
+                .with_weight(FontWeight::Bold)
                 .with_style(FontStyle::Italic)
                 .with_line_height(18.0),
         ));
@@ -1110,7 +1114,7 @@ mod tests {
             .with_underline(true)
             .with_strikethrough(true)
             .with_letter_spacing(2.0)
-            .with_font_width(0.75);
+            .with_font_width(FontWidth::Condensed);
         scene.push(Element::text("x", Point::new(1.0, 2.0), style));
         let out = render(&scene);
         // Decoration / spacing / font width are output as SVG attributes.
