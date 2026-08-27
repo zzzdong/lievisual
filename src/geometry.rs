@@ -114,7 +114,7 @@ impl Color {
     }
 
     /// Opaque 8-bit RGB.
-    pub fn rgb(r: u8, g: u8, b: u8) -> Self {
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self {
             r: r as f64 / 255.0,
             g: g as f64 / 255.0,
@@ -124,7 +124,7 @@ impl Color {
     }
 
     /// 8-bit RGBA.
-    pub fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
+    pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self {
             r: r as f64 / 255.0,
             g: g as f64 / 255.0,
