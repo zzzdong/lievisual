@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0-beta.2] — 2026-08-31
+
+Second pre-release of 0.2.0: **dual licensing** and a rewritten English README. No code changes.
+
+### Changed
+
+- **Dual-licensed under MIT OR Apache-2.0** (previously Apache-2.0 only). The Apache text lives in
+  `LICENSE-APACHE` (copyright placeholder filled in), MIT in `LICENSE-MIT`; `Cargo.toml` now
+  declares `license = "MIT OR Apache-2.0"`.
+- README rewritten in English and slimmed down (~163 → ~110 lines).
+
 ## [0.2.0-beta.1] — 2026-08-31
 
 首个 0.2 预发布，供下游（liemermaid / liepress / liecharts）实机验证破坏性变更。
@@ -85,6 +96,7 @@ A pre-release of 0.2.0, focused on **cross-backend consistency** (SVG and raster
   edges; it now interpolates in premultiplied space.
 - Canvas dimensions above `u16::MAX` were silently truncated by `as u16`; they are now clamped.
 - Alpha conversions now round instead of truncating (50% opacity maps to 128, not 127).
+- **README rewritten in English** and slimmed down (~163 → ~110 lines).
 
 ### Removed
 
@@ -142,5 +154,6 @@ primitive and reads worse — so a wholesale rewrite is *not* recommended. Inste
    mechanical migration a net loss.
 
 [Unreleased]: https://github.com/zzzdong/lievisual/compare/v0.2.0...HEAD
+[0.2.0-beta.2]: https://github.com/zzzdong/lievisual/compare/v0.2.0-beta.1...v0.2.0-beta.2
 [0.2.0-beta.1]: https://github.com/zzzdong/lievisual/compare/v0.1.4...v0.2.0-beta.1
 [0.2.0]: https://github.com/zzzdong/lievisual/compare/v0.1.4...v0.2.0
