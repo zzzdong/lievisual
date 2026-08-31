@@ -30,10 +30,19 @@
 - **裁剪**：矩形 / 圆角矩形 / 圆 / 椭圆 / 任意贝塞尔路径，跨后端一致
   （SVG `<clipPath>` / vello `push_clip_path`）。
 - **场景元数据**：`title` / `description`（SVG 输出 `<title>` / `<desc>`）与 `scale`
-  （像素密度，SVG 放大输出尺寸而保持 `viewBox`）。
+  （像素密度）。两个后端同一契约：**渲染器构造尺寸 = 输出尺寸**，`scale` 只决定用户坐标系
+  （SVG 侧 `viewBox = 输出尺寸 / scale`），绝不静默放大画布。
 - **文本（Canvas 风格）**：`font-family` / `font-size` / `font-weight` / `font-style` /
   `line-height` + `textAlign` + `textBaseline`；`measure_text` 对应 `ctx.measureText()`，
-  返回 `TextMetrics`。排版上下文按线程缓存（thread-local），避免反复系统字体扫描。
+  返回 `TextMetrics`。排版上下文按线程缓存（thread-local），避免反复系统字体扫描；
+  自定义字体 `register_font` **进程级**可见（跨线程，含后启动的线程）。
+- **Canvas-like 构造层（`builder`）**：`Ctx` + `Path2D`，对齐 Web Canvas 2D 的绘制词汇
+  （`fillRect` / `strokeRect` / `beginPath` … `fill()` / `save` 语义的 transform / alpha /
+  clip），并补充 Canvas 没有的能力：图层、具名节点、富文本 span、渐变直接作填充、
+  细粒度虚线 / 线帽 / 连接。不可变 builder（`with_*` 返回新实例），产出的是可检查的 IR。
+- **内容包围盒与自适应画布（`fit`）**：`element_bounds` / `node_bounds` / `scene_bounds`
+  与 `fit_scene(&mut scene, FitOptions)`，用于"画布贴合内容"的导出场景（图表 / 流程图）。
+  包围盒计入描边半宽、节点变换、文本旋转，跳过 `visible = false` 子树。
 
 ## 快速开始
 
@@ -41,7 +50,7 @@
 
 ```toml
 [dependencies]
-lievisual = "0.1"
+lievisual = "0.2"
 ```
 
 构建一个场景并输出 SVG：

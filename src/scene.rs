@@ -22,8 +22,21 @@
 
 use crate::geometry::{Color, Point, Rect, Transform, Vec2};
 use crate::render::Renderer;
-use crate::text::{RichSpan, TextLayout};
+use crate::text::{RichSpan, TextLayout, layout_text};
 use kurbo::BezPath;
+use std::sync::Arc;
+
+/// Typeset `spans` for [`Element::Text`], or `None` when there is nothing to lay out.
+///
+/// Returns `None` (rather than an empty layout) for empty spans / empty text, so a text element
+/// that draws nothing does not pay for an allocation.
+fn prelayout(spans: &[RichSpan], max_width: Option<f64>) -> Option<Arc<TextLayout>> {
+    if spans.is_empty() || spans.iter().all(|s| s.text.is_empty()) {
+        return None;
+    }
+    let layout = layout_text(spans, max_width);
+    (!layout.lines.is_empty()).then_some(layout)
+}
 
 /// How an image fits inside its target frame (`Element::Image.frame`, pt/px coordinates).
 ///
@@ -149,8 +162,12 @@ pub struct Scene {
     pub title: Option<String>,
     /// Document description (emitted as `<desc>` in SVG).
     pub description: Option<String>,
-    /// Output scale (pixel density). Default 1.0; the SVG side scales up `width`/`height` while
-    /// keeping `viewBox` unchanged, yielding a higher-resolution bitmap export.
+    /// Output scale (pixel density). Default 1.0.
+    ///
+    /// **Both** backends share one contract: the size passed to a renderer is the **output**
+    /// size, and `scale` divides it to obtain the user coordinate system the scene is drawn in
+    /// (on the SVG side, `viewBox = 输出尺寸 / scale`). `scale` is therefore a pure density knob —
+    /// it never silently enlarges the canvas. See [`crate::render::SvgRenderer::into_string`].
     pub scale: f64,
 }
 
@@ -900,33 +917,48 @@ impl Element {
         }
     }
 
-    /// Plain-text primitive (empty `layout`, typeset by the backend itself).
+    /// Plain-text primitive; the layout is **measured eagerly** at construction.
     ///
     /// `style` serves both as block-level positioning (`align` / `baseline` / `rotation` /
     /// `max_width`) and as the default font style; internally a single [`RichSpan`] is produced.
+    ///
+    /// The layout is typeset immediately (see [`Element::rich_text`] for why), so the result
+    /// carries accurate block dimensions. To skip it in a performance-sensitive hot loop,
+    /// build the struct variant directly with `layout: None`.
     #[must_use]
-    pub fn text(
-        content: impl Into<String>,
-        position: Point,
-        style: crate::text::TextStyle,
-    ) -> Self {
+    pub fn text(content: impl Into<String>, position: Point, style: crate::text::TextStyle) -> Self {
+        let spans = vec![RichSpan::new(content, style.clone())];
+        let layout = prelayout(&spans, style.max_width);
         Self::Text {
-            spans: vec![RichSpan::new(content, style.clone())],
+            spans,
             position,
             style,
-            layout: None,
+            layout,
         }
     }
 
     /// Rich-text primitive: composed of styled spans (`style` provides block-level positioning
     /// and the default font).
+    ///
+    /// ## Why the layout is measured here
+    ///
+    /// The two backends typeset text differently: the raster one via parley, the SVG one by
+    /// emitting `<text>` for the **browser** to typeset. Without a shared pre-computed layout
+    /// the SVG side had to *estimate* the block size from `font_size` (e.g. baseline at
+    /// `0.85 × font_size`), which made the text background rectangle and the vertical anchor
+    /// drift away from the raster output — and from [`crate::fit::scene_bounds`], which measures
+    /// for real. Typesetting once here keeps all three consistent.
+    ///
+    /// Measurement is skipped (leaving `layout: None`) when there is nothing to typeset, e.g.
+    /// empty spans.
     #[must_use]
     pub fn rich_text(spans: Vec<RichSpan>, position: Point, style: crate::text::TextStyle) -> Self {
+        let layout = prelayout(&spans, style.max_width);
         Self::Text {
             spans,
             position,
             style,
-            layout: None,
+            layout,
         }
     }
 
@@ -1112,8 +1144,23 @@ mod tests {
                     assert_eq!(spans[0].text, "hi");
                     assert_eq!(position, Point::new(0.0, 0.0));
                     assert_eq!(style.font_size, 12.0);
-                    assert!(layout.is_none());
+                    // 构造时即排版（无可用字体时为 None）。
+                    if let Some(l) = layout {
+                        assert!(!l.lines.is_empty());
+                        assert!(l.width > 0.0 && l.height > 0.0);
+                    }
                 }
+                _ => panic!("expected text"),
+            }
+
+            // 空文本不排版，layout 保持 None。
+            let empty = Element::text(
+                "",
+                Point::new(0.0, 0.0),
+                crate::text::TextStyle::new(Color::BLACK, 12.0, "sans-serif"),
+            );
+            match empty {
+                Element::Text { layout, .. } => assert!(layout.is_none()),
                 _ => panic!("expected text"),
             }
         }

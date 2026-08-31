@@ -48,7 +48,8 @@ SVG / vello_cpu 栅格 / GPU（规划中）/ PDF·DOCX（经 liepress）。
 src/
   geometry.rs   [Point]/[Rect]/[Vec2]/[Size] 直接 re-export kurbo 0.13（零转换互通，
                 消除下游 to_lie_* 缝合）；补充 PointExt（midpoint/is_finite/min/max）
-                与 RectExt（union）便捷扩展；Color/Transform 保留自定义（仿射桥接 kurbo）
+                与 PointExt（midpoint/is_finite/min/max）便捷扩展；布局方法（union/inflate/
+                from_points）直接用 kurbo 原生；Color/Transform 保留自定义（仿射桥接 kurbo）
   scene.rs      Scene（元数据 + 图层 layers）/ Layer / SceneNode（层级+节点属性）/
                 Element（图元枚举）/ 样式（FillStrokeStyle/Fill:Solid·Linear·Radial/Stroke 含虚线）
   text.rs       Canvas 风格文本 API：TextStyle/TextAlign/TextBaseline/TextMetrics/

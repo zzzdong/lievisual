@@ -28,38 +28,48 @@ pub struct SvgRenderer {
     buf: String,
     width: f64,
     height: f64,
-    background: Color,
+    /// `None` → fall back to [`Scene::background`] (the Scene is the authoritative IR).
+    background: Option<Color>,
     gradient_id: usize,
     clip_id: usize,
     title: Option<String>,
     description: Option<String>,
-    scale: f64,
+    /// `None` → fall back to [`Scene::scale`]; an explicit renderer value wins.
+    scale: Option<f64>,
 }
 
 impl SvgRenderer {
+    /// Create a renderer for an output canvas of `width × height` (scene units / px).
+    ///
+    /// A non-positive size means "unset": the value from the rendered [`Scene`] is then used,
+    /// so `SvgRenderer::new(0.0, 0.0)` still produces a correctly sized document.
     pub fn new(width: f64, height: f64) -> Self {
         Self {
             buf: String::new(),
             width,
             height,
-            background: Color::WHITE,
+            background: None,
             gradient_id: 0,
             clip_id: 0,
             title: None,
             description: None,
-            scale: 1.0,
+            scale: None,
         }
     }
 
+    /// Explicit background color; when unset, [`Scene::background`] is used.
+    #[must_use]
     pub fn with_background(mut self, bg: Color) -> Self {
-        self.background = bg;
+        self.background = Some(bg);
         self
     }
 
     /// Output scale (pixel density): enlarges `width`/`height` while keeping `viewBox` unchanged.
+    ///
+    /// Takes precedence over [`Scene::scale`]; when unset, the scene's scale is used.
     #[must_use]
     pub fn with_scale(mut self, scale: f64) -> Self {
-        self.scale = scale;
+        self.scale = Some(scale);
         self
     }
 
@@ -78,16 +88,30 @@ impl SvgRenderer {
     }
 
     /// Take the complete SVG document (including the `<svg>` root and background).
+    ///
+    /// Sizing contract (same as the raster backend): **the size given to
+    /// [`SvgRenderer::new`] is the output size** — it lands verbatim in the root
+    /// `width`/`height` attributes, and `viewBox` is that size divided by `scale`:
+    ///
+    /// ```text
+    /// width/height = 输出尺寸            (SvgRenderer::new 传入)
+    /// viewBox      = 0 0 (输出尺寸/scale) (绘制使用的用户坐标系)
+    /// ```
+    ///
+    /// `scale` is therefore a *density* knob, applied symmetrically on both backends, and it
+    /// never silently enlarges the output. To export a scene at 2× density, pass
+    /// `new(w * 2.0, h * 2.0)` (the `new(0.0, 0.0)` fallback does this for you, treating
+    /// `scene.width`/`scene.height` as logical size).
     pub fn into_string(self) -> String {
         let mut out = String::new();
-        // scale only enlarges the output size; viewBox keeps the scene coordinates, achieving
-        // higher-resolution export.
-        let sw = self.width * self.scale;
-        let sh = self.height * self.scale;
+        let scale = self.scale.unwrap_or(1.0);
+        // viewBox 用"用户坐标系"：输出尺寸 / scale。scale=1 时与输出尺寸相同。
+        let vw = self.width / scale;
+        let vh = self.height / scale;
         let _ = writeln!(
             out,
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="{:.2}" height="{:.2}" viewBox="0 0 {:.2} {:.2}">"#,
-            sw, sh, self.width, self.height
+            self.width, self.height, vw, vh
         );
         if let Some(t) = &self.title {
             let _ = writeln!(out, "<title>{}</title>", escape_text(t));
@@ -95,15 +119,15 @@ impl SvgRenderer {
         if let Some(d) = &self.description {
             let _ = writeln!(out, "<desc>{}</desc>", escape_text(d));
         }
-        // Background rectangle (viewBox coordinates, scaled with scale). Always output the
-        // full-canvas background so the base color is correct (a transparent background is also
-        // an overlay layer, matching common-library semantics).
+        // Background rectangle (viewBox / user coordinates, so it always covers exactly the
+        // logical canvas). Always output the full-canvas background so the base color is correct
+        // (a transparent background is also an overlay layer, matching common-library semantics).
         let _ = writeln!(
             out,
             r#"<rect x="0" y="0" width="{:.2}" height="{:.2}" fill="{}"/>"#,
-            self.width,
-            self.height,
-            self.background.to_hex()
+            vw,
+            vh,
+            self.background.unwrap_or(Color::WHITE).to_hex()
         );
         // content
         out.push_str(&self.buf);
@@ -120,10 +144,31 @@ impl SvgRenderer {
 
 impl Renderer for SvgRenderer {
     fn render_scene(&mut self, scene: &Scene) {
-        // Capture scene metadata, then reuse the default traversal.
+        // Capture scene metadata, then reuse the default traversal. Values explicitly set on
+        // the renderer take precedence; the rest falls back to the scene (the authoritative IR),
+        // so `SvgRenderer::new(0.0, 0.0)` still yields a correctly sized document.
         self.title = scene.title.clone();
         self.description = scene.description.clone();
-        self.scale = scene.scale;
+        // scale: an explicit renderer value wins, otherwise the scene's.
+        let scale = self.scale.unwrap_or(if scene.scale.is_finite() && scene.scale > 0.0 {
+            scene.scale
+        } else {
+            1.0
+        });
+        self.scale = Some(scale);
+        if self.background.is_none() {
+            self.background = Some(scene.background);
+        }
+        // Size fallback: treat `scene.width/height` as the **logical** size and multiply by
+        // `scale` to get the output size — i.e. `new(0.0, 0.0)` behaves exactly like the
+        // pre-existing "scale enlarges the export" behaviour, while an explicit size is honoured
+        // verbatim as the output size.
+        if self.width <= 0.0 {
+            self.width = scene.width * scale;
+        }
+        if self.height <= 0.0 {
+            self.height = scene.height * scale;
+        }
         self.render_scene_ordered(scene);
     }
 
@@ -325,8 +370,12 @@ impl Renderer for SvgRenderer {
         // background rectangle's exact dimensions. Plain text is derived by concatenating spans,
         // keeping glyph content consistent with the vello backend.
         let content = spans.iter().map(|s| s.text.as_str()).collect::<String>();
-        // A pre-laid-out layout provides the text block's exact dimensions; fall back to an
-        // approximation when absent.
+        // A pre-laid-out layout provides the text block's exact dimensions.
+        //
+        // `Element::text` / `Element::rich_text` typeset eagerly, so the normal path always has
+        // one. The `None` branch is only a fallback for a hand-built `Element::Text { layout: None
+        // }` and is a **coarse `font_size`-based approximation** — it can overshoot the block
+        // width by ~20%, so do not rely on it for background rectangles.
         let metrics = layout.map(crate::text::layout_metrics);
         // Anchor: text-anchor (horizontal, maps to align) + dominant-baseline (vertical, maps to
         // baseline).
@@ -680,16 +729,31 @@ impl SvgRenderer {
     }
 }
 
+/// A gradient stop: `stop-color` always uses the 6-digit form, and a translucent stop carries
+/// its alpha through `stop-opacity` — 8-digit hex (`#rrggbbaa`) is CSS Color 4 / SVG 2 only and
+/// is rejected by many SVG → PDF / SVG 1.1 consumers.
 fn stop_svg(s: &GradientStop) -> String {
+    let opacity = if s.color.a == 255 {
+        String::new()
+    } else {
+        format!(
+            r#" stop-opacity="{:.3}""#,
+            s.color.a as f64 / 255.0
+        )
+    };
     format!(
-        r#"<stop offset="{:.3}" stop-color="{}"/>"#,
-        s.offset,
-        s.color.to_hex()
+        r##"<stop offset="{:.3}" stop-color="#{:02x}{:02x}{:02x}"{} />"##,
+        s.offset, s.color.r, s.color.g, s.color.b, opacity
     )
 }
 
 /// Build the SVG path `d` for an arc / pie sector (using the native arc command `A` rather than
 /// a Bézier approximation).
+///
+/// A full turn (|sweep| ≥ 360°) is emitted as **two** 180° arcs: per the SVG spec an `A`
+/// segment whose start and end points coincide is dropped entirely, which would make a
+/// 100%-slice pie (or a full circle stroke) render nothing on the SVG backend while the
+/// raster backend draws a full circle.
 fn arc_path_d(
     center: Point,
     radii: Vec2,
@@ -697,42 +761,48 @@ fn arc_path_d(
     sweep_angle: f64,
     sector: bool,
 ) -> String {
-    let start = (
-        center.x + radii.x * start_angle.cos(),
-        center.y + radii.y * start_angle.sin(),
-    );
-    let end_angle = start_angle + sweep_angle;
-    let end = (
-        center.x + radii.x * end_angle.cos(),
-        center.y + radii.y * end_angle.sin(),
-    );
-    let large_arc = if sweep_angle.abs() > std::f64::consts::PI {
-        1
-    } else {
-        0
+    let point_at = |angle: f64| -> (f64, f64) {
+        (
+            center.x + radii.x * angle.cos(),
+            center.y + radii.y * angle.sin(),
+        )
     };
-    // y-down coordinate system: positive sweep = clockwise = SVG sweep-flag 1.
-    let sweep_flag = if sweep_angle >= 0.0 { 1 } else { 0 };
-    if sector {
-        format!(
-            "M {:.2} {:.2} L {:.2} {:.2} A {:.2} {:.2} 0 {} {} {:.2} {:.2} Z",
-            center.x,
-            center.y,
-            start.0,
-            start.1,
-            radii.x,
-            radii.y,
-            large_arc,
-            sweep_flag,
-            end.0,
-            end.1
-        )
+    // 整圆（|sweep| ≥ 360°）拆成两段 180°：SVG 规范规定起终点重合的 A 段被整体忽略。
+    let segments: Vec<(f64, f64)> = if sweep_angle.abs() >= std::f64::consts::TAU - 1e-9 {
+        let half = sweep_angle / 2.0;
+        vec![(start_angle, half), (start_angle + half, half)]
     } else {
-        format!(
-            "M {:.2} {:.2} A {:.2} {:.2} 0 {} {} {:.2} {:.2}",
-            start.0, start.1, radii.x, radii.y, large_arc, sweep_flag, end.0, end.1
-        )
+        vec![(start_angle, sweep_angle)]
+    };
+
+    let mut d = String::new();
+    let start = point_at(start_angle);
+    if sector {
+        // 扇形：M center L start [A ...]+ Z（与栅格端的 "M center L start [弧] end Z" 一致）。
+        let _ = write!(
+            d,
+            "M {:.2} {:.2} L {:.2} {:.2}",
+            center.x, center.y, start.0, start.1
+        );
+    } else {
+        let _ = write!(d, "M {:.2} {:.2}", start.0, start.1);
     }
+    for (a, s) in segments {
+        // 大弧标志按单段弧度判断（拆分后每段恒为 180°，取 0 更稳妥）。
+        let large_arc = if s.abs() > std::f64::consts::PI { 1 } else { 0 };
+        // y-down 坐标系：正向 sweep = 顺时针 = SVG sweep-flag 1。
+        let sweep_flag = if s >= 0.0 { 1 } else { 0 };
+        let end = point_at(a + s);
+        let _ = write!(
+            d,
+            " A {:.2} {:.2} 0 {} {} {:.2} {:.2}",
+            radii.x, radii.y, large_arc, sweep_flag, end.0, end.1
+        );
+    }
+    if sector {
+        d.push_str(" Z");
+    }
+    d
 }
 
 /// XML text escaping (for `<text>` content).
@@ -797,11 +867,27 @@ mod tests {
             .with_title("T")
             .with_description("D")
             .with_scale(2.0);
+        // 尺寸收敛后：渲染器尺寸 = 输出尺寸；viewBox = 输出尺寸 / scale。
+        // 这里显式传 scene 尺寸 → 输出 100×50，用户坐标系 50×25。
         let out = render(&scene);
         assert!(out.contains("<title>T</title>"));
         assert!(out.contains("<desc>D</desc>"));
-        // scale enlarges the output size; viewBox keeps the scene coordinates.
-        assert!(out.contains(r#"width="200.00" height="100.00" viewBox="0 0 100.00 50.00""#));
+        assert!(out.contains(r#"width="100.00" height="50.00" viewBox="0 0 50.00 25.00""#));
+    }
+
+    /// 未显式给出尺寸时回落为"scene 尺寸 × scale"（保持"scale 放大导出"的旧行为）。
+    #[test]
+    fn size_fallback_multiplies_scene_by_scale() {
+        let scene = Scene::new(100.0, 50.0).with_scale(2.0);
+        let mut svg = SvgRenderer::new(0.0, 0.0);
+        scene.render(&mut svg);
+        let out = svg.into_string();
+        assert!(
+            out.contains(r#"width="200.00" height="100.00" viewBox="0 0 100.00 50.00""#),
+            "回落应把 scene 尺寸 × scale 作为输出尺寸，实际: {out}"
+        );
+        // 背景矩形应覆盖整个用户坐标系（viewBox 尺寸），而非输出尺寸。
+        assert!(out.contains(r##"width="100.00" height="50.00" fill="#ffffff""##));
     }
 
     #[test]
@@ -1272,5 +1358,226 @@ mod tests {
         let out = render(&scene);
         // Without background_color, only the canvas background <rect> exists (no text background rect).
         assert_eq!(out.matches("<rect ").count(), 1);
+    }
+
+    /// 缺陷回归：文本背景矩形必须用**真实测量**的尺寸，而非 `font_size` 估算。
+    ///
+    /// 此前 `Element::text()` 不排版（`layout: None`），SVG 端回落到估算
+    /// （宽约 `len * font_size * 0.6`、高约 `font_size * 1.3`），实测对 "Hello World"@20px
+    /// 给出 132×26，而真实排版是 109.74×27.24 —— **宽度误差约 20%**，背景框明显偏大，
+    /// 且与 [`crate::fit::scene_bounds`]（用真实测量）不一致。
+    ///
+    /// 现在 `Element::text()` 构造时即排版，两个后端共享同一份布局。
+    #[test]
+    fn text_background_uses_real_measurement() {
+        use crate::text::TextStyle;
+
+        let style = TextStyle::new(Color::BLACK, 20.0, "sans-serif")
+            .with_background_color(Some(Color::rgb(0xff, 0xff, 0x00)));
+        let el = Element::text("Hello World", Point::new(10.0, 40.0), style);
+        // 无可用字体时排版为空，跳过（沙箱 / 精简镜像中可能没有字体）。
+        let measured_w = match &el {
+            Element::Text { layout: Some(l), .. } => l.width,
+            _ => return,
+        };
+
+        let mut scene = Scene::new(300.0, 80.0);
+        scene.push(el);
+        let out = render(&scene);
+
+        // 文本背景矩形（黄色）的宽度应等于排版宽度。
+        let bg = out
+            .lines()
+            .find(|l| l.contains("#ffff00"))
+            .expect("应输出文本背景矩形");
+        let w: f64 = bg
+            .split("width=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .and_then(|s| s.parse().ok())
+            .expect("背景矩形应有 width");
+        assert!(
+            (w - measured_w).abs() < 0.5,
+            "背景矩形宽度应等于排版宽度 {measured_w:.2}，实际 {w:.2}"
+        );
+    }
+
+    /// `Element::text()` 构造时即排版，两个后端与 [`crate::fit`] 共享同一份布局。
+    #[test]
+    fn element_text_prelayouts() {
+        use crate::text::TextStyle;
+
+        // 有内容 → 排版。
+        let el = Element::text(
+            "Hello",
+            Point::new(0.0, 0.0),
+            TextStyle::new(Color::BLACK, 16.0, "sans-serif"),
+        );
+        match &el {
+            Element::Text { layout, .. } => {
+                // 无字体环境下排版为空，此时不应 panic 而应降级为 None。
+                if let Some(l) = layout {
+                    assert!(!l.lines.is_empty());
+                    assert!(l.width > 0.0);
+                }
+            }
+            _ => panic!("expected Text"),
+        }
+
+        // 空文本 → 不排版（避免无谓分配）。
+        let empty = Element::text(
+            "",
+            Point::new(0.0, 0.0),
+            TextStyle::new(Color::BLACK, 16.0, "sans-serif"),
+        );
+        match &empty {
+            Element::Text { layout, .. } => assert!(layout.is_none(), "空文本不应排版"),
+            _ => panic!("expected Text"),
+        }
+
+        // rich_text 同理。
+        let rich = Element::rich_text(
+            vec![crate::text::RichSpan::new(
+                "ab",
+                TextStyle::new(Color::BLACK, 16.0, "sans-serif"),
+            )],
+            Point::new(0.0, 0.0),
+            TextStyle::new(Color::BLACK, 16.0, "sans-serif"),
+        );
+        match &rich {
+            Element::Text { layout, .. } => {
+                if let Some(l) = layout {
+                    assert!(!l.lines.is_empty());
+                }
+            }
+            _ => panic!("expected Text"),
+        }
+        let empty_rich = Element::rich_text(
+            vec![],
+            Point::new(0.0, 0.0),
+            TextStyle::new(Color::BLACK, 16.0, "sans-serif"),
+        );
+        match &empty_rich {
+            Element::Text { layout, .. } => assert!(layout.is_none()),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    /// Bug 回归：渲染器未显式设置尺寸 / 背景时，回落到 [`Scene`] 的元数据
+    /// （此前 `SvgRenderer::new(0.0, 0.0)` 会输出 `width="0.00" height="0.00"`，
+    /// 且 `Scene::background` 被完全忽略）。
+    #[test]
+    fn falls_back_to_scene_size_and_background() {
+        let mut scene = Scene::new(300.0, 200.0).with_background(Color::rgb(0x00, 0x00, 0xff));
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            FillStrokeStyle::fill(Color::RED),
+        ));
+        let mut svg = SvgRenderer::new(0.0, 0.0);
+        scene.render(&mut svg);
+        let out = svg.into_string();
+        assert!(
+            out.contains(r#"width="300.00" height="200.00" viewBox="0 0 300.00 200.00""#),
+            "应回落到场景尺寸，实际输出: {out}"
+        );
+        assert!(
+            out.contains(r##"fill="#0000ff""##),
+            "应回落到场景背景色，实际输出: {out}"
+        );
+    }
+
+    /// 渲染器显式设置的值优先于场景元数据（尺寸原样作为输出尺寸，scale 只影响 viewBox）。
+    #[test]
+    fn explicit_renderer_settings_win() {
+        let scene = Scene::new(300.0, 200.0).with_scale(3.0);
+        let mut svg = SvgRenderer::new(50.0, 40.0)
+            .with_scale(2.0)
+            .with_background(Color::GREEN);
+        scene.render(&mut svg);
+        let out = svg.into_string();
+        assert!(out.contains(r#"width="50.00" height="40.00" viewBox="0 0 25.00 20.00""#));
+        assert!(out.contains(r##"fill="#00ff00""##));
+        // 显式 scale=2 应压过 scene 的 scale=3。
+        assert!(
+            !out.contains(r#"viewBox="0 0 16.67"#),
+            "渲染器 scale 应优先: {out}"
+        );
+    }
+
+    /// Bug 回归：整圆（|sweep| = 360°）在 SVG 中必须拆成两段 180° 弧。
+    ///
+    /// SVG 规范规定起终点重合的 `A` 段被整体忽略，单段写法会让 100% 扇形（整圆饼图）
+    /// 在 SVG 端什么都不画，而栅格端画出整圆。
+    #[test]
+    fn full_circle_arc_is_split_in_two() {
+        let d = arc_path_d(
+            Point::new(50.0, 50.0),
+            Vec2::new(30.0, 30.0),
+            0.0,
+            std::f64::consts::TAU,
+            true,
+        );
+        assert_eq!(
+            d.matches(" A ").count(),
+            2,
+            "整圆应拆成两段弧，实际 d = {d}"
+        );
+        assert!(d.starts_with("M 50.00 50.00 L "), "扇形应含中心点: {d}");
+        assert!(d.ends_with(" Z"), "扇形应闭合: {d}");
+        // 两段的起终点不能重合（否则又被忽略）。
+        let open_pie = arc_path_d(
+            Point::new(50.0, 50.0),
+            Vec2::new(30.0, 30.0),
+            0.0,
+            std::f64::consts::TAU,
+            false,
+        );
+        assert_eq!(open_pie.matches(" A ").count(), 2, "整圆弧: {open_pie}");
+        // 非整圆仍是单段。
+        let normal = arc_path_d(
+            Point::new(50.0, 50.0),
+            Vec2::new(30.0, 30.0),
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+            true,
+        );
+        assert_eq!(normal.matches(" A ").count(), 1, "普通扇形: {normal}");
+    }
+
+    /// 半透明渐变 stop：用 `stop-opacity` 表达 alpha（8 位 hex 在 SVG 1.1 / 部分
+    /// SVG→PDF 工具链中不被识别）。
+    #[test]
+    fn gradient_stop_alpha_uses_stop_opacity() {
+        let mut scene = Scene::new(100.0, 100.0);
+        let grad = LinearGradient {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(100.0, 0.0),
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Color::rgba(0xff, 0x00, 0x00, 128),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: Color::rgb(0x00, 0x00, 0xff),
+                },
+            ],
+        };
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            FillStrokeStyle {
+                fill: Some(grad.into()),
+                stroke: None,
+            },
+        ));
+        let out = render(&scene);
+        assert!(
+            out.contains(r##"stop-color="#ff0000" stop-opacity="0.502""##),
+            "半透明 stop 应输出 stop-opacity: {out}"
+        );
+        assert!(
+            out.contains(r##"stop-color="#0000ff" />"##),
+            "不透明 stop 不应带 stop-opacity: {out}"
+        );
     }
 }

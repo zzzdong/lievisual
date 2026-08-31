@@ -4,9 +4,8 @@
 //! are **re-exported directly from kurbo**, giving zero-cost interoperability with the geometry
 //! types of rendering backends (vello / parley) and downstream crates (e.g. liemermaid), and
 //! eliminating the `to_lie_*` shim functions that "two coordinate systems" would otherwise need.
-//! Layout methods (`min_x` / `max_x` / `inflate` / `from_points`, etc.) are provided directly by
-//! kurbo; [`RectExt::union`] is a bounding-box union method added by this crate on top of kurbo's
-//! `Rect`.
+//! Layout methods (`min_x` / `max_x` / `inflate` / `from_points` / `union`, etc.) are all provided
+//! directly by kurbo; this crate adds no extension trait for `Rect`.
 //!
 //! ## Geometry pass-through (controlled allow-list)
 //!
@@ -20,9 +19,9 @@
 //! `common` / `offset` / `simplify` algorithm modules to avoid leaking internal concepts.
 //!
 //! [`Color`] / [`Transform`] remain custom (kurbo has no equivalent, or business semantics are
-//! needed). [`PointExt`] / [`RectExt`] are convenience extension methods missing from kurbo,
-//! layered on top of the geometric types. The custom [`Transform`] performs backend matrix
-//! composition through [`Affine`] (i.e. kurbo's `Affine`).
+//! needed). [`PointExt`] is a convenience extension (component-wise `min` / `max`) layered on top
+//! of the geometric types. The custom [`Transform`] performs backend matrix composition through
+//! [`Affine`] (i.e. kurbo's `Affine`).
 
 // ——— kurbo geometric vocabulary types: explicit enumeration (stable kurbo 0.13 set) ———
 pub use kurbo::{
@@ -74,30 +73,12 @@ impl PointExt for Point {
     }
 }
 
-/// Convenience extension methods for [`Rect`] (helpers missing from kurbo 0.13).
-///
-/// Re-exported from the crate root (`use lievisual::RectExt`; also
-/// `use lievisual::geometry::RectExt`).
-///
-/// Note: for outward expansion use kurbo's own `Rect::inflate(width, height)`
-/// (expands x / y by the respective amounts).
-pub trait RectExt {
-    /// Bounding box that contains another rectangle (union).
-    #[must_use]
-    fn union(&self, other: Self) -> Rect;
-}
-
-impl RectExt for Rect {
-    #[inline]
-    fn union(&self, other: Self) -> Rect {
-        Rect::new(
-            self.min_x().min(other.min_x()),
-            self.min_y().min(other.min_y()),
-            self.max_x().max(other.max_x()),
-            self.max_y().max(other.max_y()),
-        )
-    }
-}
+// `RectExt` used to provide a `union` helper, but kurbo ≥ 0.13 ships `Rect::union` natively
+// (as a `const fn`), so the extension trait was removed in 0.2.0. Call `a.union(b)` directly
+// after `use lievisual::Rect` (no extra trait import needed).
+//
+// For outward expansion use kurbo's own `Rect::inflate(width, height)`
+// (expands x / y by the respective amounts).
 
 /// Color (RGBA, 8-bit components 0–255, matching the RGBA8 bitmaps and CSS hex output).
 ///

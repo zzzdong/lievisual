@@ -2,7 +2,8 @@
 //!
 //! Images in lievisual enter the IR as **already-decoded RGBA8 bitmaps**; the rendering
 //! library **does not decode** — consistent with the text layer's principle of "the caller
-//! lays out, the renderer consumes a self-contained [`TextLayout`]". Decoding (PNG parsing or
+//! lays out, the renderer consumes a self-contained [`crate::text::TextLayout`]". Decoding (PNG
+//! parsing or
 //! other formats) is the caller's / resource-loading layer's responsibility; lievisual only
 //! holds and draws ready pixels.
 //!

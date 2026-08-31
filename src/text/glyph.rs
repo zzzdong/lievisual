@@ -4,8 +4,8 @@
 //! collection index + glyph ID, for backends such as PDF / DOCX that need **exact vector
 //! glyphs** (rather than rasterization or system-font fallback).
 //!
-//! This module is the second real need to "extract data from [`text::TextRun`]" (the first was
-//! font bytes + [`text::TextRun::font_index`]), and is a prerequisite for SVG text vector
+//! This module is the second real need to "extract data from [`crate::text::TextRun`]" (the first was
+//! font bytes + [`crate::text::TextRun::font_index`]), and is a prerequisite for SVG text vector
 //! fidelity (a README planned item).
 //!
 //! Internally it uses [`skrifa`] (the same font-scaling engine as parley / fontique):
@@ -41,10 +41,10 @@ impl GlyphOutline {
     ///
     /// - `font_data`: raw font-file bytes (ttf/otf single font or ttc/otc collection).
     /// - `font_index`: the index of the font within the collection (always 0 for a single font;
-    ///   corresponds to [`text::TextRun::font_index`]).
-    /// - `glyph_id`: the glyph ID (corresponds to [`text::Glyph::id`]).
+    ///   corresponds to [`crate::text::TextRun::font_index`]).
+    /// - `glyph_id`: the glyph ID (corresponds to [`crate::text::Glyph::id`]).
     /// - `font_size`: the scaling target (ppem / pixels; corresponds to
-    ///   [`text::TextRun::font_size`]).
+    ///   [`crate::text::TextRun::font_size`]).
     ///
     /// Returns `None` when: the font bytes cannot be parsed, the collection index is out of
     /// bounds, or the glyph has no outline (e.g. `.notdef` or a pure bitmap glyph).

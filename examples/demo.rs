@@ -9,6 +9,7 @@
 //! - `pie` 层：饼图（层内节点透明度分级）
 //! - `labels` 层：顶部标题文本
 
+use lievisual::builder::{Ctx, Path2D};
 use lievisual::geometry::{Color, Point, Transform, Vec2};
 use lievisual::render::SvgRenderer;
 use lievisual::scene::{
@@ -220,9 +221,53 @@ fn build_scene() -> Scene {
         title_style,
     ))]);
 
-    // 图层顺序（从底到顶）：默认层 nodes → shapes → pie → labels
+    // ---------- canvas-api 层：Canvas-like builder（Ctx + Path2D） ----------
+    // 与上面手写 IR 的图层等价，但用 canvas 风格表达：不可变 Ctx 携带 fill / stroke /
+    // transform / alpha，Path2D 累积路径后由 fill() / stroke() 终结。
+    let mut canvas_api = Layer::new("canvas-api");
+    let ctx = Ctx::new()
+        .with_fill(Color::rgb(0x2e, 0x8b, 0x57))
+        .with_line(Color::rgb(0x1f, 0x5f, 0x3d), 2.0)
+        .with_alpha(0.85);
+
+    // 叶片轮廓：三次贝塞尔 + close_path，填充并描边。
+    let mut leaf = Path2D::new();
+    leaf.move_to(0.0, 0.0);
+    leaf.curve_to(20.0, -30.0, 50.0, -30.0, 60.0, 0.0);
+    leaf.curve_to(50.0, 30.0, 20.0, 30.0, 0.0, 0.0);
+    leaf.close_path();
+    canvas_api.push(ctx.clone().translate(410.0, 330.0).fill_stroke_path(&leaf));
+
+    // 四分之三圆环：Path2D::arc（内部用 ≤90° 的三次贝塞尔近似），仅描边。
+    let mut ring = Path2D::new();
+    ring.arc(0.0, 0.0, 18.0, 0.0, std::f64::consts::TAU * 0.75);
+    canvas_api.push(
+        ctx.clone()
+            .with_line(Color::rgb(0xc0, 0x39, 0x2b), 3.0)
+            .with_dash(vec![5.0, 3.0], 0.0)
+            .translate(500.0, 330.0)
+            .stroke(&ring),
+    );
+
+    // 富文本：同一段文本内混排多种样式（Canvas 的 fillText 做不到）。
+    let rich = vec![
+        lievisual::RichSpan::new(
+            "Canvas-like ",
+            TextStyle::new(Color::rgb(0x2c, 0x3e, 0x50), 14.0, "sans-serif")
+                .with_weight(lievisual::FontWeight::Bold),
+        ),
+        lievisual::RichSpan::new(
+            "builder · Path2D",
+            TextStyle::new(Color::rgb(0x7f, 0x8c, 0x8d), 14.0, "sans-serif"),
+        ),
+    ];
+    let m = ctx.measure_rich_text(&rich);
+    canvas_api.push(ctx.fill_rich_text(410.0 - m.size.width / 2.0 + 30.0, 375.0, rich));
+
+    // 图层顺序（从底到顶）：默认层 nodes → shapes → pie → canvas-api → labels
     scene.push_layer(shapes);
     scene.push_layer(pie);
+    scene.push_layer(canvas_api);
     scene.push_layer(labels);
 
     scene
@@ -232,7 +277,9 @@ fn main() {
     let scene = build_scene();
 
     // SVG 输出（render_scene 会自动捕获 scene 的 title/description/scale 与各图层）
-    let mut svg = SvgRenderer::new(scene.width, scene.height).with_background(scene.background);
+    // 两个后端同一契约：构造尺寸 = 输出尺寸，故这里显式乘 scale 得到 2× 画布。
+    let mut svg = SvgRenderer::new(scene.width * scene.scale, scene.height * scene.scale)
+        .with_background(scene.background);
     scene.render(&mut svg);
     let svg_str = svg.into_string();
     std::fs::write("demo.svg", &svg_str).expect("写 SVG 失败");
@@ -267,7 +314,7 @@ fn main() {
     // PNG 输出
     {
         use lievisual::render::VelloPixmapRenderer;
-        // scale 提升栅格分辨率。
+        // 与 SVG 端同一契约：构造尺寸 = 输出尺寸，乘 scale 提升栅格分辨率。
         let mut renderer = VelloPixmapRenderer::new(
             (scene.width * scene.scale) as u32,
             (scene.height * scene.scale) as u32,

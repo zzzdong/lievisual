@@ -21,10 +21,10 @@
 //!
 //! The implementation is split so each concern is a small, focused module (there is no
 //! single monolithic `measure` layer):
-//! - [`style`] — style / alignment / baseline enums and [`TextMetrics`].
-//! - [`layout`] — glyph-level layout IR ([`Glyph`], [`TextRun`], [`TextLine`], [`TextLayout`],
+//! - `style` — style / alignment / baseline enums and [`TextMetrics`].
+//! - `layout` — glyph-level layout IR ([`Glyph`], [`TextRun`], [`TextLine`], [`TextLayout`],
 //!   [`RichSpan`], [`TextStyle`], [`TextMeasure`]) and font-family normalization.
-//! - [`engine`] — the parley-backed layout engine, font registry, and text-offset math.
+//! - `engine` — the parley-backed layout engine, font registry, and text-offset math.
 
 mod engine;
 pub mod glyph;

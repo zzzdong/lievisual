@@ -106,7 +106,7 @@ pub struct TextLine {
 
 /// Rich-text layout result — holds the laid-out set of lines.
 ///
-/// Produced by [`layout_text`] / [`measure_text`], it is **self-contained**: it does not
+/// Produced by [`crate::layout_text`] / [`crate::measure_text`], it is **self-contained**: it does not
 /// depend on parley's lifetime because `font_data` embeds the font bytes and
 /// `glyphs[].cluster` is a local offset relative to the run text. Downstream (e.g. the PDF
 /// / SVG backends of liepress) can simply iterate `lines` to draw, without touching parley
@@ -131,7 +131,7 @@ impl TextLayout {
     /// The ink bounding box of the actual glyphs (outline bbox, relative to the layout
     /// origin).
     ///
-    /// Computed during layout in [`layout_text`] / [`measure_text`] from per-glyph outlines
+    /// Computed during layout in [`crate::layout_text`] / [`crate::measure_text`] from per-glyph outlines
     /// via skrifa. It is a closer fit to the true visual boundary than parley's
     /// `LineMetrics` (which carry ascent / descent design margins), and is used for text
     /// vertical centering (e.g. `visual_height`).

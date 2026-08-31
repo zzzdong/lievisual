@@ -1,6 +1,7 @@
 ﻿    use super::*;
     use crate::geometry::{Color, Rect, Size};
     use crate::text::style::HANGING_ASCENT_RATIO;
+    use parley::fontique::{Collection, CollectionOptions, SourceCache};
     use parley::style::FontFamily;
     use parley::{FontContext, LayoutContext, StyleProperty};
     use std::cell::RefCell;
@@ -14,15 +15,45 @@
     // `Arc`.
     static FONT_BYTE_CACHE: OnceLock<Mutex<HashMap<u64, Arc<Vec<u8>>>>> = OnceLock::new();
 
+    // Process-wide font **collection** (`shared: true` makes every clone observe later
+    // registrations). Each thread's `FontContext` is built from a clone of it, so a font
+    // registered on one thread is visible on all threads (including ones started later) —
+    // with a plain per-thread `FontContext::new()` the registration stayed thread-local and
+    // worker threads silently fell back to a default font.
+    static GLOBAL_FONT_COLLECTION: OnceLock<Mutex<Collection>> = OnceLock::new();
+
+    /// The process-wide font collection (system fonts + everything ever registered).
+    fn global_font_collection() -> &'static Mutex<Collection> {
+        GLOBAL_FONT_COLLECTION.get_or_init(|| {
+            Mutex::new(Collection::new(CollectionOptions {
+                shared: true,
+                ..Default::default()
+            }))
+        })
+    }
+
+    /// Build a fresh `FontContext` sharing the global collection.
+    fn new_font_context() -> FontContext {
+        let collection = global_font_collection()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        FontContext {
+            collection,
+            source_cache: SourceCache::default(),
+        }
+    }
+
     // One cached layout context per thread: lazily initialized, reused by every
     // measurement / layout within the thread. parley's official guidance designs
     // FontContext (font library + LRU source cache) and LayoutContext (scratch + glyph
     // cache) as "one per application / per thread"; thread_local realizes that semantics and
     // avoids the system-font scanning and allocation of rebuilding each time. Every
     // parley-related operation goes through with_cached_context to reuse this same pair of
-    // instances; threads are independent (separate instances, no synchronization needed).
+    // instances; the font collection behind them is shared process-wide (see
+    // `global_font_collection`).
     thread_local! {
-        static FONT_CONTEXT: RefCell<FontContext> = RefCell::new(FontContext::new());
+        static FONT_CONTEXT: RefCell<FontContext> = RefCell::new(new_font_context());
         static LAYOUT_CONTEXT: RefCell<LayoutContext<Color>> = RefCell::new(LayoutContext::new());
     }
 
@@ -710,11 +741,12 @@
         Memory(Vec<u8>),
     }
 
-    /// Register a custom font into the global font context.
+    /// Register a custom font into the process-wide font collection.
     ///
     /// Once loaded, the font can be referenced by its `font_family` name in text styles.
-    /// Because all layout goes through this crate's thread-local context, registering once
-    /// is shared by both measurement and rendering.
+    /// Registration is visible to **every** thread (each thread's context is a clone of the
+    /// shared collection), so it covers measurement and rendering alike, including threads
+    /// started after the registration.
     pub fn register_font(
         source: FontSource,
         family_name_override: Option<&str>,
@@ -754,14 +786,21 @@
             ..Default::default()
         });
 
+        // Register into the process-wide (shared) collection: every clone — including the
+        // current thread's and those created by threads started later — observes it.
+        let mut collection = global_font_collection()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let registered = collection.register_fonts(data, override_info);
+        if let Some(generic) = generic_family {
+            let ids: Vec<_> = registered.into_iter().map(|(id, _)| id).collect();
+            collection.append_generic_families(generic, ids.into_iter());
+        }
+        drop(collection);
+        // Touch the thread-local context once so it pulls the new shared state (fontique
+        // syncs lazily on the next query; this makes it deterministic for the caller).
         with_cached_context(|font_cx, _| {
-            let registered = font_cx.collection.register_fonts(data, override_info);
-            if let Some(generic) = generic_family {
-                let ids: Vec<_> = registered.into_iter().map(|(id, _)| id).collect();
-                font_cx
-                    .collection
-                    .append_generic_families(generic, ids.into_iter());
-            }
+            let _ = font_cx.collection.family_names().count();
         });
         Ok(())
     }

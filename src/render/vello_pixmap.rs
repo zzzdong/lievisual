@@ -37,19 +37,50 @@ pub struct VelloPixmapRenderer {
     opacity_stack: Vec<f64>,
 }
 
+/// Clamp a canvas dimension (in device pixels) into vello_cpu's `1..=u16::MAX` range.
+///
+/// `RenderContext` / `Pixmap` both take `u16`, so an unclamped `as u16` would silently
+/// truncate (e.g. 70000 → 4464) and produce a wrong-sized canvas.
+fn clamp_canvas(v: f64) -> u16 {
+    if !v.is_finite() || v < 1.0 {
+        1
+    } else {
+        v.round().min(u16::MAX as f64) as u16
+    }
+}
+
+/// Clamp a bitmap dimension (in pixels) into `1..=u16::MAX`.
+fn clamp_px(v: f64) -> u32 {
+    if !v.is_finite() || v < 1.0 {
+        1
+    } else {
+        (v.ceil() as u32).min(u16::MAX as u32)
+    }
+}
+
 impl VelloPixmapRenderer {
+    /// Create a renderer with the given output canvas size (in device pixels).
+    ///
+    /// Sizes above `u16::MAX` are clamped (vello_cpu's canvas limit).
     pub fn new(width: u32, height: u32) -> Self {
+        let w = width.min(u16::MAX as u32);
+        let h = height.min(u16::MAX as u32);
         Self {
-            ctx: RenderContext::new(width as u16, height as u16),
+            ctx: RenderContext::new(w as u16, h as u16),
             resources: Resources::new(),
-            width,
-            height,
+            width: w,
+            height: h,
             background: None,
             transform_stack: Vec::new(),
             opacity_stack: Vec::new(),
         }
     }
 
+    /// Explicit background color; when unset, [`Scene::background`] is used.
+    ///
+    /// A fully transparent color (`Color::TRANSPARENT`) keeps the canvas transparent
+    /// (no background is painted).
+    #[must_use]
     pub fn with_background(mut self, color: Color) -> Self {
         self.background = Some(color);
         self
@@ -60,29 +91,71 @@ impl VelloPixmapRenderer {
     /// Reuses the same `RenderContext` / `Resources` (glyph, atlas caches persist across frames);
     /// `reset()` clears the previous frame's scene before each render, so the same renderer can
     /// render multiple frames repeatedly.
+    ///
+    /// The output canvas is exactly the size given at construction (["renderer size = output
+    /// size"](crate::render::SvgRenderer::into_string), same as the SVG backend). The scene is
+    /// mapped onto the
+    /// logical viewport `输出尺寸 / scene.scale` like SVG's default
+    /// `preserveAspectRatio="xMidYMid meet"` (uniform scale plus centering), then that viewport is
+    /// scaled up by `scene.scale` — i.e. `scale` is a pure *density* knob, never a silent
+    /// enlargement of the canvas.
     pub fn render_scene_to_pixmap(&mut self, scene: &Scene) -> Pixmap {
+        // Output canvas = the size given at construction (clamped to vello_cpu's u16 range).
+        //
+        // Deliberately **not** multiplied by `scene.scale`: downstream (e.g. liepress) builds the
+        // scene at final pixel size and passes `scene.width` straight in while also recording
+        // `scene.scale = dpi / 72` as metadata — applying it here would enlarge the canvas a
+        // second time. Pixel density is the caller's choice via the constructor.
+        let out_w = clamp_canvas(self.width as f64);
+        let out_h = clamp_canvas(self.height as f64);
         // Clear the previous frame's scene and state (including transform/opacity stacks, to
         // avoid residue after an abnormal interruption of the previous frame).
-        self.ctx.reset();
+        if self.ctx.width() != out_w || self.ctx.height() != out_h {
+            self.ctx.reset_and_resize(out_w, out_h);
+        } else {
+            self.ctx.reset();
+        }
         self.transform_stack.clear();
         self.opacity_stack.clear();
 
-        if let Some(bg) = self.background {
-            let rect = VRect::new(0.0, 0.0, self.width as f64, self.height as f64);
+        // Background: fall back to the scene's background (the Scene is the authoritative IR);
+        // skip painting an alpha-0 background so a transparent canvas stays possible.
+        let bg = self.background.unwrap_or(scene.background);
+        if bg.a > 0 {
+            self.ctx
+                .set_transform(vello_cpu::kurbo::Affine::IDENTITY);
+            let rect = VRect::new(0.0, 0.0, out_w as f64, out_h as f64);
             self.ctx.set_paint(self.to_vello(&bg));
             self.ctx.fill_rect(&rect);
         }
-        // Scene coordinates (range scene.width × scene.height) must map to the pixel canvas
-        // (self.width × self.height). The SVG backend relies on viewBox + width/height for the
-        // browser to scale automatically; the vello backend must apply this scale explicitly,
-        // otherwise the graphics would be drawn in the top-left [0,scene.width]×[0,scene.height]
-        // sub-region of the canvas.
-        let s = if scene.width > 0.0 {
-            self.width as f64 / scene.width
+
+        // Scene coordinates (scene.width × scene.height) must map to the pixel canvas
+        // (out_w × out_h), with `scene.scale` acting as the pixel density — the exact contract
+        // of the SVG backend, where the output size is `width/height` and the drawing coordinate
+        // system is `viewBox = 输出尺寸 / scale`:
+        //
+        //   1. scene → viewBox (out/scale), via `preserveAspectRatio="xMidYMid meet"`
+        //      (uniform scale + centering; scaling by width alone would overflow / crop the
+        //      vertical axis whenever the aspect ratios differ).
+        //   2. viewBox → canvas, uniformly by `scale`.
+        let density = if scene.scale.is_finite() && scene.scale > 0.0 {
+            scene.scale
         } else {
             1.0
         };
-        let base = vello_cpu::kurbo::Affine::scale(s);
+        let (vw, vh) = (out_w as f64 / density, out_h as f64 / density);
+        let (s, tx, ty) = if scene.width > 0.0 && scene.height > 0.0 {
+            let s = (vw / scene.width).min(vh / scene.height);
+            (
+                s,
+                (vw - scene.width * s) / 2.0,
+                (vh - scene.height * s) / 2.0,
+            )
+        } else {
+            (1.0, 0.0, 0.0)
+        };
+        let fit = vello_cpu::kurbo::Affine::new([s, 0.0, 0.0, s, tx, ty]);
+        let base = vello_cpu::kurbo::Affine::scale(density) * fit;
         self.ctx.set_transform(base);
         self.transform_stack.push(base);
         // Delegate the default traversal (sorting + Group recursion + node attributes + local
@@ -92,12 +165,15 @@ impl VelloPixmapRenderer {
             self.ctx.set_transform(vello_cpu::kurbo::Affine::IDENTITY);
         }
 
-        let mut pixmap = Pixmap::new(self.width as u16, self.height as u16);
+        let mut pixmap = Pixmap::new(out_w, out_h);
         self.ctx.render(&mut pixmap, &mut self.resources);
         pixmap
     }
 
     /// Render the scene and export PNG bytes (depends on the permanent `png` encoder).
+    ///
+    /// The PNG size equals the renderer's canvas size (see
+    /// [`VelloPixmapRenderer::render_scene_to_pixmap`]); `scene.scale` is not applied.
     pub fn render_png(&mut self, scene: &Scene) -> Vec<u8> {
         let pixmap = self.render_scene_to_pixmap(scene);
         pixmap_to_png(&pixmap)
@@ -111,8 +187,9 @@ impl VelloPixmapRenderer {
     /// Convert to a vello color, multiplying in the current opacity.
     fn to_vello(&self, color: &Color) -> AlphaColor<vello_cpu::color::Srgb> {
         // `color` stores exact 8-bit channels; only the alpha is modulated by opacity.
+        // Round (instead of truncating) so e.g. 50% opacity maps to 128 rather than 127.
         let a = (color.a as f64 / 255.0 * self.current_opacity()).clamp(0.0, 1.0);
-        AlphaColor::from_rgba8(color.r, color.g, color.b, (a * 255.0) as u8)
+        AlphaColor::from_rgba8(color.r, color.g, color.b, (a * 255.0).round() as u8)
     }
 
     fn kurbo_stroke(stroke: &Stroke) -> KurboStroke {
@@ -314,6 +391,12 @@ impl Renderer for VelloPixmapRenderer {
         if src.width() == 0 || src.height() == 0 {
             return;
         }
+        // 图片自身的 opacity 与节点 / 图层的 opacity 复合（其它图元都经 to_vello 乘入
+        // 当前 opacity；此前图片只用了自身 opacity，导致节点 opacity 对图片无效）。
+        let op = (opacity * self.current_opacity()).clamp(0.0, 1.0);
+        if op <= 0.0 {
+            return;
+        }
 
         // frame 已处于 px 坐标（场景坐标即 px）；直接换算到设备像素。
         let fx = frame.min_x();
@@ -339,17 +422,52 @@ impl Renderer for VelloPixmapRenderer {
             }
         };
 
+        // 画布之外的图片无需绘制：先做可见性剔除，省掉后续的大块位图分配与 blit。
+        let t = self.current_transform();
+        let (canvas_w, canvas_h) = (self.ctx.width() as f64, self.ctx.height() as f64);
+        let corners = [
+            t * VPoint::new(fx, fy),
+            t * VPoint::new(fx + fw, fy),
+            t * VPoint::new(fx, fy + fh),
+            t * VPoint::new(fx + fw, fy + fh),
+        ];
+        let (min_x, max_x) = corners
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| {
+                (a.min(p.x), b.max(p.x))
+            });
+        let (min_y, max_y) = corners
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| {
+                (a.min(p.y), b.max(p.y))
+            });
+        if max_x <= 0.0 || min_x >= canvas_w || max_y <= 0.0 || min_y >= canvas_h {
+            return;
+        }
+
+        // 中间位图的像素上限：frame / dest 以场景坐标给出，乘当前变换的实际缩放
+        // （|det|^0.5）折算到设备像素。极端 frame（如 65535×65535）或"极小图 + Cover"
+        // 会放大出 GB 级位图，这里统一按 1/k 降采样（k=1 时行为完全不变）。
+        let mag = t.determinant().abs().sqrt().max(1e-6);
+        let cap = (canvas_w * canvas_h * 4.0)
+            .clamp(16.0 * 1024.0 * 1024.0, 64.0 * 1024.0 * 1024.0);
+        let area = (dw * dh).max(fw * fh) * mag * mag;
+        let k = if area > cap {
+            (area / cap).sqrt().ceil().max(1.0)
+        } else {
+            1.0
+        };
+
         // 目标帧位图（frame 大小，透明底）；cover/none 时图片可能溢出 frame，
         // 用 fill_rect 的裁剪范围（frame）裁掉溢出部分，省去显式 clip。
-        let frame_w = (fw.ceil() as u32).max(1).min(u16::MAX as u32);
-        let frame_h = (fh.ceil() as u32).max(1).min(u16::MAX as u32);
-        let dest_w = (dw.ceil() as u32).max(1).min(u16::MAX as u32);
-        let dest_h = (dh.ceil() as u32).max(1).min(u16::MAX as u32);
+        let frame_w = clamp_px(fw / k);
+        let frame_h = clamp_px(fh / k);
+        let dest_w = clamp_px(dw / k);
+        let dest_h = clamp_px(dh / k);
         // 缩放源位图（RGBA8）到目标尺寸。
         let rgba = resize_rgba8(src.pixels(), src.width(), src.height(), dest_w, dest_h);
 
         // 应用整体 opacity：预乘到 alpha 通道（frame 透明底，src-over 合成正确）。
-        let op = opacity.clamp(0.0, 1.0);
         let mut dest_pixels: Vec<vello_cpu::color::PremulRgba8> = vec![
                 vello_cpu::color::PremulRgba8::from_u8_array([0, 0, 0, 0]);
                 (frame_w * frame_h) as usize
@@ -360,19 +478,21 @@ impl Renderer for VelloPixmapRenderer {
             .iter()
             .map(|p| {
                 let [r, g, b, a] = [p[0], p[1], p[2], p[3]];
-                let a = ((a as f64) * op) as u8;
+                // 四舍五入而非截断，减少大批量像素上的系统性偏暗。
+                let a = ((a as f64) * op).round() as u8;
                 vello_cpu::color::PremulRgba8 {
-                    r: ((a as u32 * r as u32) / 255) as u8,
-                    g: ((a as u32 * g as u32) / 255) as u8,
-                    b: ((a as u32 * b as u32) / 255) as u8,
+                    r: premul(r, a),
+                    g: premul(g, a),
+                    b: premul(b, a),
                     a,
                 }
             })
             .collect();
 
         // 把缩放后的图片 blit 到 frame 位图（考虑 offx/offy，越界部分被 frame 裁剪）。
-        let ox = offx.floor() as i64;
-        let oy = offy.floor() as i64;
+        // 位图按 1/k 分辨率栅格化，故偏移量同样除以 k。
+        let ox = (offx / k).floor() as i64;
+        let oy = (offy / k).floor() as i64;
         for row in 0..(dest_h as i64) {
             let dy = row + oy;
             if dy < 0 || dy >= frame_h as i64 {
@@ -396,11 +516,14 @@ impl Renderer for VelloPixmapRenderer {
             sampler: vello_cpu::peniko::ImageSampler::default(),
         };
         self.ctx.set_paint(brush);
-        // Image paint 以 pixmap 像素坐标 (0,0) 起始绘制；用 paint transform 把它
-        // 平移到 frame 原点（frame 大小即为裁剪框）。
+        // Image paint 以 pixmap 像素坐标 (0,0) 起始绘制；用 paint transform 把它平移到
+        // frame 原点（frame 大小即为裁剪框）。位图按 1/k 分辨率栅格化，故再放大 k 倍
+        // 铺回原尺寸的 frame（k=1 时等价于纯平移）。
         let rect = VRect::new(fx, fy, fx + fw, fy + fh);
-        self.ctx
-            .set_paint_transform(vello_cpu::kurbo::Affine::translate((fx, fy)));
+        self.ctx.set_paint_transform(
+            vello_cpu::kurbo::Affine::translate((fx, fy))
+                * vello_cpu::kurbo::Affine::scale(k),
+        );
         self.ctx.fill_rect(&rect);
         self.ctx.reset_paint_transform();
     }
@@ -520,14 +643,39 @@ impl Renderer for VelloPixmapRenderer {
     }
 }
 
-/// 将 vello Pixmap 转为 PNG 字节（RGBA8 → PNG，经 `png` 常驻依赖）。
+/// 预乘 alpha 的分量还原为直通（非预乘）分量：`c = premul_c * 255 / a`（四舍五入）。
+///
+/// vello 的 `Pixmap` 保存的是 **预乘** alpha 像素，而 PNG（以及本 crate 的
+/// [`crate::Pixmap`] RGBA8 约定）使用非预乘 alpha：直接把预乘值写进 PNG 会让所有
+/// alpha<255 的像素（抗锯齿边缘、半透明填充、文字边缘）整体偏暗。
+fn unpremultiply(c: u8, a: u8) -> u8 {
+    if a == 0 {
+        0
+    } else if a == 255 {
+        c
+    } else {
+        (((c as u32 * 255) + (a as u32 / 2)) / a as u32).min(255) as u8
+    }
+}
+
+/// vello Pixmap → 非预乘 RGBA8 字节。
+fn pixmap_to_rgba8(pixmap: &Pixmap) -> Vec<u8> {
+    let mut data = Vec::with_capacity(pixmap.data().len() * 4);
+    for p in pixmap.data() {
+        data.extend_from_slice(&[
+            unpremultiply(p.r, p.a),
+            unpremultiply(p.g, p.a),
+            unpremultiply(p.b, p.a),
+            p.a,
+        ]);
+    }
+    data
+}
+
+/// 将 vello Pixmap 转为 PNG 字节（预乘 RGBA → 非预乘 RGBA8 → PNG，经 `png` 常驻依赖）。
 fn pixmap_to_png(pixmap: &Pixmap) -> Vec<u8> {
     let (w, h) = (pixmap.width() as u32, pixmap.height() as u32);
-    let data: Vec<u8> = pixmap
-        .data()
-        .iter()
-        .flat_map(|p| vec![p.r, p.g, p.b, p.a])
-        .collect();
+    let data = pixmap_to_rgba8(pixmap);
     let mut out = Vec::with_capacity(data.len() + 64);
     {
         let mut enc = png::Encoder::new(&mut out, w, h);
@@ -541,9 +689,17 @@ fn pixmap_to_png(pixmap: &Pixmap) -> Vec<u8> {
     out
 }
 
+/// 通道值按 alpha 预乘（`c * a / 255`，四舍五入）。
+fn premul(c: u8, a: u8) -> u8 {
+    ((c as u32 * a as u32 + 127) / 255).min(255) as u8
+}
+
 /// 双线性缩放 RGBA8 位图（`src` 尺寸 `sw×sh` → `dw×dh`）。
 ///
 /// 用双线性插值替代 `image` 的 `resize_exact`（移除解码依赖后自实现，够图表场景用）。
+///
+/// 插值在 **预乘** 空间进行：直通 RGBA 直接插值会让半透明像素与透明像素混合出偏暗的
+/// 边缘（halo），预乘后再插值、最后还原为直通值是正确做法。
 fn resize_rgba8(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     if sw == dw && sh == dh {
         return src.to_vec();
@@ -567,10 +723,27 @@ fn resize_rgba8(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
             let p10 = &src[((y1 * sw + x0) as usize) * 4..];
             let p11 = &src[((y1 * sw + x1) as usize) * 4..];
             let out_idx = ((dy * dw + dx) as usize) * 4;
-            for c in 0..4 {
-                let top = p00[c] as f64 * (1.0 - wx) + p01[c] as f64 * wx;
-                let bot = p10[c] as f64 * (1.0 - wx) + p11[c] as f64 * wx;
-                out[out_idx + c] = (top * (1.0 - wy) + bot * wy).round() as u8;
+            // 采样点先按各自 alpha 预乘，再对 RGB 插值。
+            let premul = |px: &[u8]| -> [f64; 3] {
+                let a = px[3] as f64 / 255.0;
+                [
+                    px[0] as f64 * a,
+                    px[1] as f64 * a,
+                    px[2] as f64 * a,
+                ]
+            };
+            let (q00, q01, q10, q11) = (premul(p00), premul(p01), premul(p10), premul(p11));
+            // alpha 通道单独做直通插值。
+            let a_top = p00[3] as f64 * (1.0 - wx) + p01[3] as f64 * wx;
+            let a_bot = p10[3] as f64 * (1.0 - wx) + p11[3] as f64 * wx;
+            let a = (a_top * (1.0 - wy) + a_bot * wy).round().clamp(0.0, 255.0) as u8;
+            out[out_idx + 3] = a;
+            for c in 0..3 {
+                let top = q00[c] * (1.0 - wx) + q01[c] * wx;
+                let bot = q10[c] * (1.0 - wx) + q11[c] * wx;
+                let v = (top * (1.0 - wy) + bot * wy).round().clamp(0.0, 255.0) as u8;
+                // 由预乘值还原为直通值。
+                out[out_idx + c] = unpremultiply(v, a);
             }
         }
     }
@@ -583,13 +756,16 @@ mod tests {
     use crate::geometry::{Color, Point, Rect, Transform};
     use crate::scene::{Element, FillStrokeStyle, GradientStop, LinearGradient, Scene, SceneNode};
 
-    /// 提取 pixmap 像素为 RGBA u8 数组（用于比较）。
+    /// 提取 pixmap 像素为 RGBA u8 数组（非预乘，用于比较）。
     fn pixels(pixmap: &Pixmap) -> Vec<u8> {
-        pixmap
-            .data()
-            .iter()
-            .flat_map(|p| vec![p.r, p.g, p.b, p.a])
-            .collect()
+        pixmap_to_rgba8(pixmap)
+    }
+
+    /// 渲染并解码为 RGBA8（走 render_png 全链路，覆盖 PNG 编码）。
+    fn render_png_pixels(renderer: &mut VelloPixmapRenderer, scene: &Scene) -> (u32, u32, Vec<u8>) {
+        let png = renderer.render_png(scene);
+        let pm = crate::Pixmap::decode_png(&png).expect("PNG 解码失败");
+        (pm.width(), pm.height(), pm.pixels().to_vec())
     }
 
     /// 一个横跨矩形、左右颜色差异明显的线性渐变矩形。
@@ -953,5 +1129,193 @@ mod tests {
             lr > 240 && lg > 240 && lb > 240,
             "角落应为白, got ({lr},{lg},{lb})"
         );
+    }
+
+    /// Bug 回归：PNG 输出必须是 **非预乘** alpha。
+    ///
+    /// vello 的 Pixmap 保存预乘像素，直接写入 PNG 会让所有 alpha<255 的像素
+    /// （抗锯齿边缘 / 半透明填充 / 文字边缘）整体偏暗。
+    #[test]
+    fn png_output_is_unpremultiplied() {
+        let mut scene = Scene::new(4.0, 4.0).with_background(Color::TRANSPARENT);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 4.0, 4.0),
+            FillStrokeStyle::fill(Color::rgba(0xff, 0x00, 0x00, 128)),
+        ));
+        let mut r = VelloPixmapRenderer::new(4, 4);
+        let (w, h, data) = render_png_pixels(&mut r, &scene);
+        assert_eq!((w, h), (4, 4));
+        let i = ((2 * w + 2) * 4) as usize;
+        let (pr, pg, pb, pa) = (data[i], data[i + 1], data[i + 2], data[i + 3]);
+        assert!(
+            pr > 240 && pg < 20 && pb < 20 && pa.abs_diff(128) <= 2,
+            "50% 红应输出非预乘的 (255,0,0,128), got ({pr},{pg},{pb},{pa})"
+        );
+    }
+
+    /// Bug 回归：图片的最终透明度 = 图片自身 opacity × 节点 / 图层 opacity。
+    #[test]
+    fn image_opacity_composes_with_node_opacity() {
+        // 4×4 不透明白图，节点 opacity = 0.5，画在黑底上 → 中灰。
+        let img = crate::SceneImage::from_rgba8(4, 4, vec![0xffu8; 4 * 4 * 4]).unwrap();
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(
+            SceneNode::new(Element::image(img, Rect::new(0.0, 0.0, 20.0, 20.0)))
+                .with_opacity(0.5),
+        );
+        let mut r = VelloPixmapRenderer::new(20, 20).with_background(Color::BLACK);
+        let (w, _, data) = render_png_pixels(&mut r, &scene);
+        let i = ((10 * w + 10) * 4) as usize;
+        let (pr, pg, pb, _) = (data[i], data[i + 1], data[i + 2], data[i + 3]);
+        let mid = |c: u8| (100..=160).contains(&c);
+        assert!(
+            mid(pr) && mid(pg) && mid(pb),
+            "半透明白图叠黑底应为中灰, got ({pr},{pg},{pb})"
+        );
+    }
+
+    /// 契约锁定：输出画布 = 构造时给定的尺寸，`scene.scale` **不参与**光栅画布计算。
+    ///
+    /// 下游（liepress）把场景按最终像素尺寸构造（`scene.width = page_w * (dpi/72)`）并
+    /// 记录 `scene.scale = dpi/72` 作为元数据，再把 `scene.width` 直接传进来；若这里再乘
+    /// 一次 scale，输出会被二次放大（dpi=144 时面积 ×4）。像素密度由调用方通过构造器
+    /// 决定。
+    #[test]
+    fn renderer_size_defines_output_canvas_regardless_of_scene_scale() {
+        let mut scene = Scene::new(100.0, 100.0).with_scale(2.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+        ));
+        let mut r = VelloPixmapRenderer::new(100, 100).with_background(Color::WHITE);
+        let (w, h, _) = render_png_pixels(&mut r, &scene);
+        assert_eq!(
+            (w, h),
+            (100, 100),
+            "scene.scale=2 时输出画布仍应为 100×100（scale 是密度而非放大）"
+        );
+    }
+
+    /// 契约锁定（跨后端）：`scale` 是**密度**，两个后端语义完全一致。
+    ///
+    /// 场景坐标 = 输出尺寸 / scale。故"场景 100×100 + scale=2"分别用
+    /// `new(200,200)`（vello）与 `new(200.0,200.0)`（SVG）渲染时，内容都应占满整块画布，
+    /// 且输出尺寸都是 200×200 —— 而不是 100×100 或 400×400。
+    #[test]
+    fn scale_is_density_identical_on_both_backends() {
+        let mut scene = Scene::new(100.0, 100.0).with_scale(2.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+        ));
+
+        // 光栅端：输出 200×200，内容铺满（scene 100 → 视口 100 → ×2）。
+        let mut r = VelloPixmapRenderer::new(200, 200).with_background(Color::WHITE);
+        let (w, h, data) = render_png_pixels(&mut r, &scene);
+        assert_eq!((w, h), (200, 200));
+        for (x, y) in [(5u32, 5u32), (195, 195), (100, 100)] {
+            let i = ((y * w + x) * 4) as usize;
+            assert!(
+                data[i] > 200 && data[i + 1] < 60 && data[i + 2] < 60,
+                "({x},{y}) 应为红（内容铺满画布）, got {:?}",
+                &data[i..i + 4]
+            );
+        }
+
+        // SVG 端：同样的构造尺寸 → 同样的输出尺寸与用户坐标系。
+        let mut svg = crate::render::SvgRenderer::new(200.0, 200.0);
+        scene.render(&mut svg);
+        let out = svg.into_string();
+        assert!(
+            out.contains(r#"width="200.00" height="200.00" viewBox="0 0 100.00 100.00""#),
+            "SVG 端应与光栅端一致, 实际: {out}"
+        );
+    }
+
+    /// 契约锁定：构造尺寸 == 场景尺寸时（下游 liepress 的用法），两个后端都是 1:1 铺满，
+    /// 不受 `scene.scale` 影响（liepress 已把坐标乘过 scale 了）。
+    #[test]
+    fn preset_output_size_with_density_scale_maps_one_to_one() {
+        // liepress 形态：场景坐标已是最终像素（= 逻辑尺寸 × scale），scale=2 仅作元数据。
+        let mut scene = Scene::new(200.0, 100.0).with_scale(2.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 200.0, 100.0),
+            FillStrokeStyle::fill(Color::rgb(0x00, 0x00, 0xff)),
+        ));
+        let mut r = VelloPixmapRenderer::new(200, 100).with_background(Color::WHITE);
+        let (w, h, data) = render_png_pixels(&mut r, &scene);
+        assert_eq!((w, h), (200, 100), "构造尺寸即输出尺寸");
+        let i = ((50 * w + 100) * 4) as usize;
+        assert!(
+            data[i] < 60 && data[i + 2] > 200,
+            "内容应 1:1 铺满画布, got {:?}",
+            &data[i..i + 4]
+        );
+    }
+
+    /// Bug 回归：画布与场景长宽比不一致时，按 SVG 默认的
+    /// `preserveAspectRatio="xMidYMid meet"` 等比缩放并居中（此前只按宽度缩放，
+    /// 纵向会溢出/裁切，与 SVG 输出不一致）。
+    #[test]
+    fn aspect_mismatch_uses_meet_and_centers() {
+        let mut scene = Scene::new(100.0, 100.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 50.0, 50.0),
+            FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+        ));
+        // 画布 200×100、场景 100×100 → meet 取 s=1，水平居中 → 方块占 x∈[50,100]。
+        let mut r = VelloPixmapRenderer::new(200, 100).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let (cr, cg, cb, _) = pixel_at(&pix, 60, 25);
+        assert!(
+            cr > 200 && cg < 60 && cb < 60,
+            "居中后的方块内应为红, got ({cr},{cg},{cb})"
+        );
+        // 居中留白区（x=10）与纵向（y=75，场景外）应为白。
+        let (lr, lg, lb, _) = pixel_at(&pix, 10, 25);
+        assert!(
+            lr > 240 && lg > 240 && lb > 240,
+            "左侧留白应为白, got ({lr},{lg},{lb})"
+        );
+        let (br, bg, bb, _) = pixel_at(&pix, 60, 75);
+        assert!(
+            br > 240 && bg > 240 && bb > 240,
+            "纵向未裁切区应为白, got ({br},{bg},{bb})"
+        );
+    }
+
+    /// 极端 frame 不应导致超大中间位图分配（降采样后仍能画出图片）。
+    #[test]
+    fn huge_image_frame_is_downscaled() {
+        // 1×1 的图 + Cover + 巨大 frame：放大倍数极高，必须被像素上限压住。
+        let img = crate::SceneImage::from_rgba8(1, 1, vec![0xffu8; 4])
+            .unwrap()
+            .with_object_fit(crate::ObjectFit::Cover);
+        let mut scene = Scene::new(40.0, 40.0);
+        scene.push(Element::image(img, Rect::new(0.0, 0.0, 50000.0, 50000.0)));
+        let mut r = VelloPixmapRenderer::new(40, 40).with_background(Color::BLACK);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let (cr, cg, cb, _) = pixel_at(&pix, 20, 20);
+        assert!(
+            cr > 200 && cg > 200 && cb > 200,
+            "放大后的白色图片应铺满画布, got ({cr},{cg},{cb})"
+        );
+    }
+
+    /// 画布之外的图片应被直接剔除（不产生任何像素）。
+    #[test]
+    fn offscreen_image_is_culled() {
+        let img = crate::SceneImage::from_rgba8(4, 4, vec![0xffu8; 4 * 4 * 4]).unwrap();
+        let mut scene = Scene::new(100.0, 100.0);
+        scene.push(Element::image(img, Rect::new(500.0, 500.0, 600.0, 600.0)));
+        let mut r = VelloPixmapRenderer::new(100, 100).with_background(Color::BLACK);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let white = pixels(&pix)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200)
+            .count();
+        assert_eq!(white, 0, "画布外图片不应产生像素");
     }
 }

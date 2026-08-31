@@ -34,6 +34,7 @@
 //! geometry types of vello / parley; [`Color`] / [`Transform`] are defined by lievisual itself.
 
 pub mod builder;
+pub mod fit;
 pub mod geometry;
 pub mod pixmap;
 pub mod render;
@@ -52,10 +53,11 @@ pub use geometry::{
     Affine, Arc, ArcAppendIter, Axis, BezPath, Circle, CirclePathIter, CircleSegment, Color,
     CubicBez, CubicBezIter, CuspType, Diagonal2, Ellipse, Insets, Line, LineIntersection,
     LinePathIter, MinDistance, Moments, PathEl, PathSeg, PathSegIter, Point, PointExt, QuadBez,
-    QuadBezIter, QuadSpline, Rect, RectExt, RectPathIter, RoundedRect, RoundedRectPathIter,
+    QuadBezIter, QuadSpline, Rect, RectPathIter, RoundedRect, RoundedRectPathIter,
     RoundedRectRadii, Segments, Shape, Size, Transform, TranslateScale, Triangle, TrianglePathIter,
     Vec2,
 };
+pub use fit::{FitOptions, fit_scene, scene_bounds};
 pub use pixmap::Pixmap;
 pub use scene::{
     Clip, Element, Fill, FillStrokeStyle, GradientStop, Layer, LineCap, LineJoin, LinearGradient,
