@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] — 2026-08-31
+## [0.2.0-beta.1] — 2026-08-31
 
-A release focused on **cross-backend consistency** (SVG and raster must agree), **text
-correctness**, and a much larger **Canvas-like construction API**.
+首个 0.2 预发布，供下游（liemermaid / liepress / liecharts）实机验证破坏性变更。
+验证通过后内容原样转为 0.2.0 正式版。
+
+A pre-release of 0.2.0, focused on **cross-backend consistency** (SVG and raster must agree),
+**text correctness**, and a much larger **Canvas-like construction API**.
 
 ### Added
 
@@ -139,4 +142,5 @@ primitive and reads worse — so a wholesale rewrite is *not* recommended. Inste
    mechanical migration a net loss.
 
 [Unreleased]: https://github.com/zzzdong/lievisual/compare/v0.2.0...HEAD
+[0.2.0-beta.1]: https://github.com/zzzdong/lievisual/compare/v0.1.4...v0.2.0-beta.1
 [0.2.0]: https://github.com/zzzdong/lievisual/compare/v0.1.4...v0.2.0
