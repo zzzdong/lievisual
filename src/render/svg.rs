@@ -150,11 +150,13 @@ impl Renderer for SvgRenderer {
         self.title = scene.title.clone();
         self.description = scene.description.clone();
         // scale: an explicit renderer value wins, otherwise the scene's.
-        let scale = self.scale.unwrap_or(if scene.scale.is_finite() && scene.scale > 0.0 {
-            scene.scale
-        } else {
-            1.0
-        });
+        let scale = self
+            .scale
+            .unwrap_or(if scene.scale.is_finite() && scene.scale > 0.0 {
+                scene.scale
+            } else {
+                1.0
+            });
         self.scale = Some(scale);
         if self.background.is_none() {
             self.background = Some(scene.background);
@@ -736,10 +738,7 @@ fn stop_svg(s: &GradientStop) -> String {
     let opacity = if s.color.a == 255 {
         String::new()
     } else {
-        format!(
-            r#" stop-opacity="{:.3}""#,
-            s.color.a as f64 / 255.0
-        )
+        format!(r#" stop-opacity="{:.3}""#, s.color.a as f64 / 255.0)
     };
     format!(
         r##"<stop offset="{:.3}" stop-color="#{:02x}{:02x}{:02x}"{} />"##,
@@ -1377,7 +1376,9 @@ mod tests {
         let el = Element::text("Hello World", Point::new(10.0, 40.0), style);
         // 无可用字体时排版为空，跳过（沙箱 / 精简镜像中可能没有字体）。
         let measured_w = match &el {
-            Element::Text { layout: Some(l), .. } => l.width,
+            Element::Text {
+                layout: Some(l), ..
+            } => l.width,
             _ => return,
         };
 

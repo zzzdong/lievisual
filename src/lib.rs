@@ -49,6 +49,7 @@ pub use parley;
 // re-export kurbo
 pub use kurbo;
 
+pub use fit::{FitOptions, fit_scene, scene_bounds};
 pub use geometry::{
     Affine, Arc, ArcAppendIter, Axis, BezPath, Circle, CirclePathIter, CircleSegment, Color,
     CubicBez, CubicBezIter, CuspType, Diagonal2, Ellipse, Insets, Line, LineIntersection,
@@ -57,7 +58,6 @@ pub use geometry::{
     RoundedRectRadii, Segments, Shape, Size, Transform, TranslateScale, Triangle, TrianglePathIter,
     Vec2,
 };
-pub use fit::{FitOptions, fit_scene, scene_bounds};
 pub use pixmap::Pixmap;
 pub use scene::{
     Clip, Element, Fill, FillStrokeStyle, GradientStop, Layer, LineCap, LineJoin, LinearGradient,

@@ -1,4 +1,4 @@
-﻿//! Text layout support (modeled after the Web Canvas text API).
+//! Text layout support (modeled after the Web Canvas text API).
 //!
 //! Maps onto the Web Canvas `CanvasRenderingContext2D` text API:
 //! - [`TextStyle`] corresponds to `ctx.font` (`font-style` / `font-weight` / `font-size` /
@@ -665,4 +665,3 @@ pub enum TextDecoration {
     /// Strikethrough.
     LineThrough,
 }
-

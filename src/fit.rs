@@ -112,12 +112,18 @@ pub fn element_bounds(element: &Element) -> Option<Rect> {
             sweep_angle: _,
             style,
         } => circle_box(*center, *radius, style.stroke.as_ref()),
-        Element::Path { path, style, .. } => inflate_opt(path.bounding_box(), style.stroke.as_ref()),
+        Element::Path { path, style, .. } => {
+            inflate_opt(path.bounding_box(), style.stroke.as_ref())
+        }
         Element::GradientPath {
-            path, gradient: _, stroke,
+            path,
+            gradient: _,
+            stroke,
         } => inflate_opt(path.bounding_box(), stroke.as_ref()),
         Element::Image {
-            image, frame, opacity: _,
+            image,
+            frame,
+            opacity: _,
         } => {
             // `Contain` / `Cover` / `Fill` all stay inside `frame` (`Cover` is clipped to it);
             // `None` places the bitmap at its **original pixel size** from the frame's top-left,
@@ -223,7 +229,12 @@ fn arc_box(center: Point, radii: Vec2, start_angle: f64, sweep_angle: f64) -> Re
     };
     let mut pts = vec![at(start_angle), at(start_angle + sweep_angle)];
     if lo.is_finite() && hi.is_finite() {
-        for k in [0.0, std::f64::consts::PI, std::f64::consts::FRAC_PI_2, -std::f64::consts::FRAC_PI_2] {
+        for k in [
+            0.0,
+            std::f64::consts::PI,
+            std::f64::consts::FRAC_PI_2,
+            -std::f64::consts::FRAC_PI_2,
+        ] {
             // Smallest θ ≡ k (mod 2π) that is ≥ lo; keep it only if it is still ≤ hi.
             let n = ((lo - k) / std::f64::consts::TAU).ceil();
             let theta = k + n * std::f64::consts::TAU;
@@ -256,7 +267,9 @@ fn text_box(
         return None;
     }
     let (x0, x1) = match style.align {
-        crate::text::TextAlign::Left | crate::text::TextAlign::Justify => (position.x, position.x + w),
+        crate::text::TextAlign::Left | crate::text::TextAlign::Justify => {
+            (position.x, position.x + w)
+        }
         crate::text::TextAlign::Center => (position.x - w / 2.0, position.x + w / 2.0),
         crate::text::TextAlign::Right => (position.x - w, position.x),
     };
@@ -436,8 +449,10 @@ pub fn fit_scene(scene: &mut Scene, opts: FitOptions) -> bool {
 
     // Available area, at least 1pt — a max size smaller than 2×margin must not produce a
     // negative or zero scale (which previously emitted `viewBox="0 0 0 -20.41"`).
-    let avail_w = sanitize_max(opts.max_width).map_or(f64::INFINITY, |w| (w - 2.0 * margin).max(1.0));
-    let avail_h = sanitize_max(opts.max_height).map_or(f64::INFINITY, |h| (h - 2.0 * margin).max(1.0));
+    let avail_w =
+        sanitize_max(opts.max_width).map_or(f64::INFINITY, |w| (w - 2.0 * margin).max(1.0));
+    let avail_h =
+        sanitize_max(opts.max_height).map_or(f64::INFINITY, |h| (h - 2.0 * margin).max(1.0));
 
     // Unconstrained on both axes → no meaningful upscale target, so keep the natural size.
     let natural = (avail_w / content_w).min(avail_h / content_h);
@@ -462,7 +477,9 @@ pub fn fit_scene(scene: &mut Scene, opts: FitOptions) -> bool {
     // (layer-local transform first, then the fit), so layers and default nodes stay aligned.
     if !scene.nodes.is_empty() {
         let children = std::mem::take(&mut scene.nodes);
-        scene.nodes.push(SceneNode::group(children).with_transform(fit));
+        scene
+            .nodes
+            .push(SceneNode::group(children).with_transform(fit));
     }
     for layer in &mut scene.layers {
         layer.transform = Some(match layer.transform.take() {
@@ -531,7 +548,8 @@ mod tests {
     /// 缺陷回归：下游实现忽略节点 transform，算出的是未变换坐标。
     #[test]
     fn node_bounds_applies_transform() {
-        let node = rect_node(0.0, 0.0, 10.0, 10.0).with_transform(Transform::translate(100.0, 50.0));
+        let node =
+            rect_node(0.0, 0.0, 10.0, 10.0).with_transform(Transform::translate(100.0, 50.0));
         let b = node_bounds(&node).unwrap();
         assert_eq!((b.min_x(), b.min_y()), (100.0, 50.0));
         assert_eq!((b.max_x(), b.max_y()), (110.0, 60.0));
@@ -559,10 +577,16 @@ mod tests {
     #[test]
     fn group_bounds_unions_children() {
         let g = SceneNode::new(Element::Group {
-            children: vec![rect_node(0.0, 0.0, 10.0, 10.0), rect_node(90.0, 40.0, 100.0, 50.0)],
+            children: vec![
+                rect_node(0.0, 0.0, 10.0, 10.0),
+                rect_node(90.0, 40.0, 100.0, 50.0),
+            ],
         });
         let b = node_bounds(&g).unwrap();
-        assert_eq!((b.min_x(), b.min_y(), b.max_x(), b.max_y()), (0.0, 0.0, 100.0, 50.0));
+        assert_eq!(
+            (b.min_x(), b.min_y(), b.max_x(), b.max_y()),
+            (0.0, 0.0, 100.0, 50.0)
+        );
     }
 
     /// 弧的包围盒应只覆盖扫过的部分（用极值点精确求解），而非整个椭圆。
@@ -581,7 +605,12 @@ mod tests {
         assert!((b.max_y() - 10.0).abs() < 1e-9, "got {b:?}");
 
         // 下半圆（0 → π，y 恒 ≥ 0 在 y-down 坐标系下）不应含 y = -10 的极值点。
-        let half = arc_box(Point::new(0.0, 0.0), Vec2::new(10.0, 10.0), 0.0, std::f64::consts::PI);
+        let half = arc_box(
+            Point::new(0.0, 0.0),
+            Vec2::new(10.0, 10.0),
+            0.0,
+            std::f64::consts::PI,
+        );
         assert!((half.min_y() - 0.0).abs() < 1e-9, "got {half:?}");
         assert!((half.max_y() - 10.0).abs() < 1e-9, "got {half:?}");
     }
@@ -598,7 +627,11 @@ mod tests {
             opacity: 1.0,
         };
         let b = element_bounds(&el).unwrap();
-        assert_eq!((b.max_x(), b.max_y()), (50.0, 20.0), "应按原始像素尺寸溢出 frame");
+        assert_eq!(
+            (b.max_x(), b.max_y()),
+            (50.0, 20.0),
+            "应按原始像素尺寸溢出 frame"
+        );
     }
 
     #[test]
@@ -624,7 +657,10 @@ mod tests {
         layer.push(rect_node(100.0, 100.0, 120.0, 120.0));
         s.push_layer(layer);
         let b = scene_bounds(&s).unwrap();
-        assert_eq!((b.min_x(), b.min_y(), b.max_x(), b.max_y()), (0.0, 0.0, 120.0, 120.0));
+        assert_eq!(
+            (b.min_x(), b.min_y(), b.max_x(), b.max_y()),
+            (0.0, 0.0, 120.0, 120.0)
+        );
     }
 
     #[test]
@@ -657,7 +693,12 @@ mod tests {
                 .with_max_height(600.0)
                 .with_margin(8.0),
         );
-        assert!(s.width < 200.0 && s.height < 200.0, "got {}x{}", s.width, s.height);
+        assert!(
+            s.width < 200.0 && s.height < 200.0,
+            "got {}x{}",
+            s.width,
+            s.height
+        );
     }
 
     #[test]
@@ -671,7 +712,12 @@ mod tests {
                 .with_margin(8.0)
                 .with_upscale(true),
         );
-        assert!(s.width > 500.0 && s.height > 500.0, "got {}x{}", s.width, s.height);
+        assert!(
+            s.width > 500.0 && s.height > 500.0,
+            "got {}x{}",
+            s.width,
+            s.height
+        );
     }
 
     /// 只约束一个维度时，另一维度按内容比例同步缩放（不被隐式限制）。
@@ -680,7 +726,10 @@ mod tests {
         let mut s = scene_with(vec![rect_node(0.0, 0.0, 100.0, 100.0)]);
         fit_scene(
             &mut s,
-            FitOptions::new().with_max_width(500.0).with_margin(8.0).with_upscale(true),
+            FitOptions::new()
+                .with_max_width(500.0)
+                .with_margin(8.0)
+                .with_upscale(true),
         );
         assert!((s.width - 500.0).abs() < 1.0, "got {}", s.width);
         assert!((s.height - 500.0).abs() < 1.0, "got {}", s.height);
@@ -688,7 +737,10 @@ mod tests {
         let mut s = scene_with(vec![rect_node(0.0, 0.0, 100.0, 100.0)]);
         fit_scene(
             &mut s,
-            FitOptions::new().with_max_height(500.0).with_margin(8.0).with_upscale(true),
+            FitOptions::new()
+                .with_max_height(500.0)
+                .with_margin(8.0)
+                .with_upscale(true),
         );
         assert!((s.height - 500.0).abs() < 1.0, "got {}", s.height);
         assert!((s.width - 500.0).abs() < 1.0, "got {}", s.width);
@@ -717,9 +769,17 @@ mod tests {
         let mut s = scene_with(vec![rect_node(0.0, 0.0, 100.0, 100.0)]);
         fit_scene(
             &mut s,
-            FitOptions::new().with_max_width(4.0).with_max_height(4.0).with_margin(8.0),
+            FitOptions::new()
+                .with_max_width(4.0)
+                .with_max_height(4.0)
+                .with_margin(8.0),
         );
-        assert!(s.width > 0.0 && s.height > 0.0, "got {}x{}", s.width, s.height);
+        assert!(
+            s.width > 0.0 && s.height > 0.0,
+            "got {}x{}",
+            s.width,
+            s.height
+        );
         assert!(s.width.is_finite() && s.height.is_finite());
     }
 

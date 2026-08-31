@@ -228,7 +228,8 @@ impl Ctx {
             Some(_) => self.font.color,
             None => self.shape_fill(),
         };
-        self.stroke.get_or_insert_with(|| Stroke::new(fallback, 1.0))
+        self.stroke
+            .get_or_insert_with(|| Stroke::new(fallback, 1.0))
     }
 
     // ---- style: font / text ----
@@ -426,9 +427,7 @@ impl Ctx {
         text: impl Into<String>,
         max_width: f64,
     ) -> SceneNode {
-        self.clone()
-            .with_max_width(max_width)
-            .fill_text(x, y, text)
+        self.clone().with_max_width(max_width).fill_text(x, y, text)
     }
 
     /// Draw **rich text** from styled spans.
@@ -579,14 +578,7 @@ impl Ctx {
     ///
     /// Superset of Canvas, where a pie is `moveTo(center) + arc + closePath`.
     #[must_use]
-    pub fn pie(
-        &self,
-        cx: f64,
-        cy: f64,
-        r: f64,
-        start_angle: f64,
-        sweep_angle: f64,
-    ) -> SceneNode {
+    pub fn pie(&self, cx: f64, cy: f64, r: f64, start_angle: f64, sweep_angle: f64) -> SceneNode {
         self.node(Element::Pie {
             center: Point::new(cx, cy),
             radius: r,
@@ -833,7 +825,15 @@ impl Path2D {
     }
 
     /// Cubic Bézier to `(x, y)` with control points `(c1x, c1y)` and `(c2x, c2y)`.
-    pub fn curve_to(&mut self, c1x: f64, c1y: f64, c2x: f64, c2y: f64, x: f64, y: f64) -> &mut Self {
+    pub fn curve_to(
+        &mut self,
+        c1x: f64,
+        c1y: f64,
+        c2x: f64,
+        c2y: f64,
+        x: f64,
+        y: f64,
+    ) -> &mut Self {
         if !self.started {
             self.path.move_to((c1x, c1y));
             self.started = true;
@@ -860,7 +860,14 @@ impl Path2D {
     ///
     /// A connecting line is emitted first when the path already has a current point (Canvas
     /// semantics). Use [`Path2D::arc_ccw`] for the opposite direction.
-    pub fn arc(&mut self, cx: f64, cy: f64, radius: f64, start_angle: f64, end_angle: f64) -> &mut Self {
+    pub fn arc(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+    ) -> &mut Self {
         self.ellipse(cx, cy, radius, radius, 0.0, start_angle, end_angle)
     }
 
@@ -1093,7 +1100,10 @@ mod tests {
         let ctx = Ctx::new()
             .with_fill(Color::BLACK)
             .with_stroke(Stroke::new(Color::BLACK, 1.0));
-        assert!(matches!(ctx.line(0.0, 0.0, 1.0, 1.0).element, Element::Line { .. }));
+        assert!(matches!(
+            ctx.line(0.0, 0.0, 1.0, 1.0).element,
+            Element::Line { .. }
+        ));
         assert!(matches!(
             ctx.polyline(&[(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)]).element,
             Element::Polyline { .. }
@@ -1250,7 +1260,10 @@ mod tests {
         });
         assert!(last.is_some());
         let last = last.unwrap();
-        assert!((last.x - 0.0).abs() < 1e-9 && (last.y - 10.0).abs() < 1e-9, "got {last:?}");
+        assert!(
+            (last.x - 0.0).abs() < 1e-9 && (last.y - 10.0).abs() < 1e-9,
+            "got {last:?}"
+        );
     }
 
     /// 节点级属性：transform / alpha / clip / name / z 应落到产出的 node 上。
@@ -1270,7 +1283,10 @@ mod tests {
         assert!(n.transform.is_none());
 
         // transform 也应带上。
-        let n = ctx.clone().translate(10.0, 20.0).fill_rect(0.0, 0.0, 5.0, 5.0);
+        let n = ctx
+            .clone()
+            .translate(10.0, 20.0)
+            .fill_rect(0.0, 0.0, 5.0, 5.0);
         let t = n.transform.unwrap();
         let p = t.apply_point(Point::new(1.0, 1.0));
         assert_eq!(p, Point::new(11.0, 21.0));
@@ -1339,7 +1355,11 @@ mod tests {
             _ => panic!("expected Rect"),
         }
         // 渐变无"单一颜色"时，回退用首个 stop 作为描边色。
-        let s = Ctx::new().with_fill_gradient(g).with_line_width(1.0).stroke.unwrap();
+        let s = Ctx::new()
+            .with_fill_gradient(g)
+            .with_line_width(1.0)
+            .stroke
+            .unwrap();
         assert_eq!(s.color, Color::RED);
     }
 
@@ -1431,14 +1451,20 @@ mod tests {
         let ctx = Ctx::new()
             .with_fill(Color::RED)
             .with_stroke(Stroke::new(Color::BLACK, 1.0));
-        match ctx.pie(5.0, 5.0, 10.0, 0.0, std::f64::consts::FRAC_PI_2).element {
+        match ctx
+            .pie(5.0, 5.0, 10.0, 0.0, std::f64::consts::FRAC_PI_2)
+            .element
+        {
             Element::Pie { center, radius, .. } => {
                 assert_eq!(center, Point::new(5.0, 5.0));
                 assert_eq!(radius, 10.0);
             }
             _ => panic!("expected Pie"),
         }
-        match ctx.arc(5.0, 5.0, 10.0, 20.0, 0.0, std::f64::consts::FRAC_PI_2).element {
+        match ctx
+            .arc(5.0, 5.0, 10.0, 20.0, 0.0, std::f64::consts::FRAC_PI_2)
+            .element
+        {
             Element::Arc { center, radii, .. } => {
                 assert_eq!(center, Point::new(5.0, 5.0));
                 assert_eq!(radii, Vec2::new(10.0, 20.0));
@@ -1466,13 +1492,22 @@ mod tests {
         let ctx = Ctx::new()
             .with_fill(Color::RED)
             .with_stroke(Stroke::new(Color::BLUE, 2.0));
-        match ctx.clone().without_fill().fill_stroke_rect(0.0, 0.0, 1.0, 1.0).element {
+        match ctx
+            .clone()
+            .without_fill()
+            .fill_stroke_rect(0.0, 0.0, 1.0, 1.0)
+            .element
+        {
             Element::Rect { style, .. } => {
                 assert!(style.fill.is_none() && style.stroke.is_some())
             }
             _ => panic!("expected Rect"),
         }
-        match ctx.without_stroke().fill_stroke_rect(0.0, 0.0, 1.0, 1.0).element {
+        match ctx
+            .without_stroke()
+            .fill_stroke_rect(0.0, 0.0, 1.0, 1.0)
+            .element
+        {
             Element::Rect { style, .. } => {
                 assert!(style.fill.is_some() && style.stroke.is_none())
             }

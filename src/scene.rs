@@ -926,7 +926,11 @@ impl Element {
     /// carries accurate block dimensions. To skip it in a performance-sensitive hot loop,
     /// build the struct variant directly with `layout: None`.
     #[must_use]
-    pub fn text(content: impl Into<String>, position: Point, style: crate::text::TextStyle) -> Self {
+    pub fn text(
+        content: impl Into<String>,
+        position: Point,
+        style: crate::text::TextStyle,
+    ) -> Self {
         let spans = vec![RichSpan::new(content, style.clone())];
         let layout = prelayout(&spans, style.max_width);
         Self::Text {

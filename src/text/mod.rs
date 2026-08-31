@@ -34,8 +34,8 @@ mod style;
 mod tests;
 
 pub use engine::{
-    compute_text_offset, layout_metrics, layout_text, measure_text, parse_generic_family,
-    register_font, register_font_generic, FontSource,
+    FontSource, compute_text_offset, layout_metrics, layout_text, measure_text,
+    parse_generic_family, register_font, register_font_generic,
 };
 pub use glyph::*;
 pub use layout::*;

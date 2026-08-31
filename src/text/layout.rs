@@ -1,4 +1,4 @@
-﻿use crate::geometry::{Color, Rect, Size};
+use crate::geometry::{Color, Rect, Size};
 use crate::text::style::*;
 use std::sync::Arc;
 
@@ -190,4 +190,3 @@ pub struct TextMeasure {
     /// exact glyph drawing.
     pub layout: Arc<TextLayout>,
 }
-

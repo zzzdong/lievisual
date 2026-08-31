@@ -122,8 +122,7 @@ impl VelloPixmapRenderer {
         // skip painting an alpha-0 background so a transparent canvas stays possible.
         let bg = self.background.unwrap_or(scene.background);
         if bg.a > 0 {
-            self.ctx
-                .set_transform(vello_cpu::kurbo::Affine::IDENTITY);
+            self.ctx.set_transform(vello_cpu::kurbo::Affine::IDENTITY);
             let rect = VRect::new(0.0, 0.0, out_w as f64, out_h as f64);
             self.ctx.set_paint(self.to_vello(&bg));
             self.ctx.fill_rect(&rect);
@@ -449,8 +448,7 @@ impl Renderer for VelloPixmapRenderer {
         // （|det|^0.5）折算到设备像素。极端 frame（如 65535×65535）或"极小图 + Cover"
         // 会放大出 GB 级位图，这里统一按 1/k 降采样（k=1 时行为完全不变）。
         let mag = t.determinant().abs().sqrt().max(1e-6);
-        let cap = (canvas_w * canvas_h * 4.0)
-            .clamp(16.0 * 1024.0 * 1024.0, 64.0 * 1024.0 * 1024.0);
+        let cap = (canvas_w * canvas_h * 4.0).clamp(16.0 * 1024.0 * 1024.0, 64.0 * 1024.0 * 1024.0);
         let area = (dw * dh).max(fw * fh) * mag * mag;
         let k = if area > cap {
             (area / cap).sqrt().ceil().max(1.0)
@@ -521,8 +519,7 @@ impl Renderer for VelloPixmapRenderer {
         // 铺回原尺寸的 frame（k=1 时等价于纯平移）。
         let rect = VRect::new(fx, fy, fx + fw, fy + fh);
         self.ctx.set_paint_transform(
-            vello_cpu::kurbo::Affine::translate((fx, fy))
-                * vello_cpu::kurbo::Affine::scale(k),
+            vello_cpu::kurbo::Affine::translate((fx, fy)) * vello_cpu::kurbo::Affine::scale(k),
         );
         self.ctx.fill_rect(&rect);
         self.ctx.reset_paint_transform();
@@ -726,11 +723,7 @@ fn resize_rgba8(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
             // 采样点先按各自 alpha 预乘，再对 RGB 插值。
             let premul = |px: &[u8]| -> [f64; 3] {
                 let a = px[3] as f64 / 255.0;
-                [
-                    px[0] as f64 * a,
-                    px[1] as f64 * a,
-                    px[2] as f64 * a,
-                ]
+                [px[0] as f64 * a, px[1] as f64 * a, px[2] as f64 * a]
             };
             let (q00, q01, q10, q11) = (premul(p00), premul(p01), premul(p10), premul(p11));
             // alpha 通道单独做直通插值。
@@ -1160,8 +1153,7 @@ mod tests {
         let img = crate::SceneImage::from_rgba8(4, 4, vec![0xffu8; 4 * 4 * 4]).unwrap();
         let mut scene = Scene::new(20.0, 20.0);
         scene.push_node(
-            SceneNode::new(Element::image(img, Rect::new(0.0, 0.0, 20.0, 20.0)))
-                .with_opacity(0.5),
+            SceneNode::new(Element::image(img, Rect::new(0.0, 0.0, 20.0, 20.0))).with_opacity(0.5),
         );
         let mut r = VelloPixmapRenderer::new(20, 20).with_background(Color::BLACK);
         let (w, _, data) = render_png_pixels(&mut r, &scene);
