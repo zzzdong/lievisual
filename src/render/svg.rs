@@ -127,7 +127,10 @@ impl SvgRenderer {
             r#"<rect x="0" y="0" width="{:.2}" height="{:.2}""#,
             vw, vh
         );
-        out.push_str(&color_attr_str("fill", self.background.unwrap_or(Color::WHITE)));
+        out.push_str(&color_attr_str(
+            "fill",
+            self.background.unwrap_or(Color::WHITE),
+        ));
         let _ = writeln!(out, "/>");
         // content
         out.push_str(&self.buf);
@@ -710,8 +713,7 @@ impl SvgRenderer {
         let _ = write!(
             el,
             r#" stroke-width="{:.2}" stroke-miterlimit="{:.2}""#,
-            s.width,
-            s.miter_limit
+            s.width, s.miter_limit
         );
         let cap = match s.line_cap {
             LineCap::Butt => "butt",
@@ -1750,11 +1752,15 @@ mod tests {
         let out = render(&scene);
         assert!(out.contains("<tspan"), "富文本应输出 tspan: {out}");
         assert!(
-            out.contains(r##"fill="#ff0000""##) && out.contains(r##"font-size="20.00""##)
+            out.contains(r##"fill="#ff0000""##)
+                && out.contains(r##"font-size="20.00""##)
                 && out.contains(r##"font-weight="700""##),
             "红色加粗 span 的样式应保留: {out}"
         );
-        assert!(out.contains(r##"fill="#0000ff""##), "蓝色 span 的样式应保留: {out}");
+        assert!(
+            out.contains(r##"fill="#0000ff""##),
+            "蓝色 span 的样式应保留: {out}"
+        );
         assert!(out.contains(">red </tspan>"), "span 文本应完整: {out}");
         assert!(out.contains(">blue</tspan>"), "span 文本应完整: {out}");
 
@@ -1766,7 +1772,10 @@ mod tests {
             TextStyle::new(Color::BLACK, 12.0, "sans-serif"),
         ));
         let out_plain = render(&plain);
-        assert!(!out_plain.contains("<tspan"), "纯文本不应输出 tspan: {out_plain}");
+        assert!(
+            !out_plain.contains("<tspan"),
+            "纯文本不应输出 tspan: {out_plain}"
+        );
     }
 
     /// 缺陷回归：文本内含 `\n` 时必须逐行输出 tspan（SVG `<text>` 本身不换行，
@@ -1783,9 +1792,7 @@ mod tests {
         assert!(out.contains(">line1</tspan>"), "第一行内容缺失: {out}");
         assert!(out.contains(">line2</tspan>"), "第二行内容缺失: {out}");
         // 每行一个行级 tspan，且首行 dy=0、后续行按行距下移。
-        let line_tspans: Vec<&str> = out
-            .matches(r#"<tspan x="5.00" dy="#)
-            .collect();
+        let line_tspans: Vec<&str> = out.matches(r#"<tspan x="5.00" dy="#).collect();
         assert!(line_tspans.len() >= 2, "应有两个行级 tspan: {out}");
     }
 

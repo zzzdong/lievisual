@@ -96,9 +96,7 @@ impl Pixmap {
         // 显式 EXPAND + STRIP_16 让解码器完成调色板展开、tRNS→alpha、<8bit→8bit、
         // 16bit→8bit，输出恒为 Grayscale(A)/Rgb(A)。
         let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-        decoder.set_transformations(
-            png::Transformations::EXPAND | png::Transformations::STRIP_16,
-        );
+        decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         let mut reader = decoder.read_info().ok()?;
         let mut buf = vec![0u8; reader.output_buffer_size()?];
         let info = reader.next_frame(&mut buf).ok()?;
