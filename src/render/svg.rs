@@ -122,13 +122,13 @@ impl SvgRenderer {
         // Background rectangle (viewBox / user coordinates, so it always covers exactly the
         // logical canvas). Always output the full-canvas background so the base color is correct
         // (a transparent background is also an overlay layer, matching common-library semantics).
-        let _ = writeln!(
+        let _ = write!(
             out,
-            r#"<rect x="0" y="0" width="{:.2}" height="{:.2}" fill="{}"/>"#,
-            vw,
-            vh,
-            self.background.unwrap_or(Color::WHITE).to_hex()
+            r#"<rect x="0" y="0" width="{:.2}" height="{:.2}""#,
+            vw, vh
         );
+        out.push_str(&color_attr_str("fill", self.background.unwrap_or(Color::WHITE)));
+        let _ = writeln!(out, "/>");
         // content
         out.push_str(&self.buf);
         out.push_str("</svg>\n");
@@ -486,20 +486,23 @@ impl Renderer for SvgRenderer {
                 crate::text::TextAlign::Center => rx - w / 2.0,
                 crate::text::TextAlign::Left | crate::text::TextAlign::Justify => rx,
             };
-            self.buf.push_str(&format!(
-                r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="{}"/>"#,
+            let mut bg_el = String::new();
+            let _ = write!(
+                bg_el,
+                r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}""#,
                 bx,
                 ry - style.baseline_shift,
                 w,
-                h,
-                bg.to_hex()
-            ));
-            self.buf.push('\n');
+                h
+            );
+            bg_el.push_str(&color_attr_str("fill", bg));
+            bg_el.push_str("/>\n");
+            self.buf.push_str(&bg_el);
         }
         let mut el = String::new();
         let _ = write!(
             el,
-            r#"<text x="{:.2}" y="{:.2}" text-anchor="{}" dominant-baseline="{}" font-family="{}" font-size="{:.2}" font-style="{}" font-weight="{:.0}" fill="{}"{}{}{}{}{}{}>{}</text>"#,
+            r#"<text x="{:.2}" y="{:.2}" text-anchor="{}" dominant-baseline="{}" font-family="{}" font-size="{:.2}" font-style="{}" font-weight="{:.0}""#,
             position.x,
             alphabetic_y,
             anchor,
@@ -508,17 +511,26 @@ impl Renderer for SvgRenderer {
             style.font_size,
             fstyle,
             style.font_weight.value(),
-            style.color.to_hex(),
-            fwidth,
-            letter,
-            deco,
-            lh,
-            rot,
-            bshift,
-            escape_text(&content)
         );
+        el.push_str(&color_attr_str("fill", style.color));
+        el.push_str(&fwidth);
+        el.push_str(&letter);
+        el.push_str(&deco);
+        el.push_str(&lh);
+        el.push_str(&rot);
+        el.push_str(&bshift);
+        el.push('>');
+        if spans.len() > 1 || content.contains('\n') {
+            // Rich text: emit one line-`<tspan>` per physical line and one style-`<tspan>`
+            // per span fragment, so per-span color / size / weight / family and explicit
+            // `\n` breaks survive (a single flat `<text>` cannot express them).
+            el.push_str(&self.rich_text_tspans(spans, position.x, style, metrics.as_ref()));
+        } else {
+            // Single span without line breaks: keep the flat text output (no tspan).
+            el.push_str(&escape_text(&content));
+        }
+        el.push_str("</text>\n");
         self.buf.push_str(&el);
-        self.buf.push('\n');
     }
 
     fn draw_image(&mut self, image: &crate::SceneImage, frame: Rect, opacity: f64) {
@@ -651,7 +663,7 @@ impl Renderer for SvgRenderer {
 impl SvgRenderer {
     fn apply_fill_stroke(&mut self, el: &mut String, style: &FillStrokeStyle) {
         match &style.fill {
-            Some(Fill::Solid(c)) => write!(el, r#" fill="{}""#, c.to_hex()).unwrap(),
+            Some(Fill::Solid(c)) => el.push_str(&color_attr_str("fill", *c)),
             Some(Fill::LinearGradient(g)) => {
                 let gid = self.next_gradient_id();
                 let defs = format!(
@@ -694,10 +706,10 @@ impl SvgRenderer {
     }
 
     fn append_stroke(&self, el: &mut String, s: &Stroke) {
+        el.push_str(&color_attr_str("stroke", s.color));
         let _ = write!(
             el,
-            r#" stroke="{}" stroke-width="{:.2}" stroke-miterlimit="{:.2}""#,
-            s.color.to_hex(),
+            r#" stroke-width="{:.2}" stroke-miterlimit="{:.2}""#,
             s.width,
             s.miter_limit
         );
@@ -729,11 +741,143 @@ impl SvgRenderer {
             }
         }
     }
+
+    /// Rich-text `<tspan>` body: one line-`<tspan>` per physical line, plus one style-`<tspan>`
+    /// per span fragment inside each line.
+    ///
+    /// Multi-span colors / sizes / weights / families and explicit `\n` breaks are preserved,
+    /// which a single flat `<text>` cannot express. Fragments that match the block style carry
+    /// no attributes and inherit the outer `<text>`. Returns an empty string when there is no
+    /// text to lay out.
+    fn rich_text_tspans(
+        &self,
+        spans: &[crate::text::RichSpan],
+        x: f64,
+        base: &TextStyle,
+        metrics: Option<&crate::text::TextMetrics>,
+    ) -> String {
+        // 行距：显式 line_height > 布局首行行高 > 1.2×font-size。
+        let line_h = base.line_height.unwrap_or_else(|| {
+            metrics
+                .filter(|m| m.line_height > 0.0)
+                .map_or(base.font_size * 1.2, |m| m.line_height)
+        });
+        // 切行：`\n` 是换行；同一行内的片段保持各自的样式。空行保留以维持行距。
+        let mut lines: Vec<Vec<(&str, &TextStyle)>> = vec![Vec::new()];
+        for span in spans {
+            for (i, seg) in span.text.split('\n').enumerate() {
+                if i > 0 {
+                    lines.push(Vec::new());
+                }
+                lines
+                    .last_mut()
+                    .expect("lines starts with one empty line")
+                    .push((seg, &span.style));
+            }
+        }
+        // 文本末尾的换行不产生额外空行（与 parley 一致）。
+        while lines.len() > 1 && lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        let mut out = String::new();
+        for (i, segs) in lines.iter().enumerate() {
+            let dy = if i == 0 { 0.0 } else { line_h };
+            let _ = write!(out, r#"<tspan x="{:.2}" dy="{:.2}">"#, x, dy);
+            if segs.is_empty() {
+                // 显式空行：零宽占位符保住行高（空 tspan 会被浏览器折叠）。
+                out.push_str("&#8203;");
+            } else {
+                for (text, span_style) in segs {
+                    let _ = write!(out, "<tspan{}>", self.rich_span_attrs(span_style, base));
+                    out.push_str(&escape_text(text));
+                    out.push_str("</tspan>");
+                }
+            }
+            out.push_str("</tspan>");
+        }
+        out
+    }
+
+    /// Per-span typographic attribute overrides relative to the block style. Empty when the
+    /// span matches the block (it then inherits the outer `<text>` attributes).
+    fn rich_span_attrs(&self, span: &TextStyle, base: &TextStyle) -> String {
+        let mut attrs = String::new();
+        if span.font_family != base.font_family {
+            let _ = write!(
+                attrs,
+                r#" font-family="{}""#,
+                escape_attr(&span.font_family_css())
+            );
+        }
+        if (span.font_size - base.font_size).abs() > f64::EPSILON {
+            let _ = write!(attrs, r#" font-size="{:.2}""#, span.font_size);
+        }
+        if span.color != base.color {
+            attrs.push_str(&color_attr_str("fill", span.color));
+        }
+        if span.font_weight != base.font_weight {
+            let _ = write!(attrs, r#" font-weight="{:.0}""#, span.font_weight.value());
+        }
+        if span.font_style != base.font_style {
+            let f = match span.font_style {
+                crate::text::FontStyle::Normal => "normal",
+                crate::text::FontStyle::Italic => "italic",
+                crate::text::FontStyle::Oblique => "oblique",
+            };
+            let _ = write!(attrs, r#" font-style="{f}""#);
+        }
+        if span.font_width != base.font_width {
+            let _ = write!(
+                attrs,
+                r#" font-stretch="{:.0}%""#,
+                span.font_width.ratio() * 100.0
+            );
+        }
+        if span.letter_spacing != base.letter_spacing {
+            let _ = write!(attrs, r#" letter-spacing="{:.2}""#, span.letter_spacing);
+        }
+        // text-decoration 可继承；只有与块级默认不同才输出（含显式取消）。
+        if span.underline != base.underline || span.strikethrough != base.strikethrough {
+            let _ = write!(
+                attrs,
+                r#" text-decoration="{}""#,
+                deco_keyword(span.underline, span.strikethrough)
+            );
+        }
+        attrs
+    }
 }
 
-/// A gradient stop: `stop-color` always uses the 6-digit form, and a translucent stop carries
-/// its alpha through `stop-opacity` — 8-digit hex (`#rrggbbaa`) is CSS Color 4 / SVG 2 only and
-/// is rejected by many SVG → PDF / SVG 1.1 consumers.
+/// SVG color attribute fragment: ` prefix="#rrggbb"`, with a translucent color also emitting
+/// ` prefix-opacity="…"`.
+///
+/// 8-digit hex (`#rrggbbaa`) is CSS Color 4 / SVG 2 only and is rejected by many
+/// SVG → PDF / SVG 1.1 consumers; the alpha channel is therefore always split into a separate
+/// `fill-opacity` / `stroke-opacity` attribute (consistent with how gradient stops use
+/// `stop-opacity`). An opaque color produces exactly the old ` prefix="#rrggbb"` form.
+fn color_attr_str(prefix: &str, c: Color) -> String {
+    // 注意：必须用 r## —— 字面量 `"#`（引号后的 # 属于 hex 前缀）会提前终止 r#" 字符串。
+    let mut s = format!(r##" {prefix}="#{:02x}{:02x}{:02x}""##, c.r, c.g, c.b);
+    if c.a != 255 {
+        s.push_str(&format!(r#" {prefix}-opacity="{:.3}""#, c.a as f64 / 255.0));
+    }
+    s
+}
+
+/// text-decoration keyword for an underline / strikethrough pair (used per span and for the
+/// block-level default).
+fn deco_keyword(underline: bool, strikethrough: bool) -> &'static str {
+    match (underline, strikethrough) {
+        (false, false) => "none",
+        (true, false) => "underline",
+        (false, true) => "line-through",
+        (true, true) => "underline line-through",
+    }
+}
+
+/// A gradient stop: `stop-color` always uses the 6-digit form; a translucent stop carries its
+/// alpha through `stop-opacity`. 8-digit hex is CSS Color 4 / SVG 2 only and is rejected by
+/// many SVG -> PDF / SVG 1.1 consumers.
 fn stop_svg(s: &GradientStop) -> String {
     let opacity = if s.color.a == 255 {
         String::new()
@@ -1579,6 +1723,96 @@ mod tests {
         assert!(
             out.contains(r##"stop-color="#0000ff" />"##),
             "不透明 stop 不应带 stop-opacity: {out}"
+        );
+    }
+
+    /// 缺陷回归：富文本的每个 span 必须输出自己的样式（此前把 spans 拼成纯文本，
+    /// 颜色/字号/字重全部退化为块级单一样式，SVG 与 vello 不一致）。
+    #[test]
+    fn rich_text_spans_emit_tspan_with_own_style() {
+        use crate::text::RichSpan;
+        let mut scene = Scene::new(300.0, 60.0);
+        scene.push(Element::rich_text(
+            vec![
+                RichSpan::new(
+                    "red ",
+                    TextStyle::new(Color::rgb(0xff, 0x00, 0x00), 20.0, "sans-serif")
+                        .with_weight(FontWeight::Bold),
+                ),
+                RichSpan::new(
+                    "blue",
+                    TextStyle::new(Color::rgb(0x00, 0x00, 0xff), 12.0, "sans-serif"),
+                ),
+            ],
+            Point::new(10.0, 30.0),
+            TextStyle::new(Color::BLACK, 12.0, "sans-serif"),
+        ));
+        let out = render(&scene);
+        assert!(out.contains("<tspan"), "富文本应输出 tspan: {out}");
+        assert!(
+            out.contains(r##"fill="#ff0000""##) && out.contains(r##"font-size="20.00""##)
+                && out.contains(r##"font-weight="700""##),
+            "红色加粗 span 的样式应保留: {out}"
+        );
+        assert!(out.contains(r##"fill="#0000ff""##), "蓝色 span 的样式应保留: {out}");
+        assert!(out.contains(">red </tspan>"), "span 文本应完整: {out}");
+        assert!(out.contains(">blue</tspan>"), "span 文本应完整: {out}");
+
+        // 单 span、无换行的热路径保持纯文本输出（无 tspan）。
+        let mut plain = Scene::new(100.0, 30.0);
+        plain.push(Element::text(
+            "plain",
+            Point::new(1.0, 2.0),
+            TextStyle::new(Color::BLACK, 12.0, "sans-serif"),
+        ));
+        let out_plain = render(&plain);
+        assert!(!out_plain.contains("<tspan"), "纯文本不应输出 tspan: {out_plain}");
+    }
+
+    /// 缺陷回归：文本内含 `\n` 时必须逐行输出 tspan（SVG `<text>` 本身不换行，
+    /// 此前整串输出会退化为一行，与 vello 的多行布局不一致）。
+    #[test]
+    fn multiline_text_emits_line_tspans() {
+        let mut scene = Scene::new(100.0, 100.0);
+        scene.push(Element::text(
+            "line1\nline2",
+            Point::new(5.0, 10.0),
+            TextStyle::new(Color::BLACK, 12.0, "sans-serif"),
+        ));
+        let out = render(&scene);
+        assert!(out.contains(">line1</tspan>"), "第一行内容缺失: {out}");
+        assert!(out.contains(">line2</tspan>"), "第二行内容缺失: {out}");
+        // 每行一个行级 tspan，且首行 dy=0、后续行按行距下移。
+        let line_tspans: Vec<&str> = out
+            .matches(r#"<tspan x="5.00" dy="#)
+            .collect();
+        assert!(line_tspans.len() >= 2, "应有两个行级 tspan: {out}");
+    }
+
+    /// 缺陷回归：半透明 fill/stroke 必须拆成 `#rrggbb` + `*-opacity`，不能输出
+    /// SVG 1.1 / SVG→PDF 不支持的 8 位 hex。
+    #[test]
+    fn translucent_color_uses_fill_and_stroke_opacity() {
+        let mut scene = Scene::new(40.0, 40.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 40.0, 40.0),
+            FillStrokeStyle {
+                fill: Some(Color::rgba(0xff, 0x00, 0x00, 128).into()),
+                stroke: Some(Stroke::new(Color::rgba(0x00, 0x00, 0xff, 128), 2.0)),
+            },
+        ));
+        let out = render(&scene);
+        assert!(
+            out.contains(r##"fill="#ff0000" fill-opacity="0.502""##),
+            "半透明 fill 应带 fill-opacity: {out}"
+        );
+        assert!(
+            out.contains(r##"stroke="#0000ff" stroke-opacity="0.502""##),
+            "半透明 stroke 应带 stroke-opacity: {out}"
+        );
+        assert!(
+            !out.contains("#ff000080") && !out.contains("#0000ff80"),
+            "不应输出 8 位 hex: {out}"
         );
     }
 }

@@ -256,13 +256,17 @@ fn text_box(
 ) -> Option<Rect> {
     // Prefer a pre-laid-out result; otherwise measure (only when fitting, so the cost is paid
     // once per export rather than once per frame).
-    let (w, h) = match layout {
-        Some(l) => (l.width, l.height),
-        None => {
-            let m = crate::text::measure_text(spans, style.max_width);
-            (m.size.width, m.size.height)
-        }
+    //
+    // Both backends position the block vertically via `TextBaseline::anchor_offset` against
+    // the **real** first-line metrics (alphabetic baseline, em-box center, ink height for
+    // Middle/Bottom). Reuse the same metric here instead of font-size proportions — the old
+    // `h * 0.8` estimate drifted from the rendered position for multi-line text or fonts with
+    // large descenders, biasing the fit margin on one side.
+    let m = match layout {
+        Some(l) => crate::text::layout_metrics(l),
+        None => crate::text::measure_text(spans, style.max_width).metrics,
     };
+    let (w, h) = (m.width, m.height);
     if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
         return None;
     }
@@ -273,15 +277,12 @@ fn text_box(
         crate::text::TextAlign::Center => (position.x - w / 2.0, position.x + w / 2.0),
         crate::text::TextAlign::Right => (position.x - w, position.x),
     };
+    // Vertical: block top sits `anchor_offset` above the anchor, and the block extends
+    // `h` downward (y-down). `baseline_shift` shifts the whole block along y.
     let shift = style.baseline_shift;
-    let (y0, y1) = match style.baseline {
-        crate::text::TextBaseline::Top => (position.y, position.y + h),
-        crate::text::TextBaseline::Middle => (position.y - h / 2.0, position.y + h / 2.0),
-        crate::text::TextBaseline::Bottom => (position.y - h, position.y),
-        // The alphabetic baseline sits ~80% down the block (ascent-dominant in most fonts).
-        _ => (position.y - h * 0.8, position.y + h * 0.2),
-    };
-    let mut r = Rect::new(x0, y0 + shift, x1, y1 + shift);
+    let block_top = position.y - style.baseline.anchor_offset(&m);
+    let (y0, y1) = (block_top + shift, block_top + h + shift);
+    let mut r = Rect::new(x0, y0, x1, y1);
     // Rotation is about `position`: rotate the four corners and re-fit an axis-aligned box.
     if style.rotation != 0.0 && style.rotation.is_finite() {
         let rot = Transform::rotate(style.rotation);
@@ -837,5 +838,41 @@ mod tests {
         let b = scene_bounds(&s).unwrap();
         assert!((b.min_x() - 5.0).abs() < 1e-6, "got {b:?}");
         assert!((b.min_y() - 5.0).abs() < 1e-6, "got {b:?}");
+    }
+
+    /// 缺陷回归：文本块顶必须按真实 alphabetic baseline 定位，而不是 `h*0.8` 近似。
+    ///
+    /// 此前 `text_box` 用高度比例估算基线位置，与渲染端（SVG/vello 都用
+    /// `TextBaseline::anchor_offset` 的真实首行指标）不一致，多行或深 descender 字体下
+    /// `fit_scene` 画布边缘会偏。现在两者共享同一指标。
+    #[test]
+    fn text_box_y_uses_real_alphabetic_baseline() {
+        let style = TextStyle::new(Color::BLACK, 16.0, "sans-serif");
+        let m = crate::text::measure_text(
+            std::slice::from_ref(&crate::text::RichSpan::new("Ag", style.clone())),
+            None,
+        );
+        if m.size.height <= 0.0 {
+            return; // 无字体环境（沙箱/精简镜像）跳过。
+        }
+        let pos = Point::new(10.0, 50.0);
+        let el = Element::Text {
+            spans: vec![crate::text::RichSpan::new("Ag", style.clone())],
+            position: pos,
+            style: style.clone(),
+            layout: Some(m.layout.clone()),
+        };
+        let b = element_bounds(&el).expect("有字体时应测得包围盒");
+        let expect_top = pos.y - m.metrics.alphabetic_baseline;
+        assert!(
+            (b.min_y() - expect_top).abs() < 1e-9,
+            "块顶应为 {expect_top}, got {}",
+            b.min_y()
+        );
+        assert!(
+            (b.max_y() - (expect_top + m.size.height)).abs() < 1e-9,
+            "块底应为 {}",
+            expect_top + m.size.height
+        );
     }
 }

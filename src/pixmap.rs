@@ -91,7 +91,14 @@ impl Pixmap {
     /// Decode PNG bytes into RGBA8. Returns `None` for non-PNG input or decode failure.
     #[must_use]
     pub fn decode_png(bytes: &[u8]) -> Option<Self> {
-        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        // `png` 默认 Transformations::IDENTITY：palette/indexed 图每像素只给一个调色板
+        // 索引、低深度灰度仍是 packed bits，`normalize_to_rgba8` 无法还原成真彩色。
+        // 显式 EXPAND + STRIP_16 让解码器完成调色板展开、tRNS→alpha、<8bit→8bit、
+        // 16bit→8bit，输出恒为 Grayscale(A)/Rgb(A)。
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        decoder.set_transformations(
+            png::Transformations::EXPAND | png::Transformations::STRIP_16,
+        );
         let mut reader = decoder.read_info().ok()?;
         let mut buf = vec![0u8; reader.output_buffer_size()?];
         let info = reader.next_frame(&mut buf).ok()?;
@@ -142,10 +149,9 @@ fn normalize_to_rgba8(
             }
             png::ColorType::Rgb => (byte(0), byte(1), byte(2), 255),
             png::ColorType::Rgba => (byte(0), byte(1), byte(2), byte(3)),
+            // decode_png 设置了 EXPAND | STRIP_16，palette 会在解码层展开为 Rgb/Rgba，
+            // 此处不可达；保守回退为灰度以免把残留索引当真彩色。
             png::ColorType::Indexed => {
-                // EXPAND in `normalize_to_color8` should already have expanded the
-                // palette; in theory we never reach here.
-                // Conservatively treat as grayscale (avoid misreading the index).
                 let v = byte(0);
                 (v, v, v, 255)
             }
@@ -180,5 +186,35 @@ mod tests {
     #[test]
     fn decode_png_rejects_garbage() {
         assert!(Pixmap::decode_png(b"not a png").is_none());
+    }
+
+    /// 缺陷回归：palette/indexed PNG 必须展开为真彩色，而非把索引当灰度。
+    ///
+    /// 修复前 `png` 解码器默认 Transformations::IDENTITY，2×2 调色板图解码后
+    /// 每个字节是调色板索引，normalize 将其当作灰度值（红→灰），颜色完全错乱；
+    /// tRNS（调色板透明度）也一并丢失。修复后在解码层 EXPAND + STRIP_16。
+    #[test]
+    fn decode_png_expands_palette_and_trns() {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, 2, 2);
+            enc.set_color(png::ColorType::Indexed);
+            enc.set_depth(png::BitDepth::Eight);
+            // PLTE：entry0 = 红，entry1 = 绿。
+            enc.set_palette(vec![0xff, 0x00, 0x00, 0x00, 0xff, 0x00]);
+            // tRNS：entry0 不透明，entry1 半透明（128）。
+            enc.set_trns(vec![0xff, 0x80]);
+            let mut writer = enc.write_header().expect("编码头失败");
+            // 每像素一个索引：0,1,1,0。
+            writer
+                .write_image_data(&[0u8, 1, 1, 0])
+                .expect("写入像素失败");
+        }
+        let pm = Pixmap::decode_png(&out).expect("palette PNG 应能解码");
+        let px = pm.pixels();
+        assert_eq!(&px[0..4], &[0xff, 0x00, 0x00, 0xff], "索引0 应为不透明红");
+        assert_eq!(&px[4..8], &[0x00, 0xff, 0x00, 0x80], "索引1 应为半透明绿");
+        assert_eq!(&px[8..12], &[0x00, 0xff, 0x00, 0x80]);
+        assert_eq!(&px[12..16], &[0xff, 0x00, 0x00, 0xff]);
     }
 }

@@ -759,10 +759,16 @@ impl Path2D {
     /// Build from an existing Bézier path.
     #[must_use]
     pub fn from_bezpath(path: BezPath) -> Self {
+        // A path ending in ClosePath is already closed; mirror that in `is_closed()` so
+        // `Ctx::fill`/`fill_stroke_path` propagate the right `closed` flag.
+        let closed = path
+            .elements()
+            .last()
+            .is_some_and(|el| matches!(el, kurbo::PathEl::ClosePath));
         Self {
             started: !path.elements().is_empty(),
             path,
-            closed: false,
+            closed,
         }
     }
 
