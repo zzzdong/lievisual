@@ -372,7 +372,15 @@ struct GlyphRaw {
     x: f32,
     y: f32,
     advance: f32,
-    cluster: u32,
+    /// The owning cluster's text range (byte offsets into `full_text`).
+    ///
+    /// parley 的 Run 是「字体级」运行：同一字体的一个 Run 可横跨多个样式区间
+    /// （parley 只在样式属性变化处拆出多个 GlyphRun，但它们共享同一个 Run，
+    /// `Run::text_range()` 返回的是整个字体级运行的范围）。因此每个 GlyphRun
+    /// 的真实文本范围必须从其字形的 cluster 区间推导，不能直接用
+    /// `run.text_range()`，否则合并运行下所有 piece 都会拿到全文范围。
+    cluster_start: u32,
+    cluster_end: u32,
 }
 
 /// Extract a self-contained [`TextLayout`] from a parley Layout, mapping extended
@@ -418,18 +426,37 @@ fn extract_lines_from_parley(
 
         let mut glyph_data: Vec<(GlyphRaw, usize)> = Vec::new();
         #[allow(clippy::type_complexity)]
-        let mut run_infos: Vec<(
-            Color,
-            Arc<Vec<u8>>,
-            u32,
-            f32,
-            parley::layout::Run<'_, Color>,
-            f32,
-        )> = Vec::new();
+        let mut run_infos: Vec<(Color, Arc<Vec<u8>>, u32, f32, bool, bool)> = Vec::new();
+
+        // GlyphRun 的簇归属：parley 的 Run 是「字体级」运行，同一 Run 拆出的多个
+        // GlyphRun（样式区间）共享它，`run().visual_clusters()` 迭代的是整个字体级
+        // Run 的簇。因此必须先把同一字体级 Run 的所有 GlyphRun 聚合起来，再按顺序
+        // 用簇的字形数去消耗聚合后的定位字形序列，簇区间才能与字形正确对齐。
+        // 字体级 Run 在一行内以 text_range 唯一标识（各 Run 的范围互不重叠）。
+        let glyph_runs: Vec<_> = line
+            .items()
+            .filter_map(|item| match item {
+                parley::layout::PositionedLayoutItem::GlyphRun(gr) => Some(gr),
+                _ => None,
+            })
+            .collect();
 
         let mut next_run_idx = 0;
-        for item in line.items() {
-            if let parley::layout::PositionedLayoutItem::GlyphRun(glyph_run) = item {
+        let mut gr = 0usize;
+        while gr < glyph_runs.len() {
+            let font_range = glyph_runs[gr].run().text_range();
+            let mut group_end = gr;
+            while group_end < glyph_runs.len()
+                && glyph_runs[group_end].run().text_range() == font_range
+            {
+                group_end += 1;
+            }
+
+            // 聚合该字体级 Run 的全部定位字形（按视觉顺序），同时为每个 GlyphRun
+            // 登记 run_infos（颜色 / 字体 / 粗斜体）。
+            // (glyph, run_idx)。
+            let mut flat: Vec<(parley::layout::Glyph, usize)> = Vec::new();
+            for glyph_run in &glyph_runs[gr..group_end] {
                 let run = glyph_run.run();
                 let color = glyph_run.style().brush;
                 // Font bytes + collection index: bytes are deduplicated in cache by Blob::id().
@@ -449,40 +476,69 @@ fn extract_lines_from_parley(
                 };
                 let font_size = run.font_size();
 
-                let first_glyph_x = glyph_run
-                    .positioned_glyphs()
-                    .next()
-                    .map(|g| g.x)
-                    .unwrap_or(0.0);
+                // Font weight / italic (needed by backends using system fonts such as SVG).
+                // 取自字体级 Run 的属性（同一 Run 内不变），在收集阶段固化，
+                // 后续无需再借用 parley 的 `Run`。
+                let font_attrs = run.font_attrs();
+                let font_weight_bold = font_attrs.weight >= parley::fontique::FontWeight::BOLD;
+                let font_style_italic = font_attrs.style != parley::fontique::FontStyle::Normal;
 
-                run_infos.push((color, font_arc, font_index, font_size, *run, first_glyph_x));
-
-                // Collect positioned glyphs; the cluster is provided via the visual_clusters'
-                // text_range.
-                let positioned: Vec<_> = glyph_run.positioned_glyphs().collect();
-                let mut gi = 0usize;
-                for cluster in glyph_run.run().visual_clusters() {
-                    let cluster_byte = cluster.text_range().start as u32;
-                    let cluster_glyphs: Vec<_> = cluster.glyphs().collect();
-                    for _cg in &cluster_glyphs {
-                        if gi < positioned.len() {
-                            let g = &positioned[gi];
-                            glyph_data.push((
-                                GlyphRaw {
-                                    id: g.id,
-                                    x: g.x,
-                                    y: g.y,
-                                    advance: g.advance,
-                                    cluster: cluster_byte,
-                                },
-                                next_run_idx,
-                            ));
-                            gi += 1;
-                        }
-                    }
-                }
+                run_infos.push((
+                    color,
+                    font_arc,
+                    font_index,
+                    font_size,
+                    font_weight_bold,
+                    font_style_italic,
+                ));
+                let run_idx = next_run_idx;
                 next_run_idx += 1;
+
+                for g in glyph_run.positioned_glyphs() {
+                    flat.push((g, run_idx));
+                }
             }
+
+            // 按簇消耗字形：第 k 个簇拥有 k_clusters 个字形，与聚合字形序列顺序
+            // 一一对应（簇切片与 GlyphRun 字形切片都出自同一字形数组、同序）。
+            let mut qi = 0usize;
+            for cluster in glyph_runs[gr].run().visual_clusters() {
+                let cluster_range = cluster.text_range();
+                for _ in 0..cluster.glyphs().count() {
+                    let Some((g, run_idx)) = flat.get(qi) else {
+                        break;
+                    };
+                    glyph_data.push((
+                        GlyphRaw {
+                            id: g.id,
+                            x: g.x,
+                            y: g.y,
+                            advance: g.advance,
+                            cluster_start: cluster_range.start as u32,
+                            cluster_end: cluster_range.end as u32,
+                        },
+                        *run_idx,
+                    ));
+                    qi += 1;
+                }
+            }
+            // 防御：簇数与字形数不一致时（理论不发生），剩余字形退化为整个
+            // 字体级 Run 的范围，至少保证字形不丢。
+            for (g, run_idx) in &flat[qi..] {
+                glyph_data.push((
+                    GlyphRaw {
+                        id: g.id,
+                        x: g.x,
+                        y: g.y,
+                        advance: g.advance,
+                        cluster_start: font_range.start as u32,
+                        cluster_end: font_range.end as u32,
+                    },
+                    *run_idx,
+                ));
+            }
+
+            gr = group_end;
         }
 
         if glyph_data.is_empty() {
@@ -502,7 +558,9 @@ fn extract_lines_from_parley(
 
         let mut runs = Vec::new();
 
-        // Split glyphs by run index.
+        // Split glyphs by font-run index (GlyphRun). 一个字体级 Run 拆出的多个
+        // GlyphRun（样式区间）在此各自成组；跨 span 的进一步切分交给
+        // [`TextRun::split_at`]（见下）。
         let mut run_glyph_ranges: Vec<(usize, usize)> = Vec::new();
         let mut current_start = 0;
         let mut last_run_idx = glyph_data[0].1;
@@ -515,13 +573,30 @@ fn extract_lines_from_parley(
         }
         run_glyph_ranges.push((current_start, glyph_data.len()));
 
+        let span_of = |pos: usize| -> usize {
+            span_ranges
+                .iter()
+                .position(|(s, e, _)| *s <= pos && pos < *e)
+                .unwrap_or(span_ranges.len().saturating_sub(1))
+        };
+
         for (start_idx, end_idx) in run_glyph_ranges.iter() {
             let run_idx = glyph_data[*start_idx].1;
-            let (color, font_data, font_index, font_size, run, first_glyph_x) = &run_infos[run_idx];
+            let (color, font_data, font_index, font_size, font_weight_bold, font_style_italic) =
+                &run_infos[run_idx];
 
-            let run_text_range = run.text_range();
-            let text_start = run_text_range.start;
-            let text_end = run_text_range.end;
+            // GlyphRun 的真实文本范围：首字形 cluster 起点 → 末字形 cluster 终点
+            //（多字形共享同一簇时取最大终点，防退化）。不能使用 `Run::text_range()`——
+            // 那是字体级 Run 的全范围，一个字体级 Run 拆出多个 GlyphRun 时，
+            // 所有 GlyphRun 都会拿到全文范围。
+            let text_start = glyph_data[*start_idx].0.cluster_start as usize;
+            let text_end = glyph_data[*start_idx..*end_idx]
+                .iter()
+                .map(|(g, _)| g.cluster_end as usize)
+                .max()
+                .unwrap_or(text_start)
+                .max(text_start)
+                .min(full_text.len());
 
             let run_text = full_text
                 .get(text_start..text_end)
@@ -536,56 +611,64 @@ fn extract_lines_from_parley(
                     x: g.x - min_x,
                     y: g.y - row_top_rel,
                     advance: g.advance,
-                    cluster: g.cluster.saturating_sub(text_start as u32),
+                    cluster: g.cluster_start.saturating_sub(text_start as u32),
                 })
                 .collect();
 
-            let baseline_x = *first_glyph_x - min_x;
-
-            // Extended attributes: look up by byte range across spans (pass the run's
-            // [start, end) so a merged run spanning multiple spans still matches the span
-            // carrying url/background).
-            let (url, decoration, background_color, baseline_shift) =
-                lookup_extended_props(text_start, text_end, &span_ranges);
-
-            // Apply the baseline shift to the glyph y: shift>0 (superscript) → y grows →
-            // visually moves up (y-down).
-            let adjusted_glyphs: Vec<Glyph> = relative_glyphs
-                .iter()
-                .map(|g| Glyph {
-                    id: g.id,
-                    x: g.x,
-                    y: g.y + baseline_shift,
-                    advance: g.advance,
-                    cluster: g.cluster,
-                })
-                .collect();
-            let adjusted_baseline_y = baseline_y - baseline_shift;
-            let advance = adjusted_glyphs.iter().map(|g| g.advance).sum();
-
-            // Font weight / italic (needed by backends using system fonts such as SVG).
-            let font_attrs = run.font_attrs();
-            let font_weight_bold = font_attrs.weight >= parley::fontique::FontWeight::BOLD;
-            let font_style_italic = font_attrs.style != parley::fontique::FontStyle::Normal;
-
-            runs.push(TextRun {
+            let base = TextRun {
                 text: run_text,
                 font_data: font_data.clone(),
                 font_index: *font_index,
                 font_size: *font_size,
-                font_weight_bold,
-                font_style_italic,
+                font_weight_bold: *font_weight_bold,
+                font_style_italic: *font_style_italic,
                 color: *color,
-                advance,
-                glyphs: adjusted_glyphs,
+                advance: relative_glyphs.iter().map(|g| g.advance).sum(),
+                glyphs: relative_glyphs,
                 is_rtl: false,
-                baseline_x,
-                baseline_y: adjusted_baseline_y,
-                url,
-                decoration,
-                baseline_shift,
-                background_color,
-            });
+                baseline_x: glyph_data[*start_idx].0.x - min_x,
+                baseline_y,
+                url: None,
+                decoration: TextDecoration::None,
+                baseline_shift: 0.0,
+                background_color: None,
+            };
+
+            // Span 边界切分：扩展属性（url / background_color / baseline_shift）是
+            // span 级的，parley 无法感知（不是 parley 样式属性），同一 GlyphRun 可能
+            // 覆盖多个 span。若不切分，某 span 的背景色 / 链接会泄漏到相邻 span 的
+            // 文本上（例如「普通文本 + 高亮 span + 普通文本」同字体同色时，整行都会
+            // 被涂上高亮背景）。
+            let mut cuts: Vec<usize> = Vec::new();
+            for i in (*start_idx + 1)..*end_idx {
+                let prev = &glyph_data[i - 1].0;
+                let cur = &glyph_data[i].0;
+                if span_of(prev.cluster_start as usize) != span_of(cur.cluster_start as usize) {
+                    cuts.push(cur.cluster_start as usize - text_start);
+                }
+            }
+            let pieces = base.split_at(&cuts);
+
+            // 按 piece 的绝对字节区间安扩展属性（piece 必落在单一 span 内），
+            // 并应用基线偏移（上标 / 下标）：字形 y 平移，baseline_y 反向平移。
+            let mut piece_start = text_start;
+            for mut piece in pieces {
+                let piece_end = piece_start + piece.text.len();
+                let (url, decoration, background_color, baseline_shift) =
+                    lookup_extended_props(piece_start, piece_end, &span_ranges);
+                if baseline_shift != 0.0 {
+                    for g in &mut piece.glyphs {
+                        g.y += baseline_shift;
+                    }
+                    piece.baseline_y -= baseline_shift;
+                }
+                piece.url = url;
+                piece.decoration = decoration;
+                piece.baseline_shift = baseline_shift;
+                piece.background_color = background_color;
+                runs.push(piece);
+                piece_start = piece_end;
+            }
         }
 
         let bounds = Rect::new(

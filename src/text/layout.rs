@@ -71,6 +71,72 @@ pub struct TextRun {
     pub background_color: Option<Color>,
 }
 
+impl TextRun {
+    /// Split the run into multiple sub-runs at byte offsets (relative to `text`).
+    ///
+    /// - `offsets` 会被去重排序，并只保留位于 `(0, text.len())` 内、落在字符边界
+    ///   且与某字形 `cluster` 对齐的切点（不对齐的切点被忽略，字形不会丢失）。
+    /// - 子 run 的 `glyphs[].cluster` 重定基为相对各自 `text` 的局部偏移；
+    ///   `advance` 按子 run 字形重新求和；`baseline_x` 取子 run 首字形的 `x`
+    ///   （使背景矩形 / 链接热区等按 `baseline_x + advance` 定位的绘制属性
+    ///   在子 run 上依然正确）。
+    /// - 字体、颜色、粗斜体、修饰、背景、链接、基线偏移等属性**原样继承**；
+    ///   需要按 piece 区分扩展属性（如只给中段文本上背景色 / 链接）的调用方，
+    ///   在切分后按 piece 改写即可。
+    ///
+    /// 无有效切点时返回原 run 的克隆（原样）。
+    #[must_use]
+    pub fn split_at(&self, offsets: &[usize]) -> Vec<TextRun> {
+        let len = self.text.len();
+        let mut cuts: Vec<usize> = offsets.to_vec();
+        cuts.retain(|&o| {
+            o > 0
+                && o < len
+                && self.text.is_char_boundary(o)
+                && self.glyphs.iter().any(|g| g.cluster as usize == o)
+        });
+        cuts.sort_unstable();
+        cuts.dedup();
+        if cuts.is_empty() {
+            return vec![self.clone()];
+        }
+
+        let mut bounds = cuts;
+        bounds.insert(0, 0);
+        bounds.push(len);
+
+        let mut out = Vec::with_capacity(bounds.len() - 1);
+        for w in bounds.windows(2) {
+            let (start, end) = (w[0], w[1]);
+            let glyphs: Vec<Glyph> = self
+                .glyphs
+                .iter()
+                .filter(|g| {
+                    let c = g.cluster as usize;
+                    c >= start && c < end
+                })
+                .map(|g| Glyph {
+                    cluster: g.cluster - start as u32,
+                    ..g.clone()
+                })
+                .collect();
+            if glyphs.is_empty() {
+                continue;
+            }
+            let advance: f32 = glyphs.iter().map(|g| g.advance).sum();
+            let baseline_x = glyphs[0].x;
+            out.push(TextRun {
+                text: self.text[start..end].to_string(),
+                advance,
+                glyphs,
+                baseline_x,
+                ..self.clone()
+            });
+        }
+        out
+    }
+}
+
 /// Per-line font metrics (from parley's `LineMetrics`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LineMetrics {

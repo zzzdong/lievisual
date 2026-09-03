@@ -497,4 +497,140 @@ mod decoration {
             "mixed width should be in between: all_plain={all_plain}, mixed={mixed}, all_spaced={all_spaced}"
         );
     }
+
+    /// 回归：同一字体的一个 parley 字体级 Run 可横跨多个「仅背景色不同」的 span
+    /// （背景色不是 parley 样式属性，不产生 GlyphRun 边界）。提取时必须在 span
+    /// 边界处切分 piece，且 piece 的文本范围须从 cluster 区间推导——否则
+    /// 「普通 + 高亮 + 普通」会整段涂上高亮背景、且 run.text 变成整段全文。
+    #[test]
+    fn background_only_span_does_not_leak_to_neighbours() {
+        let plain = TextStyle::new(Color::BLACK, 12.0, "sans-serif");
+        let marked = plain
+            .clone()
+            .with_background_color(Some(Color::rgb(0xff, 0xff, 0xcc)));
+
+        let layout = layout_text(
+            &[
+                RichSpan::new("pre ", plain.clone()),
+                RichSpan::new("marked", marked.clone()),
+                RichSpan::new(" post", plain.clone()),
+            ],
+            None,
+        );
+
+        assert_eq!(layout.lines.len(), 1);
+        let line = &layout.lines[0];
+
+        // 同字体同色不拆 style，但提取层必须按 span 切分：至少 3 个 run。
+        assert!(
+            line.runs.len() >= 3,
+            "应按 span 边界切分为至少 3 个 run，实际 {}",
+            line.runs.len()
+        );
+
+        // 背景色只应出现在中间的 span 上，且 run.text 应为各自的切片而非全文。
+        let bg_runs: Vec<_> = line
+            .runs
+            .iter()
+            .filter(|r| r.background_color.is_some())
+            .collect();
+        assert_eq!(bg_runs.len(), 1, "只有中间 span 的 run 携带背景色");
+        assert_eq!(bg_runs[0].text, "marked");
+        assert!(
+            line.runs.iter().all(|r| r.text != "pre marked post"),
+            "任何 run 的 text 都不应是拼接全文（Run::text_range 误用）"
+        );
+
+        // 字形总数守恒：4+6+5 = 15。
+        let total_glyphs: usize = line.runs.iter().map(|r| r.glyphs.len()).sum();
+        assert_eq!(total_glyphs, 15);
+    }
+
+    /// 回归：语法高亮场景（同一 span 内多次颜色变化）下，各 run 的 text 应为
+    /// 各自的字节区间切片，且 cluster 是相对 run.text 的局部偏移。
+    #[test]
+    fn colored_ranges_keep_per_piece_text() {
+        let base = TextStyle::new(Color::BLACK, 12.0, "sans-serif");
+        let mut red = base.clone();
+        red.color = Color::rgb(0xff, 0, 0);
+        let mut blue = base.clone();
+        blue.color = Color::rgb(0, 0, 0xff);
+
+        let layout = layout_text(
+            &[
+                RichSpan::new("fn ", red),
+                RichSpan::new("name", base.clone()),
+                RichSpan::new("() {}", blue),
+            ],
+            None,
+        );
+
+        let line = &layout.lines[0];
+        let texts: Vec<&str> = line.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(
+            texts.contains(&"fn "),
+            "应存在 text == \"fn \" 的 run，实际 {texts:?}"
+        );
+        assert!(
+            texts.contains(&"name") && texts.contains(&"() {}"),
+            "各 run 应为各自区间切片，实际 {texts:?}"
+        );
+        let total_glyphs: usize = line.runs.iter().map(|r| r.glyphs.len()).sum();
+        assert_eq!(total_glyphs, 12, "字形总数应守恒");
+    }
+
+    /// `TextRun::split_at`：按 cluster 对齐的字节切点切分，字形不丢、
+    /// cluster 重定基、advance 重算、baseline_x 取各 piece 首字形。
+    #[test]
+    fn split_at_partitions_glyphs_and_recomputes_metrics() {
+        let style = TextStyle::new(Color::BLACK, 12.0, "sans-serif");
+        let layout = layout_text(std::slice::from_ref(&RichSpan::new("abcdef", style)), None);
+        let run = layout.lines[0].runs[0].clone();
+        assert_eq!(run.glyphs.len(), 6);
+
+        let pieces = run.split_at(&[2, 5]);
+        assert_eq!(pieces.len(), 3);
+        let texts: Vec<&str> = pieces.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["ab", "cde", "f"]);
+
+        // 字形总数守恒，cluster 各自归零。
+        let total: usize = pieces.iter().map(|p| p.glyphs.len()).sum();
+        assert_eq!(total, 6);
+        for p in &pieces {
+            assert_eq!(p.glyphs[0].cluster, 0, "piece 首字形 cluster 应归零");
+            let expect: f32 = p.glyphs.iter().map(|g| g.advance).sum();
+            assert!((p.advance - expect).abs() < 1e-4, "advance 应按 piece 重算");
+        }
+        // baseline_x 依次取各 piece 首字形 x（供背景矩形 / 链接热区定位）。
+        assert!(pieces[0].baseline_x <= pieces[1].baseline_x);
+        assert!(pieces[1].baseline_x <= pieces[2].baseline_x);
+        // 原 run 不受影响。
+        assert_eq!(run.glyphs.len(), 6);
+        assert_eq!(run.text, "abcdef");
+    }
+
+    /// `TextRun::split_at`：无效切点（越界 / 非字符边界 / 未对齐 cluster）
+    /// 被忽略；无有效切点时原样返回。
+    #[test]
+    fn split_at_ignores_invalid_offsets() {
+        let style = TextStyle::new(Color::BLACK, 12.0, "sans-serif");
+        let layout = layout_text(std::slice::from_ref(&RichSpan::new("中文", style)), None);
+        // CJK 走回退字体，与 ASCII 部分不在同一 run；本测试只需 runs[0]（"中文"，
+        // 每字一个字形，cluster 为字节偏移 0 / 3）。
+        let run = layout.lines[0].runs[0].clone();
+        assert_eq!(run.text, "中文");
+        assert_eq!(run.glyphs.len(), 2);
+
+        // 切点 1 落在「中」的簇中间（非 cluster 对齐）→ 忽略；切点 3 有效；
+        // 切点 100 越界 → 忽略。
+        let pieces = run.split_at(&[1, 3, 100]);
+        let texts: Vec<&str> = pieces.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, vec!["中", "文"]);
+
+        // 无有效切点：原样返回。
+        let same = run.split_at(&[0, 100]);
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0].text, run.text);
+        assert_eq!(same[0].glyphs.len(), run.glyphs.len());
+    }
 }
