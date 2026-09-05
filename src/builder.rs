@@ -364,6 +364,8 @@ impl Ctx {
     fn shape_fill(&self) -> Color {
         let from_gradient = match &self.fill {
             Some(Fill::Solid(c)) => return *c,
+            // A sketch fill has a definite colour (the pen colour), so it behaves like a solid here.
+            Some(Fill::Sketch(sf)) => return sf.color,
             Some(Fill::LinearGradient(g)) => first_stop_color(&g.stops),
             Some(Fill::RadialGradient(g)) => first_stop_color(&g.stops),
             None => None,

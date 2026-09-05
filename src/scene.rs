@@ -605,6 +605,112 @@ pub enum Fill {
     Solid(Color),
     LinearGradient(LinearGradient),
     RadialGradient(RadialGradient),
+    /// Hand-drawn ("sketch") fill: a *style hint*, not literal geometry.
+    ///
+    /// The IR only records "this shape wants a hand-drawn fill"; each backend decides how to
+    /// express it:
+    /// - SVG: `<pattern>` (a tiny seamless tile + `patternTransform`), so the output stays small;
+    /// - raster (vello): explicit hachure strokes / dots, clipped to the shape.
+    ///
+    /// Nothing produces this variant unless [`crate::sketch`] is enabled — a scene built
+    /// normally never contains it, so default rendering is bit-for-bit unchanged.
+    Sketch(SketchFill),
+}
+
+/// Hand-drawn fill style (rough.js semantics: the fill is *drawn*, not painted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SketchFillStyle {
+    /// Parallel hachure lines (the rough.js default).
+    #[default]
+    Hachure,
+    /// Two crossing hachure families (90° apart).
+    CrossHatch,
+    /// Zig-zag hachure.
+    Zigzag,
+    /// Dot grid.
+    Dots,
+}
+
+/// Parameters of a [`Fill::Sketch`] fill.
+///
+/// `angle` / `gap` / `fill_weight` mirror rough.js' `hachureAngle` / `hachureGap` /
+/// `fillWeight`; both backends read the same numbers, so the two outputs agree on line
+/// direction, spacing and weight (they differ only in the rasterizer's anti-aliasing).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SketchFill {
+    /// Colour of the drawn lines / dots (rough.js draws the fill in the fill colour).
+    pub color: Color,
+    /// Fill style.
+    pub style: SketchFillStyle,
+    /// Hachure direction in **degrees**. Default `-41.0` (rough.js' `hachureAngle`).
+    pub angle: f64,
+    /// Spacing between two hachure lines, in scene units. Default `4.0`.
+    pub gap: f64,
+    /// Stroke width of a single hachure line. Default `0.5`.
+    pub fill_weight: f64,
+}
+
+impl SketchFill {
+    /// A hachure fill in `color`, with rough.js' default angle / gap / weight.
+    #[must_use]
+    pub fn new(color: Color) -> Self {
+        Self {
+            color,
+            style: SketchFillStyle::Hachure,
+            angle: -41.0,
+            gap: 4.0,
+            fill_weight: 0.5,
+        }
+    }
+
+    /// Set the fill style.
+    #[must_use]
+    pub fn with_style(mut self, style: SketchFillStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Set the hachure direction (degrees).
+    #[must_use]
+    pub fn with_angle(mut self, angle: f64) -> Self {
+        self.angle = angle;
+        self
+    }
+
+    /// Set the spacing between hachure lines.
+    #[must_use]
+    pub fn with_gap(mut self, gap: f64) -> Self {
+        self.gap = gap;
+        self
+    }
+
+    /// Set the weight (stroke width) of a hachure line.
+    #[must_use]
+    pub fn with_fill_weight(mut self, weight: f64) -> Self {
+        self.fill_weight = weight;
+        self
+    }
+
+    /// Effective gap, guarded against degenerate values (`0` / negative / NaN would make the
+    /// line count explode or the tile degenerate).
+    #[must_use]
+    pub fn gap(&self) -> f64 {
+        if self.gap.is_finite() && self.gap > 0.05 {
+            self.gap
+        } else {
+            4.0
+        }
+    }
+
+    /// Effective weight, guarded against non-positive / non-finite values.
+    #[must_use]
+    pub fn weight(&self) -> f64 {
+        if self.fill_weight.is_finite() && self.fill_weight > 0.0 {
+            self.fill_weight.min(self.gap() * 0.5)
+        } else {
+            0.5
+        }
+    }
 }
 
 impl From<Color> for Fill {

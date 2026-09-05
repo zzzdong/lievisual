@@ -17,6 +17,10 @@
 //!   groups — covering common chart / flowchart / Markdown needs.
 //! - **Varied fills**: solid color, linear gradient, radial gradient ([`scene::Fill`]); strokes
 //!   support line caps / joins, dashes (`dash_array` / `dash_offset`), and `miter_limit`.
+//! - **Hand-drawn style (opt-in)**: [`sketch`] is a post-pass that turns selected elements into
+//!   rough, pen-drawn outlines plus [`scene::Fill::Sketch`] fills. It never runs on its own: call
+//!   [`sketch::roughen_scene`] (or the selective [`sketch::roughen_scene_if`]) to enable it, and
+//!   pick which element kinds participate with [`sketch::SketchOptions::kinds`].
 //! - **Text (rich-text core)**: [`scene::Element::Text`] is built around styled spans
 //!   ([`text::RichSpan`]); typesetting / measurement go through the `&[RichSpan]` entry points
 //!   ([`text::measure_text`] / [`text::layout_text`]); it can carry a pre-laid-out
@@ -39,6 +43,7 @@ pub mod geometry;
 pub mod pixmap;
 pub mod render;
 pub mod scene;
+pub mod sketch;
 pub mod text;
 
 // Re-expose the glyph-outline extractor at the crate root (it lives under `text` now).
@@ -61,7 +66,11 @@ pub use geometry::{
 pub use pixmap::Pixmap;
 pub use scene::{
     Clip, Element, Fill, FillStrokeStyle, GradientStop, Layer, LineCap, LineJoin, LinearGradient,
-    ObjectFit, RadialGradient, Scene, SceneImage, SceneNode, Stroke,
+    ObjectFit, RadialGradient, Scene, SceneImage, SceneNode, SketchFill, SketchFillStyle, Stroke,
+};
+pub use sketch::{
+    SketchKind, SketchKinds, SketchOptions, roughen_element, roughen_scene, roughen_scene_fit,
+    roughen_scene_fit_if, roughen_scene_if,
 };
 pub use text::{
     FontSource, FontStyle, FontWeight, FontWidth, Glyph, LineMetrics, RichSpan, TextAlign,

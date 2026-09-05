@@ -18,7 +18,7 @@ use crate::geometry::{Point, Rect, Transform, Vec2};
 use crate::scene::{Element, FillStrokeStyle, Layer, Scene, SceneNode, Stroke};
 use kurbo::Shape;
 
-pub use svg::SvgRenderer;
+pub use svg::{SvgRenderer, SvgSizing};
 pub use vello_pixmap::VelloPixmapRenderer;
 
 mod svg;

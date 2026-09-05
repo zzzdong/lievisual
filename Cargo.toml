@@ -12,8 +12,7 @@ repository = "https://github.com/zzzdong/lievisual"
 homepage = "https://github.com/zzzdong/lievisual"
 keywords = ["graphics", "svg", "vello", "render", "scene"]
 categories = ["graphics", "rendering", "visualization"]
-# 打包发布时排除演示构建产物（demo.svg / demo.png 由 cargo run --example demo 生成）
-exclude = ["demo.svg", "demo.png"]
+exclude = ["*.png", "*.svg"]
 
 [dependencies]
 # 几何基础：f64 精度，与 vello_cpu / parley 内部 kurbo 版本对齐

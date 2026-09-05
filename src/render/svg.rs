@@ -18,10 +18,31 @@
 use crate::geometry::{Color, Point, Rect, Transform, Vec2};
 use crate::render::Renderer;
 use crate::scene::{
-    Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene, Stroke,
+    Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene, SketchFill,
+    SketchFillStyle, Stroke,
 };
 use crate::text::TextStyle;
 use std::fmt::Write;
+
+/// 根节点 `width` / `height` 的写法 —— 即 SVG **视口**尺寸的来源。
+///
+/// SVG 的视口（`width` / `height`）与用户坐标系（`viewBox`）是两回事：后者始终按
+/// `输出尺寸 / scale` 输出，这里的选项只决定前者要不要写、怎么写。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SvgSizing {
+    /// 写死输出尺寸：`width="{w}" height="{h}"`（默认）。
+    ///
+    /// 栅格 / 打印语义：文档在任意宿主下都是同一像素尺寸，不做任何自适应。
+    #[default]
+    Fixed,
+    /// 只写 `viewBox`，省略 `width` / `height`：视口尺寸交给宿主 CSS 决定。
+    ///
+    /// SVG 2 中这两个属性的初始值是 `auto`（解析为 `100%`），配合 `viewBox` 的固有宽高比
+    /// 即得到"跟随容器、等比缩放"的响应式行为。官方 mermaid 的
+    /// `width="100%" style="max-width: Wpx"` 是同一效果的另一种写法 —— 需要给宽容器封顶
+    /// 时，用 [`SvgRenderer::with_style`] 补一条 `max-width` 即可。
+    Intrinsic,
+}
 
 /// SVG renderer: accumulates the SVG string.
 pub struct SvgRenderer {
@@ -32,10 +53,17 @@ pub struct SvgRenderer {
     background: Option<Color>,
     gradient_id: usize,
     clip_id: usize,
+    /// Hand-drawn fill patterns already emitted: index = `sk{n}` id, deduplicated by value so
+    /// a hundred same-coloured cells share one `<pattern>`.
+    patterns: Vec<SketchFill>,
     title: Option<String>,
     description: Option<String>,
     /// `None` → fall back to [`Scene::scale`]; an explicit renderer value wins.
     scale: Option<f64>,
+    /// Root `width` / `height` strategy (the viewport); `viewBox` is always emitted.
+    sizing: SvgSizing,
+    /// Extra CSS appended to the root's `style` attribute, e.g. `max-width: 130px`.
+    style: Option<String>,
 }
 
 impl SvgRenderer {
@@ -51,9 +79,12 @@ impl SvgRenderer {
             background: None,
             gradient_id: 0,
             clip_id: 0,
+            patterns: Vec::new(),
             title: None,
             description: None,
             scale: None,
+            sizing: SvgSizing::Fixed,
+            style: None,
         }
     }
 
@@ -70,6 +101,23 @@ impl SvgRenderer {
     #[must_use]
     pub fn with_scale(mut self, scale: f64) -> Self {
         self.scale = Some(scale);
+        self
+    }
+
+    /// Root `width` / `height` strategy; see [`SvgSizing`].
+    #[must_use]
+    pub fn with_sizing(mut self, sizing: SvgSizing) -> Self {
+        self.sizing = sizing;
+        self
+    }
+
+    /// CSS appended to the root's `style` attribute (XML-attribute escaped).
+    ///
+    /// Used for things the backends cannot express: capping the rendered width
+    /// (`max-width: 130px`), declaring a `background-color`, ...
+    #[must_use]
+    pub fn with_style(mut self, style: impl Into<String>) -> Self {
+        self.style = Some(style.into());
         self
     }
 
@@ -102,17 +150,30 @@ impl SvgRenderer {
     /// never silently enlarges the output. To export a scene at 2× density, pass
     /// `new(w * 2.0, h * 2.0)` (the `new(0.0, 0.0)` fallback does this for you, treating
     /// `scene.width`/`scene.height` as logical size).
+    ///
+    /// That size only reaches the root `width` / `height` attributes under
+    /// [`SvgSizing::Fixed`]; under [`SvgSizing::Intrinsic`] the viewport is left to the host
+    /// CSS and only `viewBox` carries the geometry.
     pub fn into_string(self) -> String {
         let mut out = String::new();
         let scale = self.scale.unwrap_or(1.0);
         // viewBox 用"用户坐标系"：输出尺寸 / scale。scale=1 时与输出尺寸相同。
         let vw = self.width / scale;
         let vh = self.height / scale;
-        let _ = writeln!(
-            out,
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{:.2}" height="{:.2}" viewBox="0 0 {:.2} {:.2}">"#,
-            self.width, self.height, vw, vh
-        );
+        let _ = write!(out, r#"<svg xmlns="http://www.w3.org/2000/svg""#);
+        // 视口：写死输出尺寸，或省略让宿主 CSS 决定（见 SvgSizing）。
+        if self.sizing == SvgSizing::Fixed {
+            let _ = write!(
+                out,
+                r#" width="{:.2}" height="{:.2}""#,
+                self.width, self.height
+            );
+        }
+        let _ = write!(out, r#" viewBox="0 0 {:.2} {:.2}""#, vw, vh);
+        if let Some(style) = &self.style {
+            let _ = write!(out, r#" style="{}""#, escape_attr(style));
+        }
+        let _ = writeln!(out, ">");
         if let Some(t) = &self.title {
             let _ = writeln!(out, "<title>{}</title>", escape_text(t));
         }
@@ -694,11 +755,75 @@ impl SvgRenderer {
                 self.buf.push_str(&defs);
                 write!(el, r#" fill="url(#grad{})""#, gid).unwrap();
             }
+            Some(Fill::Sketch(sf)) => {
+                let pid = self.sketch_pattern(sf);
+                let _ = write!(el, r#" fill="url(#sk{})""#, pid);
+            }
             None => write!(el, r#" fill="none""#).unwrap(),
         }
         if let Some(s) = &style.stroke {
             self.append_stroke(el, s);
         }
+    }
+
+    /// Emit (or reuse) the `<pattern>` for a hand-drawn fill, returning its numeric id.
+    ///
+    /// Two things make this work:
+    /// - **The tile is axis-aligned; the angle lives in `patternTransform`.** Drawing the
+    ///   diagonal inside the tile leaves visible seams at every tile edge for most angles, while
+    ///   rotating a tile that contains a plain vertical line tiles seamlessly at *any* angle.
+    /// - **Content is inset by half the stroke weight.** A pattern tile clips at its edges, so a
+    ///   line sitting exactly at `x = 0` would survive at half weight with a matching gap in the
+    ///   neighbour tile.
+    ///
+    /// The pool is keyed by the whole [`SketchFill`] (colour, style, angle, gap, weight), so N
+    /// identical shapes still cost exactly one `<pattern>`.
+    fn sketch_pattern(&mut self, sf: &SketchFill) -> usize {
+        if let Some(id) = self.patterns.iter().position(|p| p == sf) {
+            return id;
+        }
+        let id = self.patterns.len();
+        self.patterns.push(sf.clone());
+
+        let gap = sf.gap();
+        let w = sf.weight();
+        let inset = (w * 0.5).min(gap * 0.25);
+        let a = inset;
+        let b = gap - inset;
+        let mid = gap * 0.5;
+        // cross-hatch = two orthogonal families; rotating a "vertical + horizontal" tile by
+        // angle+45 yields exactly {angle-45, angle+45}, i.e. rough.js' cross-hatch.
+        let angle = match sf.style {
+            SketchFillStyle::CrossHatch => sf.angle + 45.0,
+            _ => sf.angle,
+        };
+        let content = match sf.style {
+            SketchFillStyle::Hachure => format!(
+                r#"<line x1="{mid:.2}" y1="0" x2="{mid:.2}" y2="{gap:.2}"{stroke} stroke-width="{w:.2}"/>"#,
+                stroke = color_attr_str("stroke", sf.color)
+            ),
+            SketchFillStyle::CrossHatch => format!(
+                r#"<line x1="{mid:.2}" y1="0" x2="{mid:.2}" y2="{gap:.2}"{stroke} stroke-width="{w:.2}"/><line x1="0" y1="{mid:.2}" x2="{gap:.2}" y2="{mid:.2}"{stroke} stroke-width="{w:.2}"/>"#,
+                stroke = color_attr_str("stroke", sf.color)
+            ),
+            SketchFillStyle::Zigzag => format!(
+                r#"<polyline fill="none" points="{a:.2},0 {b:.2},{q:.2} {a:.2},{m:.2} {b:.2},{t:.2} {a:.2},{gap:.2}"{stroke} stroke-width="{w:.2}"/>"#,
+                q = gap * 0.25,
+                m = gap * 0.5,
+                t = gap * 0.75,
+                stroke = color_attr_str("stroke", sf.color)
+            ),
+            SketchFillStyle::Dots => format!(
+                r#"<circle cx="{mid:.2}" cy="{mid:.2}" r="{r:.2}"{fill}/>"#,
+                r = crate::sketch::fill::dot_radius(sf),
+                fill = color_attr_str("fill", sf.color)
+            ),
+        };
+        let defs = format!(
+            r#"<defs><pattern id="sk{id}" width="{gap:.2}" height="{gap:.2}" patternUnits="userSpaceOnUse" patternTransform="rotate({angle:.2})">{content}</pattern></defs>"#
+        );
+        self.buf.push_str(&defs);
+        id
     }
 
     fn apply_stroke_only(&self, el: &mut String, style: &Stroke) {
@@ -1820,6 +1945,222 @@ mod tests {
         assert!(
             !out.contains("#ff000080") && !out.contains("#0000ff80"),
             "不应输出 8 位 hex: {out}"
+        );
+    }
+
+    // ——— 手绘填充（Fill::Sketch → <pattern>）———
+
+    fn sketch_rect(color: crate::geometry::Color, style: SketchFillStyle) -> Scene {
+        let mut scene = Scene::new(200.0, 200.0);
+        scene.push(Element::rect(
+            Rect::new(10.0, 10.0, 100.0, 80.0),
+            FillStrokeStyle {
+                fill: Some(Fill::Sketch(SketchFill::new(color).with_style(style))),
+                stroke: None,
+            },
+        ));
+        scene
+    }
+
+    #[test]
+    fn sketch_fill_emits_one_pattern_definition() {
+        let out = render(&sketch_rect(
+            Color::rgb(0x33, 0x66, 0x99),
+            SketchFillStyle::Hachure,
+        ));
+        assert!(out.contains(r#"<pattern id="sk0""#), "{out}");
+        assert!(out.contains(r#"patternUnits="userSpaceOnUse""#), "{out}");
+        // 角度交给 patternTransform，tile 内只画竖线 → 任意角度都无缝。
+        assert!(
+            out.contains(r#"patternTransform="rotate(-41.00)""#),
+            "{out}"
+        );
+        assert!(out.contains(r#"fill="url(#sk0)""#), "{out}");
+        assert_eq!(out.matches("<pattern").count(), 1, "只应定义一次: {out}");
+    }
+
+    /// pattern 池：100 个同色同参数的矩形只产生一个 <pattern>；
+    /// 这正是"元素数爆炸"防护在 SVG 侧的表现（体积与元素数无关）。
+    #[test]
+    fn identical_sketch_fills_share_one_pattern() {
+        let mut scene = Scene::new(400.0, 400.0);
+        for i in 0..100 {
+            let x = (i % 10) as f64 * 20.0;
+            let y = (i / 10) as f64 * 20.0;
+            scene.push(Element::rect(
+                Rect::new(x, y, x + 16.0, y + 16.0),
+                FillStrokeStyle {
+                    fill: Some(Fill::Sketch(SketchFill::new(Color::rgb(0xcc, 0x33, 0x33)))),
+                    stroke: None,
+                },
+            ));
+        }
+        let out = render(&scene);
+        assert_eq!(out.matches("<pattern").count(), 1, "pattern 数应 ≤1: {out}");
+        assert_eq!(out.matches(r#"fill="url(#sk0)""#).count(), 100);
+    }
+
+    /// 4 种样式 × 2 种颜色 → 最多 4 个 pattern（每种组合一个）。
+    #[test]
+    fn pattern_pool_is_keyed_by_all_parameters() {
+        let mut scene = Scene::new(300.0, 100.0);
+        for (i, style) in [
+            SketchFillStyle::Hachure,
+            SketchFillStyle::CrossHatch,
+            SketchFillStyle::Zigzag,
+            SketchFillStyle::Dots,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            scene.push(Element::rect(
+                Rect::new(i as f64 * 70.0, 10.0, i as f64 * 70.0 + 60.0, 80.0),
+                FillStrokeStyle {
+                    fill: Some(Fill::Sketch(
+                        SketchFill::new(Color::rgb(0x11, 0x22, 0x33)).with_style(style),
+                    )),
+                    stroke: None,
+                },
+            ));
+        }
+        let out = render(&scene);
+        assert_eq!(out.matches("<pattern").count(), 4, "四种样式各一个: {out}");
+        assert!(out.contains("<circle"), "Dots 用圆点: {out}");
+        assert!(out.contains("<polyline"), "Zigzag 用折线: {out}");
+    }
+
+    /// 不同颜色必须各自成 pattern（去重不能吃掉颜色）。
+    #[test]
+    fn different_colors_get_different_patterns() {
+        let mut scene = Scene::new(300.0, 100.0);
+        for (i, c) in [
+            Color::rgb(0xff, 0x00, 0x00),
+            Color::rgb(0x00, 0xff, 0x00),
+            Color::rgb(0x00, 0x00, 0xff),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            scene.push(Element::rect(
+                Rect::new(i as f64 * 90.0, 10.0, i as f64 * 90.0 + 80.0, 80.0),
+                FillStrokeStyle {
+                    fill: Some(Fill::Sketch(SketchFill::new(c))),
+                    stroke: None,
+                },
+            ));
+        }
+        let out = render(&scene);
+        assert_eq!(out.matches("<pattern").count(), 3, "{out}");
+    }
+
+    /// 半透明排线颜色必须拆成 stroke-opacity（与 fill/stroke 的惯例一致，
+    /// 不能被 SVG→PDF 工具链拒绝）。
+    #[test]
+    fn translucent_sketch_color_uses_stroke_opacity() {
+        let out = render(&sketch_rect(
+            Color::rgba(0x33, 0x66, 0x99, 128),
+            SketchFillStyle::Hachure,
+        ));
+        assert!(out.contains(r#"stroke-opacity="0.502""#), "{out}");
+        assert!(!out.contains("#33669980"), "不应输出 8 位 hex: {out}");
+    }
+
+    /// tile 内容必须内缩半个线宽：贴边画的线会被 pattern 边界裁掉一半，
+    /// 相邻 tile 又补不回来 → 排线会变成半宽虚线。
+    #[test]
+    fn pattern_tile_content_is_inset_from_the_edges() {
+        let out = render(&sketch_rect(Color::BLACK, SketchFillStyle::Hachure));
+        let gap = 4.0;
+        assert!(
+            out.contains(&format!(r#"x1="{:.2}""#, gap * 0.5)),
+            "竖线应在 tile 中间: {out}"
+        );
+        assert!(!out.contains(r#"x1="0.00""#), "线不应贴在 tile 边缘: {out}");
+    }
+
+    /// 未开启手绘时，SVG 输出里不应出现任何 pattern（默认零影响）。
+    #[test]
+    fn no_pattern_without_a_sketch_fill() {
+        let mut scene = Scene::new(100.0, 100.0);
+        scene.push(Element::rect(
+            Rect::new(10.0, 10.0, 90.0, 90.0),
+            FillStrokeStyle::fill(Color::rgb(0x33, 0x66, 0x99)),
+        ));
+        let out = render(&scene);
+        assert!(!out.contains("<pattern"), "{out}");
+        assert!(!out.contains("<defs>"), "{out}");
+    }
+
+    fn render_with(scene: &Scene, f: impl FnOnce(SvgRenderer) -> SvgRenderer) -> String {
+        let mut svg = f(SvgRenderer::new(scene.width, scene.height).with_background(Color::WHITE));
+        scene.render(&mut svg);
+        svg.into_string()
+    }
+
+    fn sized_scene() -> Scene {
+        let mut scene = Scene::new(120.0, 60.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            FillStrokeStyle::fill(Color::RED),
+        ));
+        scene
+    }
+
+    /// 默认（也是历史行为）：视口写死为输出尺寸。
+    #[test]
+    fn fixed_sizing_writes_width_and_height() {
+        let out = render_with(&sized_scene(), |r| r);
+        assert!(
+            out.starts_with(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="120.00" height="60.00" viewBox="0 0 120.00 60.00">"#
+            ),
+            "{out}"
+        );
+    }
+
+    /// 响应式：只写 viewBox，视口交给宿主 CSS（SVG 2 的 auto ≈ 100%）。
+    #[test]
+    fn intrinsic_sizing_omits_width_and_height() {
+        let out = render_with(&sized_scene(), |r| r.with_sizing(SvgSizing::Intrinsic));
+        assert!(
+            out.starts_with(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120.00 60.00">"#
+            ),
+            "{out}"
+        );
+        assert!(!out.contains(r#"<svg width="#), "根节点不应带 width: {out}");
+    }
+
+    /// `style` 追加到根节点并做属性转义（下游用它写 max-width / background-color）。
+    #[test]
+    fn root_style_is_emitted_and_escaped() {
+        let out = render_with(&sized_scene(), |r| {
+            r.with_sizing(SvgSizing::Intrinsic)
+                .with_style(r#"max-width: 120.000px; background-color: #ffffff;"#)
+        });
+        assert!(
+            out.starts_with(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120.00 60.00" style="max-width: 120.000px; background-color: #ffffff;">"#
+            ),
+            "{out}"
+        );
+
+        // 引号必须转义，否则 style 属性会提前闭合。
+        let out = render_with(&sized_scene(), |r| r.with_style(r#"content: "x""#));
+        assert!(out.contains(r#"style="content: &quot;x&quot;""#), "{out}");
+    }
+
+    /// scale 只缩放 viewBox：Intrinsic 下 viewBox 仍是 输出尺寸/scale。
+    #[test]
+    fn intrinsic_sizing_keeps_scale_in_viewbox() {
+        let out = render_with(&sized_scene(), |r| {
+            r.with_scale(2.0).with_sizing(SvgSizing::Intrinsic)
+        });
+        assert!(
+            out.starts_with(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60.00 30.00">"#
+            ),
+            "{out}"
         );
     }
 }

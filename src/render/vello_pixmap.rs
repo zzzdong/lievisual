@@ -19,7 +19,8 @@ use vello_cpu::{Pixmap, RenderContext, Resources};
 use crate::geometry::{Color, Point, Rect, Transform};
 use crate::render::Renderer;
 use crate::scene::{
-    Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene, Stroke,
+    Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene, SketchFill,
+    Stroke,
 };
 use crate::text::TextStyle;
 
@@ -273,6 +274,10 @@ impl VelloPixmapRenderer {
     }
 
     /// Set the current brush according to `Fill` (Solid / linear / radial gradient).
+    ///
+    /// [`Fill::Sketch`] is *not* painted here — a hand-drawn fill is pen strokes, not a brush;
+    /// it goes through [`Self::paint_sketch_fill`]. This arm only exists so an accidental direct
+    /// call degrades to the pen colour instead of doing nothing.
     fn set_fill(&mut self, fill: &Fill) {
         use vello_cpu::peniko::{GradientKind, LinearGradientPosition, RadialGradientPosition};
         match fill {
@@ -291,22 +296,74 @@ impl VelloPixmapRenderer {
                 ));
                 self.paint_gradient(kind, &g.stops);
             }
+            Fill::Sketch(sf) => self.ctx.set_paint(self.to_vello(&sf.color)),
         }
     }
 
     /// Unified drawing: fill (any type) + optional stroke (including dashes).
     fn paint_path(&mut self, path: &BezPath, style: &FillStrokeStyle) {
-        if let Some(fill) = &style.fill {
-            self.set_fill(fill);
-            self.ctx.fill_path(path);
-            // A gradient fill set a user-space paint transform; reset it after drawing.
-            self.ctx.reset_paint_transform();
+        match &style.fill {
+            Some(Fill::Sketch(sf)) => self.paint_sketch_fill(path, sf),
+            Some(fill) => {
+                self.set_fill(fill);
+                self.ctx.fill_path(path);
+                // A gradient fill set a user-space paint transform; reset it after drawing.
+                self.ctx.reset_paint_transform();
+            }
+            None => {}
         }
         if let Some(s) = &style.stroke {
             self.ctx.set_paint(self.to_vello(&s.color));
             self.ctx.set_stroke(Self::kurbo_stroke(s));
             self.ctx.stroke_path(path);
         }
+    }
+
+    /// Draw a hand-drawn fill: real pen strokes (or dots) clipped to the shape.
+    ///
+    /// vello has no `<pattern>` equivalent, so the fill is materialised — but the naive "one clip
+    /// per stroke" would open hundreds of mask layers for a single shape. Everything belonging
+    /// to one element is therefore batched into **one** path under a single clip push/pop.
+    fn paint_sketch_fill(&mut self, path: &BezPath, sf: &SketchFill) {
+        let bbox = path.bounding_box();
+        if !bbox.is_finite() || bbox.width() <= 0.0 || bbox.height() <= 0.0 {
+            return;
+        }
+        let cap = crate::sketch::fill::HARD_CAP;
+        self.ctx.set_paint(self.to_vello(&sf.color));
+        self.ctx.push_clip_path(path);
+        if crate::sketch::fill::is_stroke_style(sf) {
+            let mut strokes = BezPath::new();
+            for line in crate::sketch::fill::strokes(bbox, sf, cap) {
+                let mut it = line.iter();
+                if let Some(p0) = it.next() {
+                    strokes.move_to(VPoint::new(p0.x, p0.y));
+                    for p in it {
+                        strokes.line_to(VPoint::new(p.x, p.y));
+                    }
+                }
+            }
+            if !strokes.elements().is_empty() {
+                self.ctx.set_stroke(KurboStroke {
+                    width: sf.weight(),
+                    join: kurbo::Join::Round,
+                    start_cap: kurbo::Cap::Butt,
+                    end_cap: kurbo::Cap::Butt,
+                    ..Default::default()
+                });
+                self.ctx.stroke_path(&strokes);
+            }
+        } else {
+            let (centers, r) = crate::sketch::fill::dots(bbox, sf, cap);
+            if !centers.is_empty() {
+                let mut dots = BezPath::new();
+                for c in centers {
+                    dots.extend(Circle::new(VPoint::new(c.x, c.y), r).to_path(0.3));
+                }
+                self.ctx.fill_path(&dots);
+            }
+        }
+        self.ctx.pop_clip_path();
     }
 }
 
@@ -747,7 +804,9 @@ fn resize_rgba8(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::geometry::{Color, Point, Rect, Transform};
-    use crate::scene::{Element, FillStrokeStyle, GradientStop, LinearGradient, Scene, SceneNode};
+    use crate::scene::{
+        Element, FillStrokeStyle, GradientStop, LinearGradient, Scene, SceneNode, SketchFillStyle,
+    };
 
     /// 提取 pixmap 像素为 RGBA u8 数组（非预乘，用于比较）。
     fn pixels(pixmap: &Pixmap) -> Vec<u8> {
@@ -862,6 +921,80 @@ mod tests {
         }
         let p = &pixmap.data()[(y * w + x) as usize];
         (p.r, p.g, p.b, p.a)
+    }
+
+    // ——— 手绘填充（Fill::Sketch → 排线 + clip）———
+
+    fn sketch_scene(style: SketchFillStyle) -> Scene {
+        let mut scene = Scene::new(80.0, 80.0);
+        scene.push(Element::rect(
+            Rect::new(10.0, 10.0, 70.0, 70.0),
+            FillStrokeStyle {
+                fill: Some(Fill::Sketch(
+                    SketchFill::new(Color::rgb(0xff, 0x00, 0x00)).with_style(style),
+                )),
+                stroke: None,
+            },
+        ));
+        scene
+    }
+
+    /// 排线必须被形状裁住：内部有红色笔触，外部保持背景。
+    #[test]
+    fn sketch_fill_is_clipped_to_the_shape() {
+        let mut r = VelloPixmapRenderer::new(80, 80).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&sketch_scene(SketchFillStyle::Hachure));
+        let outside = pixel_at(&pix, 2, 40);
+        assert!(
+            outside.0 > 240 && outside.1 > 240 && outside.2 > 240,
+            "形状外不应有排线: {outside:?}"
+        );
+        let red = (10..70)
+            .flat_map(|y| (10..70).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let p = pixel_at(&pix, x, y);
+                p.0 > 80 && p.1 < 120 && p.2 < 120
+            })
+            .count();
+        assert!(red > 50, "形状内应出现红色排线, got {red}");
+    }
+
+    /// 点阵填充同样要落在形状内。
+    #[test]
+    fn dot_fill_is_clipped_to_the_shape() {
+        let mut r = VelloPixmapRenderer::new(80, 80).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&sketch_scene(SketchFillStyle::Dots));
+        let outside = pixel_at(&pix, 75, 5);
+        assert!(
+            outside.0 > 240 && outside.1 > 240 && outside.2 > 240,
+            "形状外不应有点: {outside:?}"
+        );
+        let red = (10..70)
+            .flat_map(|y| (10..70).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let p = pixel_at(&pix, x, y);
+                p.0 > 80 && p.1 < 120 && p.2 < 120
+            })
+            .count();
+        assert!(red > 20, "形状内应出现红色点阵, got {red}");
+    }
+
+    /// 元素数保护：超大形状 + 极小 gap 也不会把光栅化拖垮（gap 在 sketch pass 里已被抬高）。
+    #[test]
+    fn sketch_fill_survives_a_huge_shape() {
+        let mut scene = Scene::new(200.0, 200.0);
+        let mut sf = SketchFill::new(Color::rgb(0x00, 0x80, 0x00)).with_gap(0.01);
+        sf.fill_weight = 0.3;
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 200.0, 200.0),
+            FillStrokeStyle {
+                fill: Some(Fill::Sketch(sf)),
+                stroke: None,
+            },
+        ));
+        let mut r = VelloPixmapRenderer::new(200, 200);
+        let pix = r.render_scene_to_pixmap(&scene);
+        assert_eq!(pix.width(), 200);
     }
 
     /// 覆盖：圆/椭圆/圆角矩形/多边形/圆弧/扇形 在 vello 端都能渲染出对应颜色。
