@@ -1,6 +1,9 @@
 //! Rasterization backend based on `vello_cpu`.
 //!
-//! Renders a [`Scene`] into a `vello_cpu::Pixmap`, which can be further exported to PNG.
+//! Renders a [`Scene`] into a [`crate::Pixmap`] (self-contained, non-premultiplied RGBA8),
+//! which can be further exported to PNG. Internally it rasterizes through `vello_cpu` and
+//! converts the result to lievisual's own bitmap type, so downstream code never needs to
+//! depend on `vello_cpu` directly.
 //! Text prefers the caller-provided [`text::TextLayout`]; if absent, it is laid out on the fly
 //! via [`text::measure_text`].
 //!
@@ -14,9 +17,10 @@
 
 use kurbo::{BezPath, Circle, Point as VPoint, Rect as VRect, Shape, Stroke as KurboStroke};
 use vello_cpu::peniko::color::AlphaColor;
-use vello_cpu::{Pixmap, RenderContext, Resources};
+use vello_cpu::{PixelMetadata, Pixmap as VelloPixmap, RenderContext, Resources};
 
 use crate::geometry::{Color, Point, Rect, Transform};
+use crate::pixmap::Pixmap;
 use crate::render::Renderer;
 use crate::scene::{
     Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene, SketchFill,
@@ -87,7 +91,7 @@ impl VelloPixmapRenderer {
         self
     }
 
-    /// Render the scene and return a Pixmap.
+    /// Render the scene and return a [`crate::Pixmap`] (non-premultiplied RGBA8).
     ///
     /// Reuses the same `RenderContext` / `Resources` (glyph, atlas caches persist across frames);
     /// `reset()` clears the previous frame's scene before each render, so the same renderer can
@@ -165,9 +169,13 @@ impl VelloPixmapRenderer {
             self.ctx.set_transform(vello_cpu::kurbo::Affine::IDENTITY);
         }
 
-        let mut pixmap = Pixmap::new(out_w, out_h);
-        self.ctx.render(&mut pixmap, &mut self.resources);
-        pixmap
+        let mut vello_pixmap = VelloPixmap::new(out_w, out_h);
+        self.ctx.render(&mut vello_pixmap, &mut self.resources);
+        // vello 的 Pixmap 是**预乘** RGBA8；对外统一返回 lievisual 自有的**非预乘** RGBA8
+        // [`crate::Pixmap`]（与 PNG / SVG 内嵌及其它后端同语义），使下游无需依赖 vello_cpu。
+        let data = pixmap_to_rgba8(&vello_pixmap);
+        Pixmap::from_rgba8(u32::from(out_w), u32::from(out_h), data)
+            .expect("渲染输出尺寸与像素缓冲区长度不一致")
     }
 
     /// Render the scene and export PNG bytes (depends on the permanent `png` encoder).
@@ -175,8 +183,7 @@ impl VelloPixmapRenderer {
     /// The PNG size equals the renderer's canvas size (see
     /// [`VelloPixmapRenderer::render_scene_to_pixmap`]); `scene.scale` is not applied.
     pub fn render_png(&mut self, scene: &Scene) -> Vec<u8> {
-        let pixmap = self.render_scene_to_pixmap(scene);
-        pixmap_to_png(&pixmap)
+        self.render_scene_to_pixmap(scene).to_png()
     }
 
     /// The currently active composed opacity (default 1.0).
@@ -363,7 +370,7 @@ impl VelloPixmapRenderer {
                 self.ctx.fill_path(&dots);
             }
         }
-        self.ctx.pop_clip_path();
+        self.ctx.pop_clip();
     }
 }
 
@@ -523,11 +530,10 @@ impl Renderer for VelloPixmapRenderer {
         let rgba = resize_rgba8(src.pixels(), src.width(), src.height(), dest_w, dest_h);
 
         // 应用整体 opacity：预乘到 alpha 通道（frame 透明底，src-over 合成正确）。
-        let mut dest_pixels: Vec<vello_cpu::color::PremulRgba8> = vec![
-                vello_cpu::color::PremulRgba8::from_u8_array([0, 0, 0, 0]);
-                (frame_w * frame_h) as usize
-            ];
-        let src_pixels: Vec<vello_cpu::color::PremulRgba8> = rgba
+        // 位图以 **预乘 RGBA8 字节** 构造：vello_cpu 0.3 的 `Pixmap::from_parts` 收 `Vec<u8>`
+        // （旧版收 `Vec<PremulRgba8>`），配合默认 `PixelMetadata`（已预乘 + 可能含透明）。
+        let mut dest_pixels: Vec<u8> = vec![0u8; (frame_w * frame_h * 4) as usize];
+        let src_pixels: Vec<[u8; 4]> = rgba
             .as_chunks::<4>()
             .0
             .iter()
@@ -535,12 +541,7 @@ impl Renderer for VelloPixmapRenderer {
                 let [r, g, b, a] = [p[0], p[1], p[2], p[3]];
                 // 四舍五入而非截断，减少大批量像素上的系统性偏暗。
                 let a = ((a as f64) * op).round() as u8;
-                vello_cpu::color::PremulRgba8 {
-                    r: premul(r, a),
-                    g: premul(g, a),
-                    b: premul(b, a),
-                    a,
-                }
+                [premul(r, a), premul(g, a), premul(b, a), a]
             })
             .collect();
 
@@ -559,13 +560,17 @@ impl Renderer for VelloPixmapRenderer {
                     continue;
                 }
                 let sidx = (row * dest_w as i64 + col) as usize;
-                let didx = (dy * frame_w as i64 + dx) as usize;
-                dest_pixels[didx] = src_pixels[sidx];
+                let didx = (dy * frame_w as i64 + dx) as usize * 4;
+                dest_pixels[didx..didx + 4].copy_from_slice(&src_pixels[sidx]);
             }
         }
 
-        let dest_pixmap =
-            vello_cpu::Pixmap::from_parts(dest_pixels, frame_w as u16, frame_h as u16);
+        let dest_pixmap = VelloPixmap::from_parts(
+            dest_pixels,
+            frame_w as u16,
+            frame_h as u16,
+            PixelMetadata::default(),
+        );
         let brush = vello_cpu::Image {
             image: vello_cpu::ImageSource::Pixmap(std::sync::Arc::new(dest_pixmap)),
             sampler: vello_cpu::peniko::ImageSampler::default(),
@@ -648,7 +653,10 @@ impl Renderer for VelloPixmapRenderer {
                     0,
                 );
                 self.ctx.set_paint(self.to_vello(&run.color));
-                self.ctx
+                // vello_cpu 0.3：`fill_glyphs` 返回 `Result`——个别字形失败时为 Err，
+                // 但其余字形仍会绘制；这里按"尽力绘制"处理，忽略错误。
+                let _ = self
+                    .ctx
                     .glyph_run(&mut self.resources, &font_data)
                     .font_size(run.font_size)
                     .glyph_transform(transform)
@@ -693,7 +701,7 @@ impl Renderer for VelloPixmapRenderer {
     }
 
     fn pop_clip(&mut self) {
-        self.ctx.pop_clip_path();
+        self.ctx.pop_clip();
     }
 }
 
@@ -712,8 +720,8 @@ fn unpremultiply(c: u8, a: u8) -> u8 {
     }
 }
 
-/// vello Pixmap → 非预乘 RGBA8 字节。
-fn pixmap_to_rgba8(pixmap: &Pixmap) -> Vec<u8> {
+/// vello 预乘 Pixmap → 非预乘 RGBA8 字节。
+fn pixmap_to_rgba8(pixmap: &VelloPixmap) -> Vec<u8> {
     let mut data = Vec::with_capacity(pixmap.data().len() * 4);
     for p in pixmap.data() {
         data.extend_from_slice(&[
@@ -724,23 +732,6 @@ fn pixmap_to_rgba8(pixmap: &Pixmap) -> Vec<u8> {
         ]);
     }
     data
-}
-
-/// 将 vello Pixmap 转为 PNG 字节（预乘 RGBA → 非预乘 RGBA8 → PNG，经 `png` 常驻依赖）。
-fn pixmap_to_png(pixmap: &Pixmap) -> Vec<u8> {
-    let (w, h) = (pixmap.width() as u32, pixmap.height() as u32);
-    let data = pixmap_to_rgba8(pixmap);
-    let mut out = Vec::with_capacity(data.len() + 64);
-    {
-        let mut enc = png::Encoder::new(&mut out, w, h);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut writer = enc.write_header().expect("PNG 编码：写入头失败");
-        writer
-            .write_image_data(&data)
-            .expect("PNG 编码：写入像素失败");
-    }
-    out
 }
 
 /// 通道值按 alpha 预乘（`c * a / 255`，四舍五入）。
@@ -810,7 +801,7 @@ mod tests {
 
     /// 提取 pixmap 像素为 RGBA u8 数组（非预乘，用于比较）。
     fn pixels(pixmap: &Pixmap) -> Vec<u8> {
-        pixmap_to_rgba8(pixmap)
+        pixmap.pixels().to_vec()
     }
 
     /// 渲染并解码为 RGBA8（走 render_png 全链路，覆盖 PNG 编码）。
@@ -902,25 +893,28 @@ mod tests {
     /// 统计 pixmap 中近似等于给定 RGB 的像素数（容差 tol）。
     fn count_color(pixmap: &Pixmap, rgb: (u8, u8, u8), tol: u8) -> usize {
         pixmap
-            .data()
+            .pixels()
+            .as_chunks::<4>()
+            .0
             .iter()
             .filter(|p| {
-                p.r.abs_diff(rgb.0) <= tol
-                    && p.g.abs_diff(rgb.1) <= tol
-                    && p.b.abs_diff(rgb.2) <= tol
+                p[0].abs_diff(rgb.0) <= tol
+                    && p[1].abs_diff(rgb.1) <= tol
+                    && p[2].abs_diff(rgb.2) <= tol
             })
             .count()
     }
 
     /// 读取 (x, y) 处的像素（RGBA）。越界返回 (0,0,0,0)。
     fn pixel_at(pixmap: &Pixmap, x: u32, y: u32) -> (u8, u8, u8, u8) {
-        let w = pixmap.width() as u32;
-        let h = pixmap.height() as u32;
+        let w = pixmap.width();
+        let h = pixmap.height();
         if x >= w || y >= h {
             return (0, 0, 0, 0);
         }
-        let p = &pixmap.data()[(y * w + x) as usize];
-        (p.r, p.g, p.b, p.a)
+        let i = ((y * w + x) as usize) * 4;
+        let p = &pixmap.pixels()[i..i + 4];
+        (p[0], p[1], p[2], p[3])
     }
 
     // ——— 手绘填充（Fill::Sketch → 排线 + clip）———
@@ -1185,9 +1179,11 @@ mod tests {
         let mut r = VelloPixmapRenderer::new(200, 60).with_background(Color::WHITE);
         let pix = r.render_scene_to_pixmap(&scene);
         let non_white = pix
-            .data()
+            .pixels()
+            .as_chunks::<4>()
+            .0
             .iter()
-            .filter(|p| p.r < 250 || p.g < 250 || p.b < 250)
+            .filter(|p| p[0] < 250 || p[1] < 250 || p[2] < 250)
             .count();
         assert!(non_white > 20, "字形应产生非白像素, got {non_white}");
     }

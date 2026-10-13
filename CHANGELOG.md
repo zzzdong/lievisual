@@ -5,7 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — 2026-10-13
+
+Breaking release aligned with `vello_cpu` 0.3 / `parley` 0.12. Downstream can now depend on
+lievisual alone for rasterization and text layout — no direct `vello_cpu` / `parley` dependency.
+
+### Changed
+
+- **`VelloPixmapRenderer::render_scene_to_pixmap` now returns [`crate::Pixmap`]** (lievisual's own
+  non-premultiplied RGBA8 bitmap) instead of `vello_cpu::Pixmap`. This removes the last public API
+  that leaked a `vello_cpu` type, so downstream no longer needs `vello_cpu` in its dependency tree.
+  `render_png` is unchanged (`-> Vec<u8>`).
+- Text metrics migrated to parley 0.12: `LineMetrics` drops the `ascent` / `descent` fields (now the
+  methods `ascent()` / `descent()`) and gains `block_min` / `block_max` / `content_block_min` /
+  `content_block_max` / `cap_height` / `x_height`. `TextLayout` / `TextLine` drop the per-glyph
+  `ink_bounds` field and `TextLayout::ink_bounds()`; use the font-level boxes `layout_bounds` /
+  `line_box_bounds` / `logical_bounds` / `cap_bounds` instead.
+- `parley` re-export bumped to 0.12.
+
+### Removed
+
+- **`GlyphOutline` / the `skrifa` dependency.** The glyph-outline extractor
+  (`GlyphOutline::outline` / `GlyphOutline::ink_box`, glyph id → `kurbo::BezPath`) and its direct
+  `skrifa` dependency have been removed; no backend or internal caller used it, and the visual text
+  box is now derived from font-level metrics (`TextLine::logical_bounds` / `cap_bounds`). This is a
+  **breaking** change for downstream code that imported `GlyphOutline` (e.g. for PDF/DOCX vector
+  glyphs).
 
 ## [0.2.0-beta.2] — 2026-08-31
 

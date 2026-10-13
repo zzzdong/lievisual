@@ -1,6 +1,6 @@
 # lievisual API 设计概览
 
-> 本文档归纳 lievisual 当前的 API 设计（截至 2026-08-18，含 `TextRun` 收口、`GlyphOutline`、
+> 本文档归纳 lievisual 当前的 API 设计（截至 2026-08-18，含 `TextRun` 收口、
 > Builder 层的重构）。定位：**渲染库**（类似 Canvas + Pango 的合体劣化版），不做布局。
 
 ---
@@ -29,7 +29,6 @@
 | `geometry` | 几何与颜色：re-export kurbo + 自研 `Color` / `Transform` |
 | `pixmap` | 自包含 RGBA8 位图 `Pixmap`（PNG 编解码；lievisual 不做图片解码） |
 | `builder` | Canvas 风格便捷构造层（可选糖衣） |
-| `glyph` | 字形轮廓提取（glyph id → `BezPath`） |
 | `render` | 渲染后端 trait + SVG / vello_cpu 实现 |
 
 顶层 re-export：核心类型 + `pub use parley`（细粒度数据读取出入口）。
@@ -107,16 +106,7 @@ Canvas 风格**便捷构造**层：纯函数返回 `Element`，不引入可变�
 
 ---
 
-## 5. ② 字形轮廓（`glyph`）
-
-`GlyphOutline::outline(font_data, font_index, glyph_id, font_size) -> Option<BezPath>`
-
-- 供 PDF / DOCX 精确矢量字形；内部 skrifa，支持 ttc/otc 与单字体。
-- 输出 **y-down**、字形原点在基线、按字号缩放。
-
----
-
-## 6. ② 图片 / 位图（`pixmap`）
+## 5. ② 图片 / 位图（`pixmap`）
 
 ### `Pixmap`（自包含 RGBA8 位图）
 
@@ -132,22 +122,22 @@ Canvas 风格**便捷构造**层：纯函数返回 `Element`，不引入可变�
 
 ---
 
-## 7. ③ 渲染后端（`render`）
+## 6. ③ 渲染后端（`render`）
 
 `Renderer` trait + 两个后端（默认全开，无 feature gate）：
 
 - `SvgRenderer`：SVG 字符串（矢量），文本回退 `<text>`，支持 `title` / `description` / `scale`；图片由位图 → PNG → data-URI 内嵌。
-- `VelloPixmapRenderer`：vello_cpu 栅格化 → PNG 字节；图片直接消费 `pixmap` 像素（双线性缩放 + blit）。
+- `VelloPixmapRenderer`：vello_cpu 栅格化 → lievisual 自有 `Pixmap`（非预乘 RGBA8）/ PNG 字节；图片直接消费 `pixmap` 像素（双线性缩放 + blit）。下游无需直接依赖 vello_cpu。
 
 ---
 
-## 8. 几何（`geometry`）
+## 7. 几何（`geometry`）
 
 re-export kurbo：`Point` / `Rect` / `Size` / `Vec2`；自研 `Color` / `Transform` / `LineCap` / `LineJoin` 等。
 
 ---
 
-## 9. 设计主线
+## 8. 设计主线
 
 1. **IR 与后端分离**：`scene` 描述"画什么"，`render` 描述"怎么画"。
 2. **文本合同自闭环**：`TextLayout` 脱离 parley 可消费，`font_index` / `font_data` 支撑 PDF 嵌入。

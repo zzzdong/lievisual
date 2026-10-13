@@ -303,22 +303,26 @@ fn push_style_diff(
     }
 }
 
-/// Extract metrics from a laid-out layout (canvas `TextMetrics`).
 pub fn layout_metrics(layout: &TextLayout) -> TextMetrics {
     let width = layout.width;
     let height = layout.height;
+
     let (ascent, descent, baseline, line_height) = match layout.lines.first() {
         Some(line) => {
             let m = line.metrics;
+            // Parley 0.12: derive ascent/descent from content block coords.
+            let ascent = m.baseline - m.content_block_min;
+            let descent = m.content_block_max - m.baseline;
             (
-                m.ascent as f64,
-                m.descent as f64,
+                ascent as f64,
+                descent as f64,
                 m.baseline as f64,
                 m.line_height as f64,
             )
         }
         None => (0.0, 0.0, 0.0, 0.0),
     };
+
     TextMetrics {
         width,
         height,
@@ -415,14 +419,41 @@ fn extract_lines_from_parley(
 
     for line in layout.lines() {
         let m = line.metrics();
+
+        // Parley 0.12: block-axis coords are absolute (relative to layout origin).
+        // Convert to line-relative offsets so consumers don't need row_top_rel.
+        let baseline_rel = m.baseline - row_top_rel;
+        let block_min_rel = m.block_min_coord - row_top_rel;
+        let block_max_rel = m.block_max_coord - row_top_rel;
+        let content_min_rel = m.content_block_min_coord - row_top_rel;
+        let content_max_rel = m.content_block_max_coord - row_top_rel;
+
+        // cap_height / x_height live on parley's `FontMetrics`, not `LineMetrics`.
+        // Take them from the first glyph run of the line — font-level constants,
+        // identical across runs of the same font, and stable across text changes.
+        let (cap_height, x_height) = line
+            .items()
+            .find_map(|item| match item {
+                parley::layout::PositionedLayoutItem::GlyphRun(gr) => {
+                    let rm = gr.run().font_metrics();
+                    Some((rm.cap_height.unwrap_or(0.0), rm.x_height.unwrap_or(0.0)))
+                }
+                _ => None,
+            })
+            .unwrap_or((0.0, 0.0));
+
         let line_metrics = LineMetrics {
-            ascent: m.ascent,
-            descent: m.descent,
-            baseline: m.baseline,
             line_height: m.line_height,
+            baseline: baseline_rel,
+            block_min: block_min_rel,
+            block_max: block_max_rel,
+            content_block_min: content_min_rel,
+            content_block_max: content_max_rel,
+            cap_height,
+            x_height,
         };
         let line_height = m.line_height;
-        let baseline_y = m.baseline - row_top_rel;
+        let baseline_y = baseline_rel; // used by TextRun below
 
         let mut glyph_data: Vec<(GlyphRaw, usize)> = Vec::new();
         #[allow(clippy::type_complexity)]
@@ -678,62 +709,15 @@ fn extract_lines_from_parley(
             (row_top_rel + line_height) as f64,
         );
 
-        // Line-level visual ink bounds (relative to the layout origin).
-        //
-        // Derived from the actual ink bounding box of every glyph on the line, not from the
-        // line `baseline` (which sits *above* descenders such as 'g'/'y', so using it as the
-        // bottom would crop any descenders). For each glyph we read its stored bbox directly
-        // via skrifa's `GlyphMetrics` (`GlyphOutline::ink_box`) — exact and allocation-free,
-        // scaled to `font_size` and already in y-down convention (origin = baseline, same as
-        // `glyph.rs`). We overlay that box at the glyph's `(x, y)` (which are relative to the
-        // line bounds origin) and union all of them. Glyphs with no ink box (e.g. space,
-        // `.notdef`) are skipped so they don't distort the union.
-        let ink_bounds = runs
-            .iter()
-            .flat_map(|run| {
-                run.glyphs.iter().filter_map(move |g| {
-                    let bbox = crate::text::glyph::GlyphOutline::ink_box(
-                        &run.font_data,
-                        run.font_index,
-                        g.id,
-                        run.font_size,
-                    )?;
-                    if bbox.width() <= 0.0 && bbox.height() <= 0.0 {
-                        return None;
-                    }
-                    // Glyph bbox origin = baseline; overlay at the glyph's (x, y), which are
-                    // already relative to the line bounds origin (y-down).
-                    Some(Rect::new(
-                        (bounds.min_x() + g.x as f64 + bbox.min_x()).max(bounds.min_x()),
-                        (bounds.min_y() + g.y as f64 + bbox.min_y()).max(bounds.min_y()),
-                        (bounds.min_x() + g.x as f64 + bbox.max_x()).min(bounds.max_x()),
-                        (bounds.min_y() + g.y as f64 + bbox.max_y()).min(bounds.max_y()),
-                    ))
-                })
-            })
-            .fold(None, |acc: Option<Rect>, r| match acc {
-                None => Some(r),
-                Some(a) => Some(a.union(r)),
-            })
-            .unwrap_or_else(|| {
-                // No glyph produced an ink box (e.g. whitespace-only line): fall back to the
-                // line ascent/descent box so the ink bounds stay non-degenerate.
-                let ascent = line_metrics.ascent as f64;
-                let descent = line_metrics.descent as f64;
-                let baseline = line_metrics.baseline as f64;
-                Rect::new(
-                    bounds.min_x(),
-                    bounds.min_y() + baseline - ascent,
-                    bounds.max_x(),
-                    bounds.min_y() + baseline + descent,
-                )
-            });
+        // NOTE: the per-glyph ink_bounds block (a glyph-outline query over every
+        // glyph) has been removed. Ink bounds change with text content and cost
+        // O(glyphs) per layout; the visual box is now derived from font-level
+        // metrics (see TextLine::logical_bounds / cap_bounds).
 
         lines.push(TextLine {
             runs,
             bounds,
             metrics: line_metrics,
-            ink_bounds,
         });
 
         row_top_rel += line_height;
@@ -741,25 +725,11 @@ fn extract_lines_from_parley(
 
     let width = layout.width() as f64;
     let height = layout.height() as f64;
-    // Aggregate the ink bounds of all lines (relative to the layout origin).
-    let ink_bounds = lines
-        .iter()
-        .map(|l| l.ink_bounds)
-        .fold(None, |acc: Option<Rect>, r| match acc {
-            None => Some(r),
-            Some(a) => Some(Rect::new(
-                a.min_x().min(r.min_x()),
-                a.min_y().min(r.min_y()),
-                a.max_x().max(r.max_x()),
-                a.max_y().max(r.max_y()),
-            )),
-        })
-        .unwrap_or_else(|| Rect::new(0.0, 0.0, width, height));
+
     TextLayout {
         lines,
         width,
         height,
-        ink_bounds,
     }
 }
 
@@ -907,13 +877,6 @@ pub fn parse_generic_family(name: &str) -> Option<parley::fontique::GenericFamil
     }
 }
 
-/// Offset from the anchor to the text block's top-left corner.
-///
-/// Computes the offset from the anchor coordinates to the text block's top-left corner
-/// according to the desired alignment / baseline. Usage pattern for callers: first get a
-/// layout via [`layout_text`], then compute the offset via [`compute_text_offset`]; the
-/// anchor plus the offset gives the text block's top-left corner (draw TextRuns with
-/// Left/Top).
 pub fn compute_text_offset(
     layout: &TextLayout,
     align: TextAlign,
@@ -930,40 +893,35 @@ pub fn compute_text_offset(
 
     let y_offset = match baseline {
         TextBaseline::Top => 0.0,
-        // Use the ink_bounds' true visual height for centering, to avoid the text being
-        // pushed up by the descent/leading margins inside parley's layout.height.
-        // ink_bounds.min_y is relative to the layout origin (i.e. the position when
-        // rendered with Top).
-        // Middle: vertically centered on the *ink* (visible glyphs), so the text block is
-        // centered on the anchor by its actual visual height. Using ink_bounds (like
-        // `Bottom`) avoids the glyphs being pushed up by descent/leading margins, which is
-        // what callers (e.g. liemermaid node labels) expect when they pass a box center.
+
+        // Visual centering: use cap bounds (baseline - cap_height → baseline).
+        // Mirrors CSS `text-box-edge: cap alphabetic`. cap_height is a
+        // font-level constant, so the offset does NOT jump when button text
+        // changes.
         TextBaseline::Middle => {
-            let ib = layout.ink_bounds();
-            let vh = (ib.max_y() - ib.min_y()).max(0.0);
+            let cb = layout.cap_bounds();
+            let vh = (cb.max_y() - cb.min_y()).max(0.0);
             if vh > 0.0 {
-                -(ib.min_y() + vh / 2.0)
+                -(cb.min_y() + vh / 2.0)
             } else {
                 -layout_height / 2.0
             }
         }
+
+        // Bottom: use logical (content) bounds so descenders (g / y / p / q)
+        // are not clipped. Cap bounds would cut everything below the baseline.
         TextBaseline::Bottom => {
-            let ib = layout.ink_bounds();
-            let vh = (ib.max_y() - ib.min_y()).max(0.0);
+            let lb = layout.logical_bounds();
+            let vh = (lb.max_y() - lb.min_y()).max(0.0);
             if vh > 0.0 {
-                -(ib.min_y() + vh)
+                -(lb.min_y() + vh)
             } else {
                 -layout_height
             }
         }
-        TextBaseline::Alphabetic => {
-            // Reuse `layout_metrics().alphabetic_baseline` so this path stays identical to
-            // `anchor_offset` (no duplicated ascent/descent arithmetic).
-            -layout_metrics(layout).alphabetic_baseline
-        }
-        // Hanging / Ideographic reuse the same `TextMetrics` fields as `anchor_offset`,
-        // in y-down the anchor sits below the top, so we negate. When there is no first
-        // line the layout is empty and we fall back to the hanging-ratio estimate.
+
+        TextBaseline::Alphabetic => -layout_metrics(layout).alphabetic_baseline,
+
         TextBaseline::Hanging => {
             let m = layout_metrics(layout);
             if layout.lines.is_empty() {

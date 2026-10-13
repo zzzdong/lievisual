@@ -27,7 +27,6 @@
 //! - `engine` — the parley-backed layout engine, font registry, and text-offset math.
 
 mod engine;
-pub mod glyph;
 mod layout;
 mod style;
 #[cfg(test)]
@@ -37,6 +36,5 @@ pub use engine::{
     FontSource, compute_text_offset, layout_metrics, layout_text, measure_text,
     parse_generic_family, register_font, register_font_generic,
 };
-pub use glyph::*;
 pub use layout::*;
 pub use style::*;

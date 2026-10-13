@@ -361,14 +361,15 @@ mod rich_text {
         let top_left_y = cy + y_off;
         // Centered: top-left x = cx - half width (horizontal uses the line box width).
         assert!((top_left_x - (cx - layout.width / 2.0)).abs() < 1e-6);
-        // Vertically centered on the *ink* (visible glyphs): top-left y = cy - (ink_min_y +
-        // ink_height/2). This is what `compute_text_offset` returns for `Middle`, so the
-        // text is centered by its visual height rather than its em box (which would push
-        // glyphs up by descent/leading). Recompute the expected value from the layout to
-        // avoid hard-coding the ink metrics.
-        let ib = layout.ink_bounds();
-        let ink_vh = (ib.max_y() - ib.min_y()).max(0.0);
-        let expected_y = cy - (ib.min_y() + ink_vh / 2.0);
+        // Vertically centered on the *cap* box (baseline - cap_height → baseline), mirroring
+        // CSS `text-box-edge: cap alphabetic`: top-left y = cy - (cap_min_y + cap_height/2).
+        // This is what `compute_text_offset` returns for `Middle`, so the text is centered by
+        // a font-level box rather than its em box (which would push glyphs up by
+        // descent/leading). Recompute the expected value from the layout to avoid hard-coding
+        // the cap metrics.
+        let cb = layout.cap_bounds();
+        let cap_vh = (cb.max_y() - cb.min_y()).max(0.0);
+        let expected_y = cy - (cb.min_y() + cap_vh / 2.0);
         assert!((top_left_y - expected_y).abs() < 1e-6);
 
         // Rich-text measurement matches the single-span layout width, and Arc<TextLayout>

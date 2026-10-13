@@ -46,9 +46,6 @@ pub mod scene;
 pub mod sketch;
 pub mod text;
 
-// Re-expose the glyph-outline extractor at the crate root (it lives under `text` now).
-pub use text::glyph;
-
 // re-export parley
 pub use parley;
 // re-export kurbo

@@ -417,13 +417,12 @@ dependencies = [
 
 [[package]]
 name = "lievisual"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "image",
  "kurbo",
  "parley",
  "png",
- "skrifa",
  "vello_cpu",
 ]
 

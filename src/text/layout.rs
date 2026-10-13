@@ -137,17 +137,57 @@ impl TextRun {
     }
 }
 
-/// Per-line font metrics (from parley's `LineMetrics`).
+/// Per-line font metrics — mirrors Parley 0.12's `LineMetrics` (block-axis coords)
+/// plus the font-level `cap_height` / `x_height` pulled from parley's `FontMetrics`.
+///
+/// All block-axis fields are **relative to the line's top edge** (i.e.
+/// `parley_line_metrics.baseline - row_top_rel`, etc.), so consumers don't need
+/// to know the line's position within the layout.
+///
+/// Parley 0.12 dropped `ascent` / `descent` from `LineMetrics`; they are now
+/// derivable as `baseline - content_block_min` and `content_block_max - baseline`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LineMetrics {
-    /// Ascent (baseline upward).
-    pub ascent: f32,
-    /// Descent (baseline downward).
-    pub descent: f32,
-    /// Distance from the baseline to the line top.
-    pub baseline: f32,
-    /// Line height.
+    /// The absolute line height (`line_height`).
     pub line_height: f32,
+
+    /// Block-axis coordinate of the line's baseline, relative to the line's top.
+    pub baseline: f32,
+
+    /// Top of the **line box** (half-leading included), relative to the line's top.
+    /// Comes from `block_min_coord`.
+    pub block_min: f32,
+
+    /// Bottom of the **line box**, relative to the line's top.
+    /// Comes from `block_max_coord`.
+    pub block_max: f32,
+
+    /// Top of the **typographic content** (ascender edge, no leading),
+    /// relative to the line's top. Comes from `content_block_min_coord`.
+    pub content_block_min: f32,
+
+    /// Bottom of the **typographic content** (descender edge, no leading),
+    /// relative to the line's top. Comes from `content_block_max_coord`.
+    pub content_block_max: f32,
+
+    /// Font-level cap height (baseline → top of uppercase). `0.0` when unknown.
+    /// Sourced from parley's `FontMetrics`, not `LineMetrics`.
+    pub cap_height: f32,
+
+    /// Font-level x-height (baseline → top of lowercase). `0.0` when unknown.
+    pub x_height: f32,
+}
+
+impl LineMetrics {
+    /// Typographic ascent (baseline → content top), derived.
+    pub fn ascent(&self) -> f32 {
+        self.baseline - self.content_block_min
+    }
+
+    /// Typographic descent (baseline → content bottom), derived.
+    pub fn descent(&self) -> f32 {
+        self.content_block_max - self.baseline
+    }
 }
 
 /// A text line — holds all [`TextRun`]s within one line.
@@ -155,57 +195,135 @@ pub struct LineMetrics {
 /// Coordinate system (relative to the layout origin):
 /// - `bounds.origin`: the line's position in the layout.
 /// - `runs[].glyphs[].x/y`: offsets relative to `bounds.origin`.
-///
-/// For absolute positioning: glyph coordinate = page offset + bounds.origin + glyph.
 #[derive(Debug, Clone)]
 pub struct TextLine {
     /// All runs in this line.
     pub runs: Vec<TextRun>,
     /// The line's bounding box (relative to the layout origin).
+    /// This is the **line box** (equivalent to `block_min/max`, kept for compat).
     pub bounds: Rect,
-    /// Inline font metrics (ascent / descent / baseline / line_height).
+    /// Inline font metrics (block-axis coords + cap / x).
     pub metrics: LineMetrics,
-    /// The ink bounding box of the line's actual glyphs (outline bbox, relative to the
-    /// layout origin), used for precise vertical centering.
-    pub ink_bounds: Rect,
+}
+
+impl TextLine {
+    /// **Layout bounds** for this line: parley's default `line_height` box,
+    /// i.e. `row_top → row_top + line_height`.
+    pub fn layout_bounds(&self) -> Rect {
+        self.bounds
+    }
+
+    /// **Line box bounds** — `block_min` → `block_max` (half-leading included).
+    /// Identical to [`Self::layout_bounds`] in most cases; kept separate so the
+    /// two concepts stay distinct if parley changes its default.
+    pub fn line_box_bounds(&self) -> Rect {
+        let top = self.bounds.min_y();
+        Rect::new(
+            self.bounds.min_x(),
+            top + self.metrics.block_min as f64,
+            self.bounds.max_x(),
+            top + self.metrics.block_max as f64,
+        )
+    }
+
+    /// **Logical / content bounds** — `content_block_min` → `content_block_max`.
+    ///
+    /// This is the equivalent of Pango's `logical_rect`: typographic ascent +
+    /// descent, **without** leading. Stable across text changes, but for CJK
+    /// the font's ascent margin still makes it look top-heavy.
+    pub fn logical_bounds(&self) -> Rect {
+        let top = self.bounds.min_y();
+        Rect::new(
+            self.bounds.min_x(),
+            top + self.metrics.content_block_min as f64,
+            self.bounds.max_x(),
+            top + self.metrics.content_block_max as f64,
+        )
+    }
+
+    /// **Cap bounds** — `baseline - cap_height` → `baseline`.
+    ///
+    /// Equivalent to CSS `text-box-edge: cap alphabetic`. Recommended for
+    /// visual vertical centering of digits / uppercase / CJK. Because
+    /// `cap_height` is a font-level constant, this box does **not** change
+    /// when the line's text changes.
+    ///
+    /// Falls back to [`Self::logical_bounds`] when `cap_height` is unavailable.
+    pub fn cap_bounds(&self) -> Rect {
+        if self.metrics.cap_height > 0.0 {
+            let top = self.bounds.min_y();
+            let baseline_y = top + self.metrics.baseline as f64;
+            Rect::new(
+                self.bounds.min_x(),
+                baseline_y - self.metrics.cap_height as f64,
+                self.bounds.max_x(),
+                baseline_y,
+            )
+        } else {
+            self.logical_bounds()
+        }
+    }
 }
 
 /// Rich-text layout result — holds the laid-out set of lines.
 ///
-/// Produced by [`crate::layout_text`] / [`crate::measure_text`], it is **self-contained**: it does not
-/// depend on parley's lifetime because `font_data` embeds the font bytes and
-/// `glyphs[].cluster` is a local offset relative to the run text. Downstream (e.g. the PDF
-/// / SVG backends of liepress) can simply iterate `lines` to draw, without touching parley
-/// again.
-///
-/// All coordinates are relative to the layout origin (the paragraph's top-left corner);
-/// pagination and absolute positioning are the output backend's responsibility.
+/// All coordinates are relative to the layout origin (the paragraph's
+/// top-left corner); pagination and absolute positioning are the output
+/// backend's responsibility.
 #[derive(Debug, Clone)]
 pub struct TextLayout {
     /// All laid-out lines.
     pub lines: Vec<TextLine>,
     /// Total layout width.
     pub width: f64,
-    /// Total layout height.
+    /// Total layout height (sum of `line_height`, = parley's `layout.height()`).
     pub height: f64,
-    /// The ink bounding box of every line's actual glyphs (outline bbox, relative to the
-    /// layout origin), used for precise vertical centering.
-    pub ink_bounds: Rect,
 }
 
 impl TextLayout {
-    /// The ink bounding box of the actual glyphs (outline bbox, relative to the layout
-    /// origin).
-    ///
-    /// Computed during layout in [`crate::layout_text`] / [`crate::measure_text`] from per-glyph outlines
-    /// via skrifa. It is a closer fit to the true visual boundary than parley's
-    /// `LineMetrics` (which carry ascent / descent design margins), and is used for text
-    /// vertical centering (e.g. `visual_height`).
-    pub fn ink_bounds(&self) -> Rect {
-        self.ink_bounds
+    /// Aggregate **layout bounds** over all lines (parley's default box).
+    pub fn layout_bounds(&self) -> Rect {
+        self.lines
+            .iter()
+            .map(TextLine::layout_bounds)
+            .fold(None, union_rect)
+            .unwrap_or_else(|| Rect::new(0.0, 0.0, self.width, self.height))
+    }
+
+    /// Aggregate **line box bounds** over all lines.
+    pub fn line_box_bounds(&self) -> Rect {
+        self.lines
+            .iter()
+            .map(TextLine::line_box_bounds)
+            .fold(None, union_rect)
+            .unwrap_or_else(|| Rect::new(0.0, 0.0, self.width, self.height))
+    }
+
+    /// Aggregate **logical / content bounds** over all lines.
+    pub fn logical_bounds(&self) -> Rect {
+        self.lines
+            .iter()
+            .map(TextLine::logical_bounds)
+            .fold(None, union_rect)
+            .unwrap_or_else(|| Rect::new(0.0, 0.0, self.width, self.height))
+    }
+
+    /// Aggregate **cap bounds** over all lines.
+    pub fn cap_bounds(&self) -> Rect {
+        self.lines
+            .iter()
+            .map(TextLine::cap_bounds)
+            .fold(None, union_rect)
+            .unwrap_or_else(|| Rect::new(0.0, 0.0, self.width, self.height))
     }
 }
 
+fn union_rect(acc: Option<Rect>, r: Rect) -> Option<Rect> {
+    Some(match acc {
+        None => r,
+        Some(a) => a.union(r),
+    })
+}
 /// Text measurement result (the value returned by canvas `measureText()`).
 ///
 /// Coordinate semantics (consistent with Canvas `TextMetrics`, where y-down quantities
