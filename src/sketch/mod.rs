@@ -43,7 +43,7 @@
 //! roughen_scene_if(
 //!     &mut scene,
 //!     &SketchOptions { seed: Some(42), ..Default::default() },
-//!     &|node| SketchKind::of(&node.element) == Some(SketchKind::Rect),
+//!     &|node| node.element().and_then(SketchKind::of) == Some(SketchKind::Rect),
 //! );
 //! ```
 //!
@@ -109,7 +109,8 @@ impl SketchKind {
             E::Pie { .. } => Self::Pie,
             E::Path { .. } => Self::Path,
             E::GradientPath { .. } => Self::GradientPath,
-            E::Text { .. } | E::Image { .. } | E::Group { .. } => return None,
+            // Containers are never elements (they are nodes); text / images are not sketched.
+            E::Text { .. } | E::Image { .. } => return None,
         })
     }
 

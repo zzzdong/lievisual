@@ -29,7 +29,9 @@ use super::rough;
 use super::{Rng, SketchKind, SketchOptions};
 use crate::fit::{FitOptions, element_bounds, fit_scene};
 use crate::geometry::{BezPath, Color, Vec2};
-use crate::scene::{Element, Fill, FillStrokeStyle, Scene, SceneNode, SketchFill, Stroke};
+use crate::scene::{
+    Element, Fill, FillStrokeStyle, NodeKind, Scene, SceneNode, SketchFill, Stroke,
+};
 
 /// Apply the sketch pass to the whole scene (subject to `opts.kinds`).
 pub fn roughen_scene(scene: &mut Scene, opts: &SketchOptions) {
@@ -113,20 +115,23 @@ fn walk(
             continue;
         }
         // Containers: recurse into the group's children (a container is never itself sketched).
-        // Uses the shared container accessor instead of matching `Element::Group` directly.
+        // Uses the shared container accessor instead of matching the node kind directly.
         if let Some(children) = node.children_mut() {
             walk(children, rng, opts, filter);
             continue;
         }
-        let Some(kind) = SketchKind::of(&node.element) else {
+        // The remaining nodes are leaves; a container was handled above.
+        let Some(element) = node.element() else {
+            continue;
+        };
+        let Some(kind) = SketchKind::of(element) else {
             continue;
         };
         if !opts.kinds.contains(kind) {
             continue;
         }
-        let replacement = sketch_element(&node.element, rng, opts);
-        if let Some(element) = replacement {
-            node.element = element;
+        if let Some(kind) = sketch_element(element, rng, opts) {
+            node.kind = kind;
         }
     }
 }
@@ -148,16 +153,13 @@ pub fn roughen_element(el: &Element, rng: &mut Rng, opts: &SketchOptions) -> Vec
     out
 }
 
-fn sketch_element(el: &Element, rng: &mut Rng, opts: &SketchOptions) -> Option<Element> {
+fn sketch_element(el: &Element, rng: &mut Rng, opts: &SketchOptions) -> Option<NodeKind> {
     let (fill, outline) = sketch_parts(el, rng, opts);
     match (fill, outline) {
         (None, None) => None,
-        (Some(f), None) => Some(f),
-        (None, Some(o)) => Some(o),
+        (Some(e), None) | (None, Some(e)) => Some(NodeKind::Draw(e)),
         // Fill under outline — same as how a single filled+stroked shape is painted.
-        (Some(f), Some(o)) => Some(Element::Group {
-            children: vec![SceneNode::new(f), SceneNode::new(o)],
-        }),
+        (Some(f), Some(o)) => Some(NodeKind::Group(vec![SceneNode::new(f), SceneNode::new(o)])),
     }
 }
 
@@ -611,11 +613,11 @@ mod tests {
             },
         );
         assert!(
-            matches!(scene.nodes[0].element, Element::Rect { .. }),
+            matches!(scene.nodes[0].element(), Some(Element::Rect { .. })),
             "矩形被排除"
         );
         assert!(
-            matches!(scene.nodes[1].element, Element::Path { .. }),
+            matches!(scene.nodes[1].element(), Some(Element::Path { .. })),
             "圆被手绘化"
         );
     }
@@ -644,15 +646,13 @@ mod tests {
             },
             &|n| n.name.as_deref() != Some("drop"),
         );
-        let Element::Group { children } = &scene.nodes[0].element else {
-            panic!("期望 Group");
-        };
+        let children = scene.nodes[0].children().expect("期望 Group");
         assert!(
-            matches!(children[0].element, Element::Path { .. }),
+            matches!(children[0].element(), Some(Element::Path { .. })),
             "keep 应被手绘化"
         );
         assert!(
-            matches!(children[1].element, Element::Rect { .. }),
+            matches!(children[1].element(), Some(Element::Rect { .. })),
             "drop 应被跳过"
         );
     }
@@ -673,7 +673,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(matches!(scene.nodes[0].element, Element::Rect { .. }));
+        assert!(matches!(
+            scene.nodes[0].element(),
+            Some(Element::Rect { .. })
+        ));
     }
 
     #[test]
@@ -693,8 +696,8 @@ mod tests {
             },
         );
         assert!(matches!(
-            scene.layers[0].nodes[0].element,
-            Element::Path { .. }
+            scene.layers[0].nodes[0].element(),
+            Some(Element::Path { .. })
         ));
     }
 
@@ -726,7 +729,7 @@ mod tests {
         assert!(n.transform.is_some() && n.clip.is_some());
         assert_eq!(n.opacity, 0.5);
         assert_eq!(n.name.as_deref(), Some("node"));
-        assert!(matches!(n.element, Element::Group { .. }));
+        assert!(n.is_group());
     }
 
     /// 端到端确定性：同种子两次处理同场景 → 完全相同的路径。

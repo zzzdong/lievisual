@@ -50,6 +50,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   They are **raster-only**: SVG (and the browser) expose no per-element equivalent, so the SVG
   backend degrades them to `Normal` (rendered without a `mix-blend-mode` group).
 
+### Changed
+
+- **BREAKING — container vs. drawing content is now modelled by `NodeKind`.** `SceneNode.element`
+  became `SceneNode.kind`: `NodeKind::Draw(Element)` (a drawable leaf) or
+  `NodeKind::Group(Vec<SceneNode>)` (a container). `Element::Group` has been **removed** — `Element`
+  is now purely "geometry + style" and no longer references `SceneNode`, so future container
+  semantics (isolated layers, clip groups, …) extend `NodeKind` instead of polluting `Element`.
+  Migration:
+  - construct with `SceneNode::new(element)` / `SceneNode::group(children)` (unchanged signatures);
+  - read a leaf via `SceneNode::element()` / `element_mut()` (or `into_element()` to take it by
+    value) instead of matching `node.element` directly;
+  - containers are still reached through `is_group()` / `children()` / `children_mut()` / `visit` /
+    `visit_mut`, so traversal code needs no change;
+  - replace `Element::Group { children }` matches with `children()` / `is_group()`.
+  `Renderer::draw_element(element)` is the new single place that knows every `Element` variant.
+  Downstream adaptations: `liemermaid` (1 construction site), `liecharts` (17 `.element` matches),
+  `liepress` (1 struct literal, now `SceneNode::new(...).with_z(...)`).
+- **`Layer` and `SceneNode` now share one compositing scope.** New `NodeScope` (transform / clip /
+  filter / opacity / blend / mask / name) with `SceneNode::scope()` and `Layer::scope()`, plus
+  `Renderer::push_scope` / `pop_scope` as the single implementation — `render_layer` no longer
+  duplicates the push / pop sequence. Non-breaking: `Layer` semantics are unchanged (a layer is a
+  named root group, so it still carries no clip / filter / mask).
+- `SceneNode::z_index` is documented as **sibling-local ordering only** — it never reorders across a
+  container boundary, and the default `Scene::nodes` list always draws below the named `Layer`s
+  regardless of value. Regression test: `z_index_does_not_cross_root_lists`.
+
 ### Fixed
 
 - **Node / layer opacity is now isolated compositing.** The vello backend previously multiplied the

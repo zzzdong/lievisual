@@ -26,8 +26,10 @@
 
 ## 1. 现状能力盘点
 
-- **IR**：`Scene { nodes, layers, ... }` → `SceneNode { element, z_index, transform, opacity, name, visible, clip }`；
-  `Element::Group { children }` 可递归嵌套；`Layer` 是带 `visible/opacity/transform/name` 的节点集合。
+- **IR**：`Scene { nodes, layers, ... }` →
+  `SceneNode { kind, z_index, transform, opacity, name, visible, clip, blend_mode, mask, filter }`；
+  `kind: NodeKind` 为 `Draw(Element)`（叶子几何 + 样式）或 `Group(Vec<SceneNode>)`（可递归嵌套的容器）；
+  `Layer` 是带 `visible/opacity/transform/blend_mode/name` 的节点集合。
 - **图元**：Rect / Circle / Ellipse（可旋转）/ RoundedRect / Line / Polyline / Polygon / Arc / Pie / Path / GradientPath / Image / Text / Group。
 - **填充**：Solid / LinearGradient / RadialGradient / Sketch（手绘排线）。
 - **描边**：Cap / Join / Dash（`dash_array` / `dash_offset`）/ `miter_limit`。
@@ -106,8 +108,9 @@
 
 ### 3.1 现状：已经是树
 
-- `SceneNode` 的 `element` 可以是 `Element::Group { children: Vec<SceneNode> }`，可任意深度嵌套；
-  `transform` / `opacity` / `clip` / `visible` / `name` 递归作用于子树；同级按 `z_index` 稳定排序。
+- `SceneNode.kind` 是 `NodeKind::Draw(Element)`（叶子）或 `NodeKind::Group(Vec<SceneNode>)`（容器），
+  可任意深度嵌套；`transform` / `opacity` / `clip` / `visible` / `name` 递归作用于子树；
+  同级按 `z_index` 稳定排序。
 - 因此**问题不是"要不要树"，而是"容器的表达方式是否干净"**。
 
 ### 3.2 现存设计问题
@@ -115,26 +118,55 @@
 1. **容器与可绘制混在 `Element` 枚举里**：`Group` 是唯一的"非叶子"变体，导致所有遍历都要特判
    （`src/render/mod.rs`、`src/fit.rs`、`src/sketch/pass.rs`、`src/builder.rs` 各自 `match Element::Group`）。
    将来再加"隔离层 / 遮罩组"会继续污染 `Element`。
+
+   > **状态：已解决（2026-10-13）** —— 容器剥离为一等的 `NodeKind::Group`，`Element` 只描述几何 +
+   > 样式，**不再引用 `SceneNode`**；新增容器语义改为扩展 `NodeKind`。**破坏性**：`SceneNode.element`
+   > 字段变为 `kind`，按引用 / 按值读取用 `SceneNode::element()` / `element_mut()` / `into_element()`；
+   > 构造用 `SceneNode::new` / `SceneNode::group`（`liemermaid` 的 1 处 `Element::Group` 构造、
+   > `liecharts` 的 17 处 `.element` 匹配已同步）。
 2. **`Layer` 与 `Group` 语义重叠**：`Layer` 本质是"命名的根 Group"（`visible/opacity/transform/name` + nodes），
    却与 `Group` 分成两套代码路径（`render_layer` vs `render_node`）。
+
+   > **状态：已解决（2026-10-13）** —— 抽出 `NodeScope`（`transform / clip / filter / opacity /
+   > blend / mask / name`），`SceneNode::scope()` 与 `Layer::scope()` 产出同一描述，
+   > `Renderer::push_scope` / `pop_scope` 成为唯一实现，`render_layer` 与 `render_node` 共用
+   > （非破坏性；Layer 语义不变，仍无 clip / filter / mask）。
 3. **`Scene` 不是单一根**：`nodes` 与 `layers` 并列，`scene_bounds` 等要分别 union 两条集合。
+
+   > **状态：读取侧已统一；"合并成单一根"决定不做（2026-10-13）** —— `Scene::root_lists` /
+   > `root_lists_mut` 已让 bounds / sketch / render 共用一份"默认层 + 可见 layer"视图。
+   > 把 `nodes` + `layers` 合并为 `roots` **收益低**（统一视图已具备）、**代价高**（破坏两个公开字段，
+   > 且与第 2 项重叠 —— Layer 已是命名根 group），故不做。
 4. **属性模型混了两类语义**：
    - 可**传递**属性：`transform` / `clip` / `visible`；
    - 需**隔离**属性：`opacity` / `blend` / `mask`（必须离屏合成）。
    现在把 opacity 当传递属性逐图元乘 alpha，直接引发 P0-1。
+
+   > **状态：已解决（2026-10-13）** —— 隔离属性统一经 `Renderer::push_scope` 表达为离屏层语义
+   >（见 Step 2 与 P0-1 / P0-2）。
 5. **`z_index` 是同级排序键**，不跨层比较（注释有说明，但易被误当全局 z）。
+
+   > **状态：已固化（2026-10-13）** —— `SceneNode::z_index` 的字段文档写明"仅同级排序、不跨容器
+   > 边界、默认层恒在命名 layer 之下"，并新增回归测试 `z_index_does_not_cross_root_lists`。
 
 ### 3.3 建议（按性价比，不必大重写）
 
 - **Step 1 · 收敛容器（低风险，零行为变化，建议先做）**
-  保留 `SceneNode.element` 兼容，引入统一的子节点访问器，例如
-  `SceneNode::children() / children_mut() / is_group()`，让 fit / sketch / render / hit-test **共用一套递归**，
-  消除各处的 `match Element::Group`；并让 `Layer` 复用 group 渲染路径，`Scene` 逐步收敛为"根 group 列表"。
+  引入统一的子节点访问器 `SceneNode::children() / children_mut() / is_group()`，让
+  fit / sketch / render / hit-test **共用一套递归**，消除各处的 `match Element::Group`；
+  并让 `Layer` 复用 group 渲染路径。（原计划保留 `SceneNode.element` 字段以求零破坏；实际进一步
+  推进到"彻底版"——容器剥离为 `NodeKind::Group`，代价是 `element` → `kind` 的破坏性改名。）
 
   > **状态：已实现（2026-10-13，lievisual 0.3.0）** —— 新增 `SceneNode::{is_group, children,
   > children_mut, visit, visit_mut}`、`Scene::{visit_nodes, visit_nodes_mut, root_lists,
   > root_lists_mut}` 与 `Renderer::render_children`；sketch / fit / render 的 `Element::Group`
   > 特判已收敛到访问器与统一递归（纯重构，零行为变化）。
+  >
+  > **并已推进到"彻底版"**：容器从 `Element` 剥离为一等的 `NodeKind::Group`（`Element` 不再含
+  > `Group`，也不再引用 `SceneNode`），新增 `SceneNode::element()` / `element_mut()` /
+  > `into_element()` 与 `Renderer::draw_element`（唯一知道全部 `Element` 变体的地方）；
+  > `Layer` 与节点共用 `NodeScope` / `Renderer::push_scope`（见 3.2 第 1、2 项）。
+  > `Scene` 单一根（3.2 第 3 项）决定不做。
 
 - **Step 2 · 隔离合成（正确性，关键）**
   给节点加 `compositing`（`opacity` / `blend_mode` / `mask` 作为**离屏层**语义）：

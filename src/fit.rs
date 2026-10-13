@@ -40,7 +40,7 @@
 use kurbo::Shape;
 
 use crate::geometry::{Point, Rect, Size, Transform, Vec2};
-use crate::scene::{Element, Scene, SceneNode, Stroke};
+use crate::scene::{Element, NodeKind, Scene, SceneNode, Stroke};
 
 /// Bounding box of a single primitive, in the element's own coordinate space.
 ///
@@ -143,7 +143,6 @@ pub fn element_bounds(element: &Element) -> Option<Rect> {
             style,
             layout,
         } => text_box(spans, *position, style, layout.as_deref()),
-        Element::Group { children } => nodes_bounds(children),
     };
     // Drop degenerate / non-finite boxes so a single pathological primitive cannot poison the
     // whole canvas transform.
@@ -299,7 +298,12 @@ pub fn node_bounds(node: &SceneNode) -> Option<Rect> {
     if !node.visible {
         return None;
     }
-    let local = element_bounds(&node.element)?;
+    // A container's box is the union of its children (each child recurses through this same
+    // function, so `visible = false` subtrees are skipped); a leaf delegates to `element_bounds`.
+    let local = match &node.kind {
+        NodeKind::Draw(element) => element_bounds(element)?,
+        NodeKind::Group(children) => nodes_bounds(children)?,
+    };
     Some(match node.transform.as_ref() {
         Some(t) => transform_box(t, local),
         None => local,
@@ -579,12 +583,10 @@ mod tests {
 
     #[test]
     fn group_bounds_unions_children() {
-        let g = SceneNode::new(Element::Group {
-            children: vec![
-                rect_node(0.0, 0.0, 10.0, 10.0),
-                rect_node(90.0, 40.0, 100.0, 50.0),
-            ],
-        });
+        let g = SceneNode::group(vec![
+            rect_node(0.0, 0.0, 10.0, 10.0),
+            rect_node(90.0, 40.0, 100.0, 50.0),
+        ]);
         let b = node_bounds(&g).unwrap();
         assert_eq!(
             (b.min_x(), b.min_y(), b.max_x(), b.max_y()),
@@ -807,7 +809,7 @@ mod tests {
         let mut s = scene_with(vec![rect_node(0.0, 0.0, 100.0, 50.0)]);
         fit_scene(&mut s, FitOptions::new());
         assert_eq!(s.nodes.len(), 1, "恒等变换不应包裹 Group");
-        assert!(matches!(s.nodes[0].element, Element::Rect { .. }));
+        assert!(matches!(s.nodes[0].element(), Some(Element::Rect { .. })));
         assert_eq!((s.width, s.height), (100.0, 50.0));
     }
 

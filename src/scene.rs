@@ -19,12 +19,13 @@
 //!   order (preserving insertion order within the same level), and [`Scene::iter_ordered`] is a
 //!   convenience entry for the top-level collection; rendering and callers share the same
 //!   traversal logic.
-//! - Container abstraction: a node whose element is [`Element::Group`] is a **container**. Use
-//!   [`SceneNode::is_group`] / [`SceneNode::children`] / [`SceneNode::children_mut`] (and
-//!   [`SceneNode::visit`] / [`SceneNode::visit_mut`]) instead of matching `Element::Group`
-//!   directly, so rendering / bounds / effects / hit-testing share one recursion over the tree.
-//!   [`Scene::root_lists`] / [`Scene::root_lists_mut`] likewise unify "default nodes + layers"
-//!   for root-level traversals.
+//! - Container vs. drawing content is modelled by [`NodeKind`]: a node either **draws** a leaf
+//!   primitive ([`Element`]: geometry + style only) or is a **container** holding child nodes
+//!   ([`NodeKind::Group`]). Use [`SceneNode::is_group`] / [`SceneNode::children`] /
+//!   [`SceneNode::children_mut`] / [`SceneNode::element`] (and [`SceneNode::visit`] /
+//!   [`SceneNode::visit_mut`]) instead of matching the kind directly, so rendering / bounds /
+//!   effects / hit-testing share one recursion over the tree. [`Scene::root_lists`] /
+//!   [`Scene::root_lists_mut`] likewise unify "default nodes + layers" for root-level traversals.
 
 use crate::geometry::{Color, Point, Rect, Transform, Vec2};
 use crate::render::Renderer;
@@ -284,7 +285,7 @@ impl Scene {
     }
 
     /// Visit every node in **document order** — the default [`Scene::nodes`] first, then each
-    /// [`Layer`] bottom-to-top — recursing into [`Element::Group`] containers (a container before
+    /// [`Layer`] bottom-to-top — recursing into [`NodeKind::Group`] containers (a container before
     /// its children). `z_index` is *not* applied (this is structural order, not draw order).
     ///
     /// Layer-level attributes (`visible` / `opacity` / `transform`) are **not** applied, and no
@@ -437,17 +438,112 @@ impl Layer {
     }
 }
 
-/// A single node in the scene: primitive + layer + local transform + node attributes.
+/// The **subtree attributes** shared by a [`SceneNode`] and a [`Layer`], expressed as one
+/// compositing scope.
 ///
-/// All fields except `element` are "subtree-level" attributes: `transform` / `opacity` / `name`
-/// / `visible` also apply to a `Group` (and `opacity` / `transform` are composed through
-/// recursion).
+/// A [`Layer`] is essentially a *named root group*, so both push exactly the same kind of scope
+/// onto a backend's state stack — `transform → clip → filter → opacity → blend → mask → name`.
+/// Sharing one description keeps the two render paths in sync: see
+/// [`crate::render::Renderer::push_scope`].
+#[derive(Debug, Clone, Copy)]
+pub struct NodeScope<'a> {
+    /// Transform applied to the whole subtree.
+    pub transform: Option<Transform>,
+    /// Clip applied to the whole subtree.
+    pub clip: Option<&'a Clip>,
+    /// Post-processing filter applied to the subtree's rendered content.
+    pub filter: Option<&'a Filter>,
+    /// Subtree opacity, 0.0–1.0; `1.0` means "no scope".
+    pub opacity: f64,
+    /// Blend mode used when compositing the subtree onto the backdrop.
+    pub blend_mode: BlendMode,
+    /// Alpha mask applied to the subtree's composited result.
+    pub mask: Option<&'a Mask>,
+    /// Optional scope name (the SVG backend emits it as an `id`).
+    pub name: Option<&'a str>,
+}
+
+impl NodeScope<'_> {
+    /// Whether this scope would do nothing at all (all attributes at their defaults).
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        self.transform.is_none()
+            && self.clip.is_none()
+            && self.filter.is_none()
+            && self.opacity == 1.0
+            && self.blend_mode.is_normal()
+            && self.mask.is_none()
+            && self.name.is_none()
+    }
+}
+
+impl SceneNode {
+    /// This node's compositing scope (see [`NodeScope`]).
+    #[must_use]
+    pub fn scope(&self) -> NodeScope<'_> {
+        NodeScope {
+            transform: self.transform,
+            clip: self.clip.as_ref(),
+            filter: self.filter.as_ref(),
+            opacity: self.opacity,
+            blend_mode: self.blend_mode,
+            mask: self.mask.as_ref(),
+            name: self.name.as_deref(),
+        }
+    }
+}
+
+impl Layer {
+    /// This layer's compositing scope. A layer is a named root group, so it carries no
+    /// clip / filter / mask.
+    #[must_use]
+    pub fn scope(&self) -> NodeScope<'_> {
+        NodeScope {
+            transform: self.transform,
+            clip: None,
+            filter: None,
+            opacity: self.opacity,
+            blend_mode: self.blend_mode,
+            mask: None,
+            name: (!self.name.is_empty()).then_some(self.name.as_str()),
+        }
+    }
+}
+
+/// What a [`SceneNode`] holds: **drawing content** (a leaf primitive) or **children** (a
+/// container).
+///
+/// Keeping these apart means [`Element`] stays a pure "geometry + style" vocabulary — it carries
+/// no `Group` variant, so the recursive tree lives entirely in [`SceneNode`]. New *container*
+/// semantics (isolated layers, clip groups, …) extend this enum rather than `Element`.
+#[derive(Debug, Clone)]
+pub enum NodeKind {
+    /// A drawable leaf primitive.
+    Draw(Element),
+    /// A container: children are drawn under the parent transform / clip / compositing scope.
+    Group(Vec<SceneNode>),
+}
+
+/// A single node in the scene: drawing content (or children) + layer + local transform + node
+/// attributes.
+///
+/// All fields except `kind` are "subtree-level" attributes: `transform` / `opacity` / `name` /
+/// `visible` also apply to a container ([`NodeKind::Group`]) (and `opacity` / `transform` are
+/// composed through recursion).
 #[derive(Debug, Clone)]
 pub struct SceneNode {
-    pub element: Element,
+    /// Drawing content (a [`NodeKind::Draw`] leaf) or children (a [`NodeKind::Group`] container).
+    pub kind: NodeKind,
+    /// Draw order **within this node's own sibling list**: nodes are drawn in stable ascending
+    /// `z_index` order (equal values keep insertion order). See [`SceneNode::ordered`].
+    ///
+    /// It is *not* a global z: it never reorders across a container boundary, and the default
+    /// [`Scene::nodes`] list always draws **below** the named [`Layer`]s regardless of value —
+    /// the layer array order wins. Use [`Scene::push_layer`] (not a large `z_index`) to lift
+    /// something above everything else.
     pub z_index: i32,
     pub transform: Option<Transform>,
-    /// Opacity for the node (and Group subtree), 0.0–1.0; default 1.0.
+    /// Opacity for the node (and its subtree), 0.0–1.0; default 1.0.
     pub opacity: f64,
     /// Optional identifier: debugging, hit-testing, SVG `id`.
     pub name: Option<String>,
@@ -455,7 +551,7 @@ pub struct SceneNode {
     pub visible: bool,
     /// Optional clip shape: restrict the whole subtree to its interior.
     pub clip: Option<Clip>,
-    /// Blend mode when compositing this node (and its Group subtree) onto the backdrop;
+    /// Blend mode when compositing this node (and its subtree) onto the backdrop;
     /// default [`BlendMode::Normal`] (no blending).
     pub blend_mode: BlendMode,
     /// Optional alpha mask applied to the subtree's composited result.
@@ -465,9 +561,10 @@ pub struct SceneNode {
 }
 
 impl SceneNode {
-    pub fn new(element: Element) -> Self {
+    /// Node with all subtree attributes at their defaults.
+    fn with_defaults(kind: NodeKind) -> Self {
         Self {
-            element,
+            kind,
             z_index: 0,
             transform: None,
             opacity: 1.0,
@@ -480,20 +577,15 @@ impl SceneNode {
         }
     }
 
-    /// Construct a recursive group node (children drawn under the parent transform and layer).
+    /// A drawing (leaf) node from a primitive.
+    pub fn new(element: Element) -> Self {
+        Self::with_defaults(NodeKind::Draw(element))
+    }
+
+    /// Construct a recursive group (container) node: children are drawn under the parent
+    /// transform / clip / compositing scope.
     pub fn group(children: Vec<SceneNode>) -> Self {
-        Self {
-            element: Element::Group { children },
-            z_index: 0,
-            transform: None,
-            opacity: 1.0,
-            name: None,
-            visible: true,
-            clip: None,
-            blend_mode: BlendMode::Normal,
-            mask: None,
-            filter: None,
-        }
+        Self::with_defaults(NodeKind::Group(children))
     }
 
     /// Yield node references in ascending `z_index` order (stable: insertion order is preserved
@@ -505,30 +597,59 @@ impl SceneNode {
         order.into_iter().map(move |i| &nodes[i])
     }
 
-    /// Whether this node is a **container** (its element is [`Element::Group`]).
+    /// Whether this node is a **container** ([`NodeKind::Group`]).
     ///
-    /// Containers hold child nodes; every other element is a drawable leaf. Prefer this plus
-    /// [`SceneNode::children`] over matching on [`Element::Group`] directly, so every pass
-    /// (rendering / bounds / effects / hit-testing) shares one notion of "the tree".
+    /// Containers hold child nodes; [`NodeKind::Draw`] nodes are drawable leaves. Prefer this plus
+    /// [`SceneNode::children`] / [`SceneNode::element`] over matching [`NodeKind`] directly, so
+    /// every pass (rendering / bounds / effects / hit-testing) shares one notion of "the tree".
     #[must_use]
     pub fn is_group(&self) -> bool {
-        matches!(self.element, Element::Group { .. })
+        matches!(self.kind, NodeKind::Group(_))
     }
 
-    /// Child nodes of a container, or `None` for a leaf (drawable) node.
+    /// The leaf primitive of a drawing node, or `None` for a container.
     #[must_use]
-    pub fn children(&self) -> Option<&[SceneNode]> {
-        match &self.element {
-            Element::Group { children } => Some(children),
-            _ => None,
+    pub fn element(&self) -> Option<&Element> {
+        match &self.kind {
+            NodeKind::Draw(element) => Some(element),
+            NodeKind::Group(_) => None,
         }
     }
 
-    /// Mutable child nodes of a container, or `None` for a leaf node.
+    /// Mutable leaf primitive of a drawing node, or `None` for a container.
+    pub fn element_mut(&mut self) -> Option<&mut Element> {
+        match &mut self.kind {
+            NodeKind::Draw(element) => Some(element),
+            NodeKind::Group(_) => None,
+        }
+    }
+
+    /// Consume the node, returning its leaf primitive (`None` for a container).
+    ///
+    /// The owned counterpart of [`SceneNode::element`]; handy when the node is a temporary (e.g. a
+    /// freshly built primitive) and the element is wanted by value.
+    #[must_use]
+    pub fn into_element(self) -> Option<Element> {
+        match self.kind {
+            NodeKind::Draw(element) => Some(element),
+            NodeKind::Group(_) => None,
+        }
+    }
+
+    /// Child nodes of a container, or `None` for a drawing (leaf) node.
+    #[must_use]
+    pub fn children(&self) -> Option<&[SceneNode]> {
+        match &self.kind {
+            NodeKind::Group(children) => Some(children),
+            NodeKind::Draw(_) => None,
+        }
+    }
+
+    /// Mutable child nodes of a container, or `None` for a drawing node.
     pub fn children_mut(&mut self) -> Option<&mut Vec<SceneNode>> {
-        match &mut self.element {
-            Element::Group { children } => Some(children),
-            _ => None,
+        match &mut self.kind {
+            NodeKind::Group(children) => Some(children),
+            NodeKind::Draw(_) => None,
         }
     }
 
@@ -1176,6 +1297,9 @@ impl BlendMode {
 }
 
 /// Declarative primitive enum. Describes geometry and style only.
+///
+/// Containers are **not** elements: a node holding children is a [`NodeKind::Group`], so `Element`
+/// never references [`SceneNode`] and the recursive tree lives entirely in the scene graph.
 #[derive(Debug, Clone)]
 pub enum Element {
     Rect {
@@ -1276,10 +1400,6 @@ pub enum Element {
         position: Point,
         style: crate::text::TextStyle,
         layout: Option<std::sync::Arc<TextLayout>>,
-    },
-    /// Recursive group: children are drawn under the parent transform and layer.
-    Group {
-        children: Vec<SceneNode>,
     },
 }
 
@@ -1453,8 +1573,8 @@ mod tests {
     }
 
     fn rect_x(node: &SceneNode) -> f64 {
-        match &node.element {
-            Element::Rect { rect, .. } => rect.min_x(),
+        match node.element() {
+            Some(Element::Rect { rect, .. }) => rect.min_x(),
             _ => panic!("expected rect"),
         }
     }
@@ -1733,6 +1853,19 @@ mod tests {
             assert_eq!(xs, vec![10.0, 20.0, 30.0]);
         }
 
+        /// `z_index` 只在**同级**排序：默认层永远画在命名 layer 之下，即使它的 z 更大。
+        #[test]
+        fn z_index_does_not_cross_root_lists() {
+            let mut scene = Scene::new(10.0, 10.0);
+            scene.push_node(rect_node(1.0, 100)); // 默认层，z 很大
+            scene.push_layer(Layer::new("top").with_nodes(vec![rect_node(2.0, -100)]));
+            let drawn: Vec<f64> = scene
+                .root_lists()
+                .flat_map(|(nodes, _)| SceneNode::ordered(nodes).map(rect_x).collect::<Vec<_>>())
+                .collect();
+            assert_eq!(drawn, vec![1.0, 2.0], "layer 数组顺序优先于 z_index");
+        }
+
         #[test]
         fn layer_iter_ordered_sorts_within_layer() {
             let layer = Layer::new("l").with_nodes(vec![
@@ -1765,13 +1898,11 @@ mod tests {
         #[test]
         fn scene_node_group_and_push_group() {
             let group = SceneNode::group(vec![rect_node(0.0, 0), rect_node(0.0, 1)]);
-            match &group.element {
-                Element::Group { children } => assert_eq!(children.len(), 2),
-                _ => panic!("expected group"),
-            }
+            assert_eq!(group.children().unwrap().len(), 2);
+            assert!(group.element().is_none(), "容器没有 leaf element");
             let mut scene = Scene::new(10.0, 10.0);
             scene.push_group(vec![rect_node(0.0, 0)]);
-            assert!(matches!(&scene.nodes[0].element, Element::Group { .. }));
+            assert!(scene.nodes[0].is_group());
         }
 
         /// 容器访问器（`is_group` / `children` / `children_mut`）与前后序遍历。
@@ -1878,6 +2009,21 @@ mod tests {
             assert!(!l2.visible);
             assert_eq!(l2.opacity, 0.5);
             assert_eq!(l2.transform, Some(Transform::translate(1.0, 2.0)));
+        }
+
+        /// `Layer::scope()` 把 layer 属性映射成与节点一致的合成作用域（B：统一 scope 路径）。
+        #[test]
+        fn layer_scope_matches_its_attributes() {
+            let layer = Layer::new("l").with_opacity(0.5);
+            let s = layer.scope();
+            assert_eq!(s.opacity, 0.5);
+            assert_eq!(s.blend_mode, BlendMode::Normal);
+            assert_eq!(s.name, Some("l"));
+            assert!(s.clip.is_none() && s.filter.is_none() && s.mask.is_none());
+            assert!(!s.is_identity());
+
+            // 无名且全默认的 layer 不产生任何作用域。
+            assert!(Layer::new("").scope().is_identity());
         }
     }
 

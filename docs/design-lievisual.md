@@ -20,12 +20,17 @@ SVG / vello_cpu 栅格 / GPU（规划中）/ PDF·DOCX（经 liepress）。
    `render_scene_ordered` 里统一处理排序、节点属性、`Group` 递归与局部变换。`blend_mode` 含 16 种
    CSS mix 模式与 13 种 Porter-Duff 合成算子；后者为 raster-only（SVG 无逐元素等价物，退化为
    `Normal`）。
-   **容器是一等概念**：`Element::Group` 的节点即"容器"，通过 `SceneNode::is_group` /
-   `children` / `children_mut`（以及 `visit` / `visit_mut`）访问，避免各处直接 `match
-   Element::Group`；渲染用统一的 `Renderer::render_children` 递归（默认层 / `Layer` / `Group`
-   共用同一路径），根级遍历用 `Scene::root_lists` / `root_lists_mut`（默认层 + 可见 layer）。
+   **容器是一等概念**：节点内容由 `NodeKind` 表达 —— `NodeKind::Draw(Element)`（叶子图元）或
+   `NodeKind::Group(Vec<SceneNode>)`（容器）。`Element` 因此只描述几何 + 样式，**不再**含递归的
+   `Group` 变体，也不再引用 `SceneNode`。通过 `SceneNode::is_group` / `children` / `children_mut` /
+   `element`（以及 `visit` / `visit_mut`）访问，避免各处直接匹配节点种类；渲染用统一的
+   `Renderer::render_children` 递归（默认层 / `Layer` / 容器共用同一路径），根级遍历用
+   `Scene::root_lists` / `root_lists_mut`（默认层 + 可见 layer）。`Layer` 与节点共用同一套
+   `NodeScope`（`Renderer::push_scope`），不再各写一遍 transform / clip / filter / opacity /
+   blend / mask / name 的压栈顺序。
 3. **图元丰富**。`Element` 覆盖：矩形、圆、椭圆（可旋转）、圆角矩形、线、折线、多边形、
-   圆弧（开放描边）、扇形（闭合、适合饼图）、路径、渐变路径、文本（双形态）、组合 Group。
+   圆弧（开放描边）、扇形（闭合、适合饼图）、路径、渐变路径、文本（双形态）；容器由
+   `NodeKind::Group` 表达（`Element` 不含 `Group`）。
 4. **图层（Layer）**。`Scene` 可携带一组有序 [`Layer`]（从底到顶），整层控制
    `name` / `visible` / `opacity` / `transform`；层内节点再按 `z_index` 稳定排序，
    互不影响其它层。`Scene::nodes` 作为"默认层"（最底）保留，向后兼容。

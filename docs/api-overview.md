@@ -70,12 +70,14 @@ Canvas 风格**便捷构造**层：纯函数返回 `Element`，不引入可变�
 ### 3.1 `Scene` / `SceneNode` / `Layer`
 
 - `Scene::new(w, h)`：可携带有序 `Layer`（从底到顶）；层内节点按 `z_index` 稳定排序；`nodes` 为默认层（最底）。
-- `SceneNode`：`Element` + 节点属性 `z_index` / `transform` / `opacity` / `name` / `visible` / `clip` / `blend_mode` / `mask` / `filter`（Group 子树递归生效）；`filter` / `opacity` / `blend_mode` / `mask` 为隔离合成（离屏层），跨后端一致。
+- `SceneNode`：内容为 `kind: NodeKind`（`Draw(Element)` 叶子 / `Group(Vec<SceneNode>)` 容器），加节点属性 `z_index` / `transform` / `opacity` / `name` / `visible` / `clip` / `blend_mode` / `mask` / `filter`（子树递归生效）；`filter` / `opacity` / `blend_mode` / `mask` 为隔离合成（离屏层），跨后端一致。叶子用 `element()` / `element_mut()` / `into_element()` 读取，容器用 `is_group()` / `children()` / `children_mut()` / `visit` / `visit_mut`。
+- `NodeScope`：节点与 `Layer` 共用的作用域描述；`Renderer::push_scope` / `pop_scope` 为其唯一实现（`render_layer` 与 `render_node` 共用）。
 - `Scene::push(node)`：`Element: From<Element> → SceneNode` 自动转换。
 
 ### 3.2 `Element` 图元枚举
 
-矩形、圆、椭圆、圆角矩形、线、折线、多边形、圆弧、扇形、路径、渐变路径、文本、组合（Group）、`SceneImage`（图片）。
+矩形、圆、椭圆、圆角矩形、线、折线、多边形、圆弧、扇形、路径、渐变路径、文本、`SceneImage`（图片）。
+**`Element` 只描述几何 + 样式** —— 容器不是图元，而是 `NodeKind::Group`（`Element` 不含 `Group`，也不引用 `SceneNode`）。
 
 ### 3.3 填充 / 描边
 

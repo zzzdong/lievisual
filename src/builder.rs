@@ -422,9 +422,8 @@ impl Ctx {
             .unwrap_or_else(|| Stroke::new(self.shape_fill(), 1.0))
     }
 
-    /// Wrap an element into a node carrying this context's node-level attributes.
-    fn node(&self, element: Element) -> SceneNode {
-        let mut n = SceneNode::new(element);
+    /// Apply this context's node-level attributes to an already-built node.
+    fn attrs(&self, mut n: SceneNode) -> SceneNode {
         if let Some(t) = self.transform {
             n = n.with_transform(t);
         }
@@ -450,6 +449,11 @@ impl Ctx {
             n = n.with_z(self.z_index);
         }
         n
+    }
+
+    /// Wrap an element into a node carrying this context's node-level attributes.
+    fn node(&self, element: Element) -> SceneNode {
+        self.attrs(SceneNode::new(element))
     }
 
     // ---- text ----
@@ -749,7 +753,7 @@ impl Ctx {
     /// shares one transform / alpha / clip.
     #[must_use]
     pub fn group(&self, children: Vec<SceneNode>) -> SceneNode {
-        self.node(Element::Group { children })
+        self.attrs(SceneNode::group(children))
     }
 
     /// Build a named [`Layer`] carrying this context's transform and alpha, then push nodes via
@@ -1075,7 +1079,7 @@ impl Path2D {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::{LinearGradient, ObjectFit, Scene, Stroke};
+    use crate::scene::{LinearGradient, NodeKind, ObjectFit, Scene, Stroke};
 
     fn default_ctx() -> Ctx {
         Ctx::new().with_fill(Color::rgb(0x33, 0x66, 0x99))
@@ -1087,7 +1091,11 @@ mod tests {
     fn fill_text_anchors_and_color() {
         let ctx =
             default_ctx().with_font(TextStyle::new(Color::rgb(0xff, 0, 0), 24.0, "sans-serif"));
-        match ctx.fill_text(50.0, 50.0, "Hi").element {
+        match ctx
+            .fill_text(50.0, 50.0, "Hi")
+            .into_element()
+            .expect("leaf")
+        {
             Element::Text {
                 spans,
                 position,
@@ -1113,12 +1121,16 @@ mod tests {
     #[test]
     fn text_color_independent_of_shape_fill() {
         let ctx = default_ctx().with_text_color(Color::rgb(0xff, 0, 0));
-        match ctx.fill_text(0.0, 0.0, "x").element {
+        match ctx.fill_text(0.0, 0.0, "x").into_element().expect("leaf") {
             Element::Text { spans, .. } => assert_eq!(spans[0].style.color, Color::rgb(0xff, 0, 0)),
             _ => panic!("expected Text"),
         }
         // shape fill still uses the default fill color.
-        match ctx.fill_rect(0.0, 0.0, 1.0, 1.0).element {
+        match ctx
+            .fill_rect(0.0, 0.0, 1.0, 1.0)
+            .into_element()
+            .expect("leaf")
+        {
             Element::Rect { style, .. } => {
                 assert_eq!(style.fill, Some(Fill::Solid(Color::rgb(0x33, 0x66, 0x99))));
             }
@@ -1130,7 +1142,11 @@ mod tests {
     #[test]
     fn rect_builders() {
         let ctx = default_ctx();
-        match ctx.fill_rect(10.0, 20.0, 30.0, 40.0).element {
+        match ctx
+            .fill_rect(10.0, 20.0, 30.0, 40.0)
+            .into_element()
+            .expect("leaf")
+        {
             Element::Rect { rect, style } => {
                 assert_eq!(rect, Rect::new(10.0, 20.0, 40.0, 60.0));
                 assert!(style.fill.is_some() && style.stroke.is_none());
@@ -1138,7 +1154,11 @@ mod tests {
             _ => panic!("expected Rect"),
         }
         let ctx = Ctx::new().with_stroke(Stroke::new(Color::BLACK, 2.0));
-        match ctx.stroke_rect(0.0, 0.0, 5.0, 5.0).element {
+        match ctx
+            .stroke_rect(0.0, 0.0, 5.0, 5.0)
+            .into_element()
+            .expect("leaf")
+        {
             Element::Rect { rect, style } => {
                 assert_eq!(rect, Rect::new(0.0, 0.0, 5.0, 5.0));
                 assert_eq!(style.stroke.as_ref().unwrap().width, 2.0);
@@ -1155,23 +1175,29 @@ mod tests {
             .with_fill(Color::BLACK)
             .with_stroke(Stroke::new(Color::BLACK, 1.0));
         assert!(matches!(
-            ctx.line(0.0, 0.0, 1.0, 1.0).element,
+            ctx.line(0.0, 0.0, 1.0, 1.0).into_element().expect("leaf"),
             Element::Line { .. }
         ));
         assert!(matches!(
-            ctx.polyline(&[(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)]).element,
+            ctx.polyline(&[(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)])
+                .into_element()
+                .expect("leaf"),
             Element::Polyline { .. }
         ));
         assert!(matches!(
-            ctx.polygon(&[(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)]).element,
+            ctx.polygon(&[(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
+                .into_element()
+                .expect("leaf"),
             Element::Polygon { .. }
         ));
         assert!(matches!(
-            ctx.fill_circle(0.0, 0.0, 5.0).element,
+            ctx.fill_circle(0.0, 0.0, 5.0).into_element().expect("leaf"),
             Element::Circle { .. }
         ));
         assert!(matches!(
-            ctx.fill_ellipse(0.0, 0.0, 4.0, 2.0, 0.0).element,
+            ctx.fill_ellipse(0.0, 0.0, 4.0, 2.0, 0.0)
+                .into_element()
+                .expect("leaf"),
             Element::Ellipse { .. }
         ));
     }
@@ -1187,7 +1213,11 @@ mod tests {
         p.line_to(1.0, 0.0);
         p.line_to(1.0, 1.0);
         p.close_path();
-        match ctx.path(p.into_bezpath(), true).element {
+        match ctx
+            .path(p.into_bezpath(), true)
+            .into_element()
+            .expect("leaf")
+        {
             Element::Path {
                 style,
                 closed,
@@ -1234,7 +1264,7 @@ mod tests {
         p.line_to(10.0, 0.0);
         p.line_to(10.0, 10.0);
 
-        let filled = ctx.fill(&p).element;
+        let filled = ctx.fill(&p).into_element().expect("leaf");
         match &filled {
             Element::Path { style, .. } => {
                 assert!(style.fill.is_some(), "fill 应带填充");
@@ -1242,7 +1272,7 @@ mod tests {
             }
             _ => panic!("expected Path"),
         }
-        let stroked = ctx.stroke(&p).element;
+        let stroked = ctx.stroke(&p).into_element().expect("leaf");
         match &stroked {
             Element::Path { style, .. } => {
                 assert!(style.fill.is_none(), "stroke 不应填充");
@@ -1250,7 +1280,7 @@ mod tests {
             }
             _ => panic!("expected Path"),
         }
-        let both = ctx.fill_stroke_path(&p).element;
+        let both = ctx.fill_stroke_path(&p).into_element().expect("leaf");
         match &both {
             Element::Path { style, .. } => {
                 assert!(style.fill.is_some() && style.stroke.is_some());
@@ -1402,7 +1432,11 @@ mod tests {
             }],
         };
         let ctx = Ctx::new().with_fill_gradient(g.clone());
-        match ctx.fill_rect(0.0, 0.0, 10.0, 10.0).element {
+        match ctx
+            .fill_rect(0.0, 0.0, 10.0, 10.0)
+            .into_element()
+            .expect("leaf")
+        {
             Element::Rect { style, .. } => {
                 assert!(matches!(style.fill, Some(Fill::LinearGradient(_))));
             }
@@ -1425,7 +1459,11 @@ mod tests {
             RichSpan::new("bold ", TextStyle::new(Color::RED, 20.0, "sans-serif")),
             RichSpan::new("plain", TextStyle::new(Color::BLUE, 12.0, "sans-serif")),
         ];
-        match ctx.fill_rich_text(0.0, 0.0, spans).element {
+        match ctx
+            .fill_rich_text(0.0, 0.0, spans)
+            .into_element()
+            .expect("leaf")
+        {
             Element::Text { spans, .. } => {
                 assert_eq!(spans.len(), 2);
                 assert_eq!(spans[0].style.color, Color::RED);
@@ -1447,13 +1485,21 @@ mod tests {
     fn draw_image_builders() {
         let img = SceneImage::from_rgba8(4, 2, vec![0u8; 4 * 2 * 4]).unwrap();
         let ctx = Ctx::new();
-        match ctx.draw_image(img.clone(), 1.0, 2.0, 100.0, 50.0).element {
+        match ctx
+            .draw_image(img.clone(), 1.0, 2.0, 100.0, 50.0)
+            .into_element()
+            .expect("leaf")
+        {
             Element::Image { frame, .. } => {
                 assert_eq!(frame, Rect::new(1.0, 2.0, 101.0, 52.0));
             }
             _ => panic!("expected Image"),
         }
-        match ctx.draw_image_at_size(img, 1.0, 2.0).element {
+        match ctx
+            .draw_image_at_size(img, 1.0, 2.0)
+            .into_element()
+            .expect("leaf")
+        {
             Element::Image { frame, .. } => {
                 assert_eq!(frame, Rect::new(1.0, 2.0, 5.0, 4.0), "应为原始像素尺寸");
             }
@@ -1467,7 +1513,7 @@ mod tests {
         let img = SceneImage::from_rgba8(1, 1, vec![0u8; 4]).unwrap();
         let node = Ctx::new().with_alpha(0.4).draw_image_at_size(img, 0.0, 0.0);
         assert_eq!(node.opacity, 0.4);
-        match node.element {
+        match node.element().expect("leaf") {
             Element::Image { opacity, .. } => assert!((opacity - 0.4).abs() < 1e-9),
             _ => panic!("expected Image"),
         }
@@ -1481,8 +1527,8 @@ mod tests {
         let g = ctx.group(vec![child]);
         assert_eq!(g.opacity, 0.5);
         assert!(g.transform.is_some());
-        match g.element {
-            Element::Group { children } => assert_eq!(children.len(), 1),
+        match &g.kind {
+            NodeKind::Group(children) => assert_eq!(children.len(), 1),
             _ => panic!("expected Group"),
         }
     }
@@ -1507,7 +1553,8 @@ mod tests {
             .with_stroke(Stroke::new(Color::BLACK, 1.0));
         match ctx
             .pie(5.0, 5.0, 10.0, 0.0, std::f64::consts::FRAC_PI_2)
-            .element
+            .into_element()
+            .expect("leaf")
         {
             Element::Pie { center, radius, .. } => {
                 assert_eq!(center, Point::new(5.0, 5.0));
@@ -1517,7 +1564,8 @@ mod tests {
         }
         match ctx
             .arc(5.0, 5.0, 10.0, 20.0, 0.0, std::f64::consts::FRAC_PI_2)
-            .element
+            .into_element()
+            .expect("leaf")
         {
             Element::Arc { center, radii, .. } => {
                 assert_eq!(center, Point::new(5.0, 5.0));
@@ -1531,7 +1579,11 @@ mod tests {
     #[test]
     fn round_rect_helper() {
         let ctx = Ctx::new().with_fill(Color::BLACK);
-        match ctx.round_rect(1.0, 2.0, 3.0, 4.0, 0.5).element {
+        match ctx
+            .round_rect(1.0, 2.0, 3.0, 4.0, 0.5)
+            .into_element()
+            .expect("leaf")
+        {
             Element::RoundedRect { rect, radius, .. } => {
                 assert_eq!(rect, Rect::new(1.0, 2.0, 4.0, 6.0));
                 assert_eq!(radius, 0.5);
@@ -1550,7 +1602,8 @@ mod tests {
             .clone()
             .without_fill()
             .fill_stroke_rect(0.0, 0.0, 1.0, 1.0)
-            .element
+            .into_element()
+            .expect("leaf")
         {
             Element::Rect { style, .. } => {
                 assert!(style.fill.is_none() && style.stroke.is_some())
@@ -1560,7 +1613,8 @@ mod tests {
         match ctx
             .without_stroke()
             .fill_stroke_rect(0.0, 0.0, 1.0, 1.0)
-            .element
+            .into_element()
+            .expect("leaf")
         {
             Element::Rect { style, .. } => {
                 assert!(style.fill.is_some() && style.stroke.is_none())
@@ -1575,7 +1629,11 @@ mod tests {
         let img = SceneImage::from_rgba8(1, 1, vec![0u8; 4])
             .unwrap()
             .with_object_fit(ObjectFit::Cover);
-        match Ctx::new().draw_image_at_size(img, 0.0, 0.0).element {
+        match Ctx::new()
+            .draw_image_at_size(img, 0.0, 0.0)
+            .into_element()
+            .expect("leaf")
+        {
             Element::Image { image, .. } => assert_eq!(image.object_fit, ObjectFit::Cover),
             _ => panic!("expected Image"),
         }

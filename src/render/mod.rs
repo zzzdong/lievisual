@@ -15,7 +15,9 @@
 //! these to emit native markup (e.g. SVG `<ellipse>` / `<rect rx>`).
 
 use crate::geometry::{Point, Rect, Transform, Vec2};
-use crate::scene::{BlendMode, Element, FillStrokeStyle, Layer, Scene, SceneNode, Stroke};
+use crate::scene::{
+    BlendMode, Element, FillStrokeStyle, Layer, NodeKind, Scene, SceneNode, Stroke,
+};
 use kurbo::Shape;
 
 pub use svg::{SvgRenderer, SvgSizing};
@@ -239,62 +241,75 @@ pub trait Renderer {
     /// Exit the scope established by [`Renderer::push_clip`].
     fn pop_clip(&mut self) {}
 
-    /// Enter the node-level scope: stacks transform, clip, opacity, and name in order.
-    /// The default combines `push_transform` / `push_clip` / `push_opacity` /
-    /// `push_name`; backends rarely need to override this.
-    fn push_node_scope(&mut self, node: &SceneNode) {
-        if let Some(t) = node.transform {
+    /// Enter a compositing scope: stacks transform, clip, filter, opacity, blend, mask and name,
+    /// in exactly that order.
+    ///
+    /// The **single** implementation of "what does a subtree attribute scope look like", shared by
+    /// [`Renderer::push_node_scope`] (a node) and [`Renderer::render_layer`] (a layer — a named
+    /// root group). Pop order is the reverse; see [`Renderer::pop_scope`].
+    fn push_scope(&mut self, scope: &crate::scene::NodeScope) {
+        if let Some(t) = scope.transform {
             self.push_transform(t);
         }
-        if let Some(clip) = &node.clip {
+        if let Some(clip) = scope.clip {
             self.push_clip(clip);
         }
         // Filter is applied to the subtree's rendered content, before opacity / blend / mask
         // (mirrors CSS `filter` → opacity → `mix-blend-mode`).
-        if let Some(filter) = &node.filter {
+        if let Some(filter) = scope.filter {
             self.push_filter(filter);
         }
-        if node.opacity != 1.0 {
-            self.push_opacity(node.opacity);
+        if scope.opacity != 1.0 {
+            self.push_opacity(scope.opacity);
         }
         // Blend is pushed after opacity so it forms the outer compositing layer: the scope's
         // content is first scaled by opacity, then blended with the backdrop.
-        if !node.blend_mode.is_normal() {
-            self.push_blend(node.blend_mode);
+        if !scope.blend_mode.is_normal() {
+            self.push_blend(scope.blend_mode);
         }
         // Mask is outermost of the compositing scopes: it multiplies the final alpha of the
         // (opacity- and blend-applied) subtree.
-        if let Some(mask) = &node.mask {
+        if let Some(mask) = scope.mask {
             self.push_mask(mask);
         }
-        if node.name.is_some() {
-            self.push_name(node.name.as_deref());
+        if let Some(name) = scope.name {
+            self.push_name(Some(name));
         }
     }
 
-    /// Exit the scope established by [`Renderer::push_node_scope`] (pops in reverse order).
-    fn pop_node_scope(&mut self, node: &SceneNode) {
-        if node.name.is_some() {
+    /// Exit the scope established by [`Renderer::push_scope`] (pops in reverse order).
+    fn pop_scope(&mut self, scope: &crate::scene::NodeScope) {
+        if scope.name.is_some() {
             self.pop_name();
         }
-        if node.mask.is_some() {
+        if scope.mask.is_some() {
             self.pop_mask();
         }
-        if !node.blend_mode.is_normal() {
+        if !scope.blend_mode.is_normal() {
             self.pop_blend();
         }
-        if node.opacity != 1.0 {
+        if scope.opacity != 1.0 {
             self.pop_opacity();
         }
-        if node.filter.is_some() {
+        if scope.filter.is_some() {
             self.pop_filter();
         }
-        if node.clip.is_some() {
+        if scope.clip.is_some() {
             self.pop_clip();
         }
-        if node.transform.is_some() {
+        if scope.transform.is_some() {
             self.pop_transform();
         }
+    }
+
+    /// Enter the node-level scope (delegates to [`Renderer::push_scope`]).
+    fn push_node_scope(&mut self, node: &SceneNode) {
+        self.push_scope(&node.scope());
+    }
+
+    /// Exit the scope established by [`Renderer::push_node_scope`].
+    fn pop_node_scope(&mut self, node: &SceneNode) {
+        self.pop_scope(&node.scope());
     }
 
     /// Render the whole scene: the default implementation handles sorting and recursion.
@@ -306,7 +321,7 @@ pub trait Renderer {
 
     /// Draw a slice of nodes in stable ascending `z_index` order.
     ///
-    /// The single recursion shared by the default node list, [`Layer`]s and [`Element::Group`]
+    /// The single recursion shared by the default node list, [`Layer`]s and [`NodeKind::Group`]
     /// containers: each level is sorted by `z_index`, then every node goes through
     /// [`Renderer::render_node`] (which applies the node scope and recurses into nested groups).
     fn render_children(&mut self, nodes: &[SceneNode]) {
@@ -325,58 +340,49 @@ pub trait Renderer {
         }
     }
 
-    /// Render a single layer: applies the layer-level `visible` / `opacity` /
-    /// `transform` / `name` scope, then renders each node inside the layer stably by
-    /// ascending `z_index` (including Group recursion). Rarely needs to be overridden.
+    /// Render a single layer: apply the layer-level scope, then render each node inside the layer
+    /// stably by ascending `z_index` (including container recursion). Rarely needs to be
+    /// overridden.
+    ///
+    /// A layer is a named root group, so it reuses the very same scope path as a node
+    /// ([`Renderer::push_scope`]) instead of duplicating the push / pop sequence.
     fn render_layer(&mut self, layer: &Layer) {
         if !layer.visible {
             return;
         }
-        if let Some(t) = layer.transform {
-            self.push_transform(t);
-        }
-        if layer.opacity != 1.0 {
-            self.push_opacity(layer.opacity);
-        }
-        if !layer.blend_mode.is_normal() {
-            self.push_blend(layer.blend_mode);
-        }
-        if !layer.name.is_empty() {
-            self.push_name(Some(&layer.name));
-        }
-
+        let scope = layer.scope();
+        self.push_scope(&scope);
         self.render_children(&layer.nodes);
-
-        if !layer.name.is_empty() {
-            self.pop_name();
-        }
-        if !layer.blend_mode.is_normal() {
-            self.pop_blend();
-        }
-        if layer.opacity != 1.0 {
-            self.pop_opacity();
-        }
-        if layer.transform.is_some() {
-            self.pop_transform();
-        }
+        self.pop_scope(&scope);
     }
 
-    /// Render a single node (node attributes, local transform, and Group recursion
-    /// included). Rarely needs to be overridden.
+    /// Render a single node: enter the node's scope, draw its content (a leaf primitive, or a
+    /// container's children), then leave the scope. Rarely needs to be overridden.
     fn render_node(&mut self, node: &SceneNode) {
         // Skip the whole subtree for a hidden node.
         if !node.visible {
             return;
         }
-        // Enter the node scope (transform + opacity + name).
+        // Enter the node scope (transform + clip + compositing + name).
         self.push_node_scope(node);
 
-        match &node.element {
-            Element::Group { children } => {
-                // Children inside a Group are drawn stably by ascending z_index (the same
-                // recursion used by layers / the default node list).
-                self.render_children(children);
-            }
+        match &node.kind {
+            // A container: children are drawn stably by ascending z_index (the same recursion
+            // used by layers / the default node list).
+            NodeKind::Group(children) => self.render_children(children),
+            // A leaf: dispatch to the atomic drawing method.
+            NodeKind::Draw(element) => self.draw_element(element),
+        }
+
+        self.pop_node_scope(node);
+    }
+
+    /// Draw one leaf primitive, dispatching to the atomic `draw_*` methods.
+    ///
+    /// This is the single place that knows every [`Element`] variant; a backend (or a custom pass)
+    /// that wants to draw an element outside the standard traversal can reuse it.
+    fn draw_element(&mut self, element: &Element) {
+        match element {
             Element::Rect { rect, style } => self.draw_rect(*rect, style),
             Element::Circle {
                 center,
@@ -433,8 +439,6 @@ pub trait Renderer {
                 layout,
             } => self.draw_text(spans, *position, style, layout.as_deref()),
         }
-
-        self.pop_node_scope(node);
     }
 }
 
