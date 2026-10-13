@@ -58,7 +58,7 @@ pub fn element_bounds(element: &Element) -> Option<Rect> {
         }
         Element::RoundedRect {
             rect,
-            radius: _,
+            radii: _,
             style,
         } => {
             let mut r = normalized(*rect);

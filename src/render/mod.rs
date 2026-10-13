@@ -81,16 +81,26 @@ pub trait Renderer {
         self.draw_path(&path, style, true);
     }
 
-    /// Draw a rounded rectangle (`radius` is the uniform corner radius).
+    /// Draw a rounded rectangle with a uniform corner radius.
     fn draw_rounded_rect(&mut self, rect: Rect, radius: f64, style: &FillStrokeStyle) {
-        let path = kurbo::RoundedRect::new(
-            rect.min_x(),
-            rect.min_y(),
-            rect.max_x(),
-            rect.max_y(),
-            radius,
-        )
-        .to_path(0.1);
+        self.draw_rounded_rect_radii(rect, crate::scene::CornerRadii::uniform(radius), style);
+    }
+
+    /// Draw a rounded rectangle with **per-corner** radii.
+    ///
+    /// The default builds a Bézier path (kurbo `RoundedRectRadii`) and delegates to
+    /// [`Renderer::draw_path`], so any backend can render it. A backend with a native rounded-rect
+    /// tag (SVG's `<rect rx="…">`) should only use it for the *uniform* case — `<rect rx>` cannot
+    /// express four different radii — which is exactly what [`Renderer::draw_element`] arranges:
+    /// it routes a uniform `Element::RoundedRect` to [`Renderer::draw_rounded_rect`] and a
+    /// per-corner one here.
+    fn draw_rounded_rect_radii(
+        &mut self,
+        rect: Rect,
+        radii: crate::scene::CornerRadii,
+        style: &FillStrokeStyle,
+    ) {
+        let path = kurbo::RoundedRect::from_rect(rect, radii.to_kurbo()).to_path(0.1);
         self.draw_path(&path, style, true);
     }
 
@@ -252,6 +262,15 @@ pub trait Renderer {
     /// Exit the scope established by [`Renderer::push_color_matrix`].
     fn pop_color_matrix(&mut self) {}
 
+    /// Enter an anti-aliasing scope: shapes drawn until [`Renderer::pop_antialias`] use
+    /// `enabled` anti-aliasing.
+    ///
+    /// Empty by default. Backends implement it as a *draw state* (SVG `shape-rendering`, vello's
+    /// aliasing threshold) rather than a compositing layer.
+    fn push_antialias(&mut self, _enabled: bool) {}
+    /// Exit the scope established by [`Renderer::push_antialias`].
+    fn pop_antialias(&mut self) {}
+
     /// Enter a compositing scope: stacks transform, clip, filter, opacity, blend, mask and name,
     /// in exactly that order.
     ///
@@ -264,6 +283,11 @@ pub trait Renderer {
         }
         if let Some(clip) = scope.clip {
             self.push_clip(clip);
+        }
+        // Anti-aliasing is a draw hint, not a compositing layer: it only needs to be active while
+        // the subtree's geometry is emitted.
+        if let Some(enabled) = scope.antialias {
+            self.push_antialias(enabled);
         }
         // A colour matrix is *baked into the paints*, so it must be active before the subtree
         // emits any colour — and before `filter`, which then sees the baked colours.
@@ -312,6 +336,9 @@ pub trait Renderer {
         }
         if scope.color_matrix.is_some() {
             self.pop_color_matrix();
+        }
+        if scope.antialias.is_some() {
+            self.pop_antialias();
         }
         if scope.clip.is_some() {
             self.pop_clip();
@@ -414,11 +441,15 @@ pub trait Renderer {
                 rotation,
                 style,
             } => self.draw_ellipse(*center, *radii, *rotation, style),
-            Element::RoundedRect {
-                rect,
-                radius,
-                style,
-            } => self.draw_rounded_rect(*rect, *radius, style),
+            // A native rounded-rect tag can only carry one radius, so a per-corner shape goes
+            // through the (path-based) radii entry point instead.
+            Element::RoundedRect { rect, radii, style } => {
+                if radii.is_uniform() {
+                    self.draw_rounded_rect(*rect, radii.uniform_value(), style);
+                } else {
+                    self.draw_rounded_rect_radii(*rect, *radii, style);
+                }
+            }
             Element::Line { start, end, style } => self.draw_line(*start, *end, style),
             Element::Polyline { points, style } => self.draw_polyline(points, style),
             Element::Polygon { points, style } => self.draw_polygon(points, style),

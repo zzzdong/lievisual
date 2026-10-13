@@ -56,8 +56,12 @@ pub struct SvgRenderer {
     clip_id: usize,
     mask_id: usize,
     filter_id: usize,
+    /// Id counter for `<pattern>`s built from tiled images.
+    image_id: usize,
     /// Composed colour-matrix stack: the last entry is baked into every paint colour emitted.
     color_matrices: Vec<ColorMatrix>,
+    /// Anti-aliasing stack: the top value is the active setting (`true` = anti-aliased).
+    antialias_stack: Vec<bool>,
     /// Hand-drawn fill patterns already emitted: index = `sk{n}` id, deduplicated by value so
     /// a hundred same-coloured cells share one `<pattern>`. Keyed by the active colour matrix too,
     /// since the tile's ink is baked with it.
@@ -87,7 +91,9 @@ impl SvgRenderer {
             clip_id: 0,
             mask_id: 0,
             filter_id: 0,
+            image_id: 0,
             color_matrices: Vec::new(),
+            antialias_stack: Vec::new(),
             patterns: Vec::new(),
             title: None,
             description: None,
@@ -605,9 +611,7 @@ impl Renderer for SvgRenderer {
     fn draw_image(&mut self, image: &crate::SceneImage, frame: Rect, opacity: f64) {
         // Bitmap → PNG encode → data: URI (base64), output as <image>, the browser decodes it
         // and applies object-fit.
-        let png = image.pixmap.to_png();
-        let b64 = base64_encode(&png);
-        let data_uri = format!("data:image/png;base64,{b64}");
+        let data_uri = image_data_uri(&image.pixmap);
         let op = if (opacity - 1.0).abs() > 1e-6 {
             format!(r#" opacity="{:.3}""#, opacity)
         } else {
@@ -619,15 +623,39 @@ impl Renderer for SvgRenderer {
             crate::ObjectFit::None => (image.pixmap.width() as f64, image.pixmap.height() as f64),
             _ => (frame.width(), frame.height()),
         };
+        // The browser does the resampling; `image-rendering` is the only lever available, and it
+        // is only a hint (`Bilinear` = the default, so nothing is emitted).
+        let rendering = match image.quality {
+            crate::scene::ImageQuality::Nearest => r#" image-rendering="pixelated""#,
+            crate::scene::ImageQuality::Bilinear => "",
+            crate::scene::ImageQuality::Bicubic => r#" image-rendering="high-quality""#,
+        };
+        let (x, y) = (frame.min_x(), frame.min_y());
+        // A tile is a `<pattern>` holding one copy at natural pixel size (anchored at the frame
+        // origin) plus a rect covering the frame — the rect clips the overflow.
+        if image.object_fit == crate::ObjectFit::Tile {
+            let id = self.image_id;
+            self.image_id += 1;
+            let (iw, ih) = (image.pixmap.width() as f64, image.pixmap.height() as f64);
+            let (tw, th) = (frame.width(), frame.height());
+            let _ = write!(
+                self.buf,
+                r#"<defs><pattern id="img{id}" patternUnits="userSpaceOnUse" x="{x:.2}" y="{y:.2}" width="{iw:.2}" height="{ih:.2}"><image x="0" y="0" width="{iw:.2}" height="{ih:.2}" href="{data_uri}" preserveAspectRatio="none"{rendering}/></pattern></defs>"#
+            );
+            let _ = writeln!(
+                self.buf,
+                r#"<rect x="{x:.2}" y="{y:.2}" width="{tw:.2}" height="{th:.2}" fill="url(#img{id})"{op}/>"#
+            );
+            return;
+        }
         let el = format!(
-            r#"<image x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" href="{}" preserveAspectRatio="{}"{}/>"#,
+            r#"<image x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" href="{}" preserveAspectRatio="{}"{op}{rendering}/>"#,
             frame.min_x(),
             frame.min_y(),
             w,
             h,
             data_uri,
             image.preserve_aspect_ratio(),
-            op
         );
         self.buf.push_str(&el);
         self.buf.push('\n');
@@ -813,6 +841,14 @@ impl Renderer for SvgRenderer {
     fn pop_color_matrix(&mut self) {
         self.color_matrices.pop();
     }
+
+    fn push_antialias(&mut self, enabled: bool) {
+        self.antialias_stack.push(enabled);
+    }
+
+    fn pop_antialias(&mut self) {
+        self.antialias_stack.pop();
+    }
 }
 
 impl SvgRenderer {
@@ -827,6 +863,18 @@ impl SvgRenderer {
     /// A colour attribute fragment with the active colour matrix baked into `c`.
     fn color_attr(&self, prefix: &str, c: Color) -> String {
         color_attr_str(prefix, self.current_color_matrix().apply(c))
+    }
+
+    /// Whether shapes are currently anti-aliased (the default outside any such scope).
+    fn current_antialias(&self) -> bool {
+        self.antialias_stack.last().copied().unwrap_or(true)
+    }
+
+    /// Append the shape-rendering hint when the active scope turns anti-aliasing off.
+    fn append_antialias_hint(&self, el: &mut String) {
+        if !self.current_antialias() {
+            let _ = write!(el, r#" shape-rendering="crispEdges""#);
+        }
     }
 
     /// A ` fill="…"` attribute for mask content (same emission as a normal fill).
@@ -865,6 +913,7 @@ impl SvgRenderer {
         if let Some(s) = &style.stroke {
             self.append_stroke(el, s);
         }
+        self.append_antialias_hint(el);
     }
 
     /// Emit a `<linearGradient>` `<defs>` into `buf` and return the matching ` fill="url(#…)"`.
@@ -912,6 +961,20 @@ impl SvgRenderer {
             }
             // Handled by the caller (see `apply_fill_stroke`).
             Fill::SweepGradient(_) => r#" fill="none""#.to_string(),
+            Fill::Image(f) => {
+                // One `<pattern>` per fill: the bitmap is stretched into the tile cell and the
+                // pattern repeats it across the shape.
+                let id = self.image_id;
+                self.image_id += 1;
+                let data_uri = image_data_uri(&f.image);
+                let (x, y) = (f.tile.min_x(), f.tile.min_y());
+                let (w, h) = (f.tile.width(), f.tile.height());
+                let defs = format!(
+                    r#"<defs><pattern id="img{id}" patternUnits="userSpaceOnUse" x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}"><image x="0" y="0" width="{w:.2}" height="{h:.2}" href="{data_uri}" preserveAspectRatio="none"/></pattern></defs>"#
+                );
+                self.buf.push_str(&defs);
+                format!(r#" fill="url(#img{id})""#)
+            }
         }
     }
 
@@ -1028,6 +1091,7 @@ impl SvgRenderer {
         // fill, otherwise the browser would fill the polyline/arc area black.
         let _ = write!(el, r#" fill="none""#);
         self.append_stroke(el, style);
+        self.append_antialias_hint(el);
     }
 
     fn append_stroke(&self, el: &mut String, s: &Stroke) {
@@ -1201,6 +1265,11 @@ fn deco_keyword(underline: bool, strikethrough: bool) -> &'static str {
 
 /// Number of wedges used to approximate a sweep gradient in SVG (2π/120 = 3° per step).
 const SWEEP_WEDGES: usize = 120;
+
+/// PNG-encode a bitmap into a `data:` URI (the browser decodes it).
+fn image_data_uri(pixmap: &crate::Pixmap) -> String {
+    format!("data:image/png;base64,{}", base64_encode(&pixmap.to_png()))
+}
 
 /// A square box of half-side `r` around `center` (bounds helper for sweep overlay radii).
 fn square_bbox(center: Point, r: f64) -> Rect {
@@ -1635,6 +1704,145 @@ mod tests {
         assert!(
             out.contains(r#"fill="none""#),
             "形状自身不再填充（由 wedge 着色）"
+        );
+    }
+
+    /// 圆角矩形：统一半径走原生 `<rect rx>`（输出与旧版一致），每角半径退化为 `<path>`。
+    #[test]
+    fn rounded_rect_uniform_uses_rect_per_corner_uses_path() {
+        let scene_with = |radii: crate::scene::CornerRadii| {
+            let mut s = Scene::new(20.0, 20.0);
+            s.push(Element::rounded_rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                radii,
+                FillStrokeStyle::fill(Color::BLACK),
+            ));
+            s
+        };
+        let uniform = render(&scene_with(3.0.into()));
+        assert!(
+            uniform.contains(r#"<rect x="0.00" y="0.00" width="20.00" height="20.00" rx="3.00""#)
+        );
+
+        let per_corner = render(&scene_with(crate::scene::CornerRadii::new(
+            6.0, 0.0, 0.0, 0.0,
+        )));
+        assert!(
+            !per_corner.contains("rx="),
+            "每角半径不能用 <rect rx>: {per_corner}"
+        );
+        assert!(
+            per_corner.contains(r#"<path d=""#),
+            "应退化为路径: {per_corner}"
+        );
+    }
+
+    /// 4×4 测试图：四个 2×2 象限色块（左上红 / 右上绿 / 左下蓝 / 右下白）。
+    fn quad_pixmap() -> crate::Pixmap {
+        let mut px = Vec::with_capacity(4 * 4 * 4);
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let (r, g, b) = match (x < 2, y < 2) {
+                    (true, true) => (255u8, 0u8, 0u8),
+                    (false, true) => (0, 255, 0),
+                    (true, false) => (0, 0, 255),
+                    (false, false) => (255, 255, 255),
+                };
+                px.extend_from_slice(&[r, g, b, 255]);
+            }
+        }
+        crate::Pixmap::from_rgba8(4, 4, px).unwrap()
+    }
+
+    /// 图片采样质量 → `image-rendering` 提示（Bilinear 是默认值，不输出）。
+    #[test]
+    fn image_quality_maps_to_image_rendering() {
+        use crate::scene::ImageQuality;
+        let scene_with = |q: ImageQuality| {
+            let mut s = Scene::new(8.0, 8.0);
+            s.push(Element::image(
+                crate::SceneImage::from_pixmap(quad_pixmap()).with_quality(q),
+                Rect::new(0.0, 0.0, 8.0, 8.0),
+            ));
+            s
+        };
+        assert!(
+            render(&scene_with(ImageQuality::Nearest)).contains(r#"image-rendering="pixelated""#)
+        );
+        assert!(!render(&scene_with(ImageQuality::Bilinear)).contains("image-rendering"));
+        assert!(
+            render(&scene_with(ImageQuality::Bicubic))
+                .contains(r#"image-rendering="high-quality""#)
+        );
+    }
+
+    /// `ObjectFit::Tile` → `<pattern>`（瓦片按原始像素尺寸）+ 覆盖 frame 的 `<rect>`。
+    #[test]
+    fn tile_object_fit_emits_a_pattern() {
+        let mut scene = Scene::new(8.0, 8.0);
+        scene.push(Element::image(
+            crate::SceneImage::from_pixmap(quad_pixmap()).with_object_fit(crate::ObjectFit::Tile),
+            Rect::new(0.0, 0.0, 8.0, 8.0),
+        ));
+        let out = render(&scene);
+        assert!(
+            out.contains(r#"<pattern id="img0" patternUnits="userSpaceOnUse""#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"width="4.00" height="4.00""#),
+            "瓦片按原始像素尺寸: {out}"
+        );
+        assert!(out.contains(r#"fill="url(#img0)""#), "{out}");
+    }
+
+    /// `Fill::Image` → `<pattern>` + 形状上的 `fill="url(#img…)"`。
+    #[test]
+    fn image_fill_emits_a_pattern() {
+        let mut scene = Scene::new(8.0, 8.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 8.0, 8.0),
+            FillStrokeStyle::fill_gradient(crate::scene::ImageFill::natural(
+                quad_pixmap(),
+                Point::new(0.0, 0.0),
+            )),
+        ));
+        let out = render(&scene);
+        assert!(out.contains(r#"<pattern id="img0""#), "{out}");
+        assert!(out.contains(r#"fill="url(#img0)""#), "{out}");
+    }
+
+    /// 抗锯齿开关：关闭的形状带 `shape-rendering="crispEdges"`，且能被整棵子树继承。
+    #[test]
+    fn antialias_off_emits_crisp_edges() {
+        let rect = |w: f64| {
+            Element::rect(
+                Rect::new(0.0, 0.0, w, w),
+                FillStrokeStyle::fill(Color::BLACK),
+            )
+        };
+
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push(SceneNode::new(rect(10.0)).with_antialias(false));
+        scene.push(rect(5.0));
+        let out = render(&scene);
+        assert_eq!(
+            out.matches(r#"shape-rendering="crispEdges""#).count(),
+            1,
+            "只有关闭的那个形状带提示: {out}"
+        );
+
+        // 容器关闭 → 子树两个形状都带上（属性沿子树继承）。
+        let mut nested = Scene::new(20.0, 20.0);
+        nested.push_node(
+            SceneNode::group(vec![SceneNode::new(rect(2.0)), SceneNode::new(rect(3.0))])
+                .with_antialias(false),
+        );
+        let out = render(&nested);
+        assert_eq!(
+            out.matches(r#"shape-rendering="crispEdges""#).count(),
+            2,
+            "子树继承容器的设置: {out}"
         );
     }
 

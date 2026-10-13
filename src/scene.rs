@@ -62,6 +62,25 @@ pub enum ObjectFit {
     Fill,
     /// No scaling; place at the frame's top-left at original pixel size (may overflow or pad).
     None,
+    /// **Repeat** the image at its original pixel size across the frame (clipped to it) — the
+    /// tiling/pattern fill. The raster backend wraps while blitting; SVG emits a `<pattern>`.
+    Tile,
+}
+
+/// How an image is resampled when its pixel grid does not match the size it is drawn at.
+///
+/// The raster backend implements all three itself. The SVG backend can only pass a hint to the
+/// browser (`image-rendering`), so there the exact look is the browser's choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageQuality {
+    /// Nearest neighbour: fast and blocky — exactly right for pixel art / QR-like images.
+    Nearest,
+    /// Bilinear (triangle filter); the default. Smooth and cheap.
+    #[default]
+    Bilinear,
+    /// Bicubic (Catmull-Rom, a = -0.5): sharper edges when enlarging. When *shrinking* the kernel
+    /// widens into a prefilter, so it also avoids the aliasing a plain bilinear downscale shows.
+    Bicubic,
 }
 
 /// Image resource inside a scene (self-contained RGBA8 bitmap).
@@ -75,6 +94,8 @@ pub struct SceneImage {
     pub pixmap: crate::Pixmap,
     /// Fit mode.
     pub object_fit: ObjectFit,
+    /// Resampling quality when the bitmap is scaled.
+    pub quality: ImageQuality,
 }
 
 impl SceneImage {
@@ -84,6 +105,7 @@ impl SceneImage {
         Self {
             pixmap,
             object_fit: ObjectFit::Contain,
+            quality: ImageQuality::default(),
         }
     }
 
@@ -138,6 +160,13 @@ impl SceneImage {
         self
     }
 
+    /// Set the resampling quality used when the bitmap is scaled.
+    #[must_use]
+    pub fn with_quality(mut self, quality: ImageQuality) -> Self {
+        self.quality = quality;
+        self
+    }
+
     /// The `preserveAspectRatio` fragment (without prefix) used for SVG output.
     ///
     /// `None` together with `"none"` plus the raw pixel width/height on the SVG side
@@ -148,7 +177,8 @@ impl SceneImage {
             ObjectFit::Contain => "xMidYMid meet",
             ObjectFit::Cover => "xMidYMid slice",
             ObjectFit::Fill => "none",
-            ObjectFit::None => "none",
+            // `Tile` is emitted as a `<pattern>` instead, so this value is never used for it.
+            ObjectFit::None | ObjectFit::Tile => "none",
         }
     }
 }
@@ -461,6 +491,8 @@ pub struct NodeScope<'a> {
     pub mask: Option<&'a Mask>,
     /// Colour matrix baked into every paint of the subtree.
     pub color_matrix: Option<ColorMatrix>,
+    /// Anti-aliasing override for the subtree (`None` = inherit).
+    pub antialias: Option<bool>,
     /// Optional scope name (the SVG backend emits it as an `id`).
     pub name: Option<&'a str>,
 }
@@ -476,6 +508,7 @@ impl NodeScope<'_> {
             && self.blend_mode.is_normal()
             && self.mask.is_none()
             && self.color_matrix.is_none()
+            && self.antialias.is_none()
             && self.name.is_none()
     }
 }
@@ -492,6 +525,7 @@ impl SceneNode {
             blend_mode: self.blend_mode,
             mask: self.mask.as_ref(),
             color_matrix: self.color_matrix,
+            antialias: self.antialias,
             name: self.name.as_deref(),
         }
     }
@@ -510,6 +544,7 @@ impl Layer {
             blend_mode: self.blend_mode,
             mask: None,
             color_matrix: None,
+            antialias: None,
             name: (!self.name.is_empty()).then_some(self.name.as_str()),
         }
     }
@@ -570,6 +605,14 @@ pub struct SceneNode {
     /// scope machinery (background / mask paint / a `Filter`'s colour) are unaffected; see
     /// [`ColorMatrix`] for the rationale.
     pub color_matrix: Option<ColorMatrix>,
+    /// Anti-aliasing for this subtree.
+    ///
+    /// `None` (the default) **inherits** from the enclosing scope, which is anti-aliased at the
+    /// root — so this is "turn it off for this subtree" rather than "force it on". `Some(false)`
+    /// gives crisp, hard edges (1px grid lines, pixel-aligned chrome): SVG emits
+    /// `shape-rendering="crispEdges"` on each shape, vello sets an aliasing threshold of 0.
+    /// Text is not affected (SVG has a separate `text-rendering` property).
+    pub antialias: Option<bool>,
 }
 
 impl SceneNode {
@@ -587,6 +630,7 @@ impl SceneNode {
             mask: None,
             filter: None,
             color_matrix: None,
+            antialias: None,
         }
     }
 
@@ -755,6 +799,13 @@ impl SceneNode {
     #[must_use]
     pub fn with_color_matrix(mut self, matrix: ColorMatrix) -> Self {
         self.color_matrix = Some(matrix);
+        self
+    }
+
+    /// Set anti-aliasing for this subtree (`false` = crisp, hard edges).
+    #[must_use]
+    pub fn with_antialias(mut self, enabled: bool) -> Self {
+        self.antialias = Some(enabled);
         self
     }
 }
@@ -979,6 +1030,41 @@ impl FillStrokeStyle {
     }
 }
 
+/// An image used as a **paint**: the bitmap tiles across the shape on the grid given by `tile`.
+///
+/// Both backends express this natively and identically — SVG emits a `<pattern>`, the raster
+/// backend an image brush in `Repeat` mode — so a filled shape looks the same in both.
+///
+/// Images are exempt from [`ColorMatrix`], exactly like [`Element::Image`]: they are pixels, not
+/// paint colours.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageFill {
+    /// The bitmap to paint.
+    pub image: crate::Pixmap,
+    /// One tile's **user-space** box: the bitmap is mapped onto it and repeated on that grid. The
+    /// box's top-left anchors the grid.
+    pub tile: Rect,
+}
+
+impl ImageFill {
+    /// An image tiled on a grid of `tile`-sized cells (user space).
+    #[must_use]
+    pub fn new(image: crate::Pixmap, tile: Rect) -> Self {
+        Self { image, tile }
+    }
+
+    /// Convenience: tile the image at its **natural pixel size**, with the first tile's top-left
+    /// at `at`.
+    #[must_use]
+    pub fn natural(image: crate::Pixmap, at: Point) -> Self {
+        let (w, h) = (image.width() as f64, image.height() as f64);
+        Self {
+            image,
+            tile: Rect::new(at.x, at.y, at.x + w, at.y + h),
+        }
+    }
+}
+
 /// Fill definition.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fill {
@@ -992,6 +1078,8 @@ pub enum Fill {
     /// backend docs); strokes cannot carry a gradient at all in this IR, so a fill is the only
     /// place a sweep appears.
     SweepGradient(SweepGradient),
+    /// A tiled image paint — see [`ImageFill`].
+    Image(ImageFill),
     /// Hand-drawn ("sketch") fill: a *style hint*, not literal geometry.
     ///
     /// The IR only records "this shape wants a hand-drawn fill"; each backend decides how to
@@ -1121,6 +1209,12 @@ impl From<RadialGradient> for Fill {
 impl From<SweepGradient> for Fill {
     fn from(g: SweepGradient) -> Self {
         Self::SweepGradient(g)
+    }
+}
+
+impl From<ImageFill> for Fill {
+    fn from(g: ImageFill) -> Self {
+        Self::Image(g)
     }
 }
 
@@ -1304,6 +1398,77 @@ pub fn sample_stops(stops: &[GradientStop], t: f64) -> Color {
         }
     }
     stops.last().map_or(first.color, |s| s.color)
+}
+
+/// Corner radii of a rounded rectangle: **one value, or one per corner**.
+///
+/// `From<f64>` keeps the uniform case ergonomic — `Element::rounded_rect(rect, 3.0, style)` still
+/// works — while [`CornerRadii::new`] unlocks "one square corner" shapes (tooltips, chat bubbles,
+/// tabs) that a single radius cannot express.
+///
+/// Each radius is clamped by kurbo to half the shorter side, so an oversized value degrades
+/// gracefully instead of producing a self-intersecting outline.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CornerRadii {
+    pub top_left: f64,
+    pub top_right: f64,
+    pub bottom_right: f64,
+    pub bottom_left: f64,
+}
+
+impl CornerRadii {
+    /// The same radius on all four corners.
+    #[must_use]
+    pub const fn uniform(radius: f64) -> Self {
+        Self {
+            top_left: radius,
+            top_right: radius,
+            bottom_right: radius,
+            bottom_left: radius,
+        }
+    }
+
+    /// Per-corner radii, clockwise from the top-left (matching SVG `border-radius` order).
+    #[must_use]
+    pub const fn new(top_left: f64, top_right: f64, bottom_right: f64, bottom_left: f64) -> Self {
+        Self {
+            top_left,
+            top_right,
+            bottom_right,
+            bottom_left,
+        }
+    }
+
+    /// Whether all four corners share one radius.
+    #[must_use]
+    pub fn is_uniform(&self) -> bool {
+        self.top_left == self.top_right
+            && self.top_right == self.bottom_right
+            && self.bottom_right == self.bottom_left
+    }
+
+    /// The shared radius (meaningful when [`CornerRadii::is_uniform`]); otherwise the top-left one.
+    #[must_use]
+    pub fn uniform_value(&self) -> f64 {
+        self.top_left
+    }
+
+    /// The kurbo representation.
+    #[must_use]
+    pub fn to_kurbo(self) -> kurbo::RoundedRectRadii {
+        kurbo::RoundedRectRadii::new(
+            self.top_left,
+            self.top_right,
+            self.bottom_right,
+            self.bottom_left,
+        )
+    }
+}
+
+impl From<f64> for CornerRadii {
+    fn from(radius: f64) -> Self {
+        Self::uniform(radius)
+    }
 }
 
 /// Straight (non-premultiplied) RGBA interpolation, rounded to the nearest byte.
@@ -1722,10 +1887,11 @@ pub enum Element {
         rotation: f64,
         style: FillStrokeStyle,
     },
-    /// Rounded rectangle: `radius` is the uniform corner radius.
+    /// Rounded rectangle: `radii` is a uniform corner radius or one value per corner
+    /// (see [`CornerRadii`]).
     RoundedRect {
         rect: Rect,
-        radius: f64,
+        radii: CornerRadii,
         style: FillStrokeStyle,
     },
     Line {
@@ -1834,12 +2000,17 @@ impl Element {
         }
     }
 
-    /// Rounded-rectangle primitive.
+    /// Rounded-rectangle primitive. `radius` accepts a plain `f64` (uniform) or a
+    /// [`CornerRadii`] (per corner).
     #[must_use]
-    pub fn rounded_rect(rect: Rect, radius: f64, style: FillStrokeStyle) -> Self {
+    pub fn rounded_rect(
+        rect: Rect,
+        radius: impl Into<CornerRadii>,
+        style: FillStrokeStyle,
+    ) -> Self {
         Self::RoundedRect {
             rect,
-            radius,
+            radii: radius.into(),
             style,
         }
     }
@@ -2187,6 +2358,35 @@ mod tests {
             assert_eq!(
                 Rect::new(2.0, 4.0, 12.0, 10.0).center(),
                 Point::new(7.0, 7.0)
+            );
+        }
+
+        /// 圆角矩形：标量半径等价于统一 `CornerRadii`，每角半径可分别指定。
+        #[test]
+        fn corner_radii_uniform_vs_per_corner() {
+            let u = CornerRadii::uniform(4.0);
+            assert!(u.is_uniform());
+            assert_eq!(u.uniform_value(), 4.0);
+            let el = Element::rounded_rect(
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+                // 标量自动转成统一半径。
+                4.0,
+                FillStrokeStyle::fill(Color::BLACK),
+            );
+            match el {
+                Element::RoundedRect { rect, radii, style } => {
+                    assert_eq!(rect, Rect::new(0.0, 0.0, 10.0, 10.0));
+                    assert_eq!(radii, u);
+                    assert_eq!(style.fill, Some(Fill::Solid(Color::BLACK)));
+                }
+                _ => panic!("expected RoundedRect"),
+            }
+
+            let p = CornerRadii::new(6.0, 0.0, 0.0, 0.0);
+            assert!(!p.is_uniform());
+            assert_eq!(
+                p.to_kurbo(),
+                kurbo::RoundedRectRadii::new(6.0, 0.0, 0.0, 0.0)
             );
         }
 

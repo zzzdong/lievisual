@@ -70,8 +70,10 @@ Canvas 风格**便捷构造**层：纯函数返回 `Element`，不引入可变�
 ### 3.1 `Scene` / `SceneNode` / `Layer`
 
 - `Scene::new(w, h)`：可携带有序 `Layer`（从底到顶）；层内节点按 `z_index` 稳定排序；`nodes` 为默认层（最底）。
-- `SceneNode`：内容为 `kind: NodeKind`（`Draw(Element)` 叶子 / `Group(Vec<SceneNode>)` 容器），加节点属性 `z_index` / `transform` / `opacity` / `name` / `visible` / `clip` / `blend_mode` / `mask` / `filter` / `color_matrix`（子树递归生效）；`filter` / `opacity` / `blend_mode` / `mask` 为隔离合成（离屏层），跨后端一致。叶子用 `element()` / `element_mut()` / `into_element()` 读取，容器用 `is_group()` / `children()` / `children_mut()` / `visit` / `visit_mut`。
+- `SceneNode`：内容为 `kind: NodeKind`（`Draw(Element)` 叶子 / `Group(Vec<SceneNode>)` 容器），加节点属性 `z_index` / `transform` / `opacity` / `name` / `visible` / `clip` / `blend_mode` / `mask` / `filter` / `color_matrix` / `antialias`（子树递归生效）；`filter` / `opacity` / `blend_mode` / `mask` 为隔离合成（离屏层），跨后端一致。叶子用 `element()` / `element_mut()` / `into_element()` 读取，容器用 `is_group()` / `children()` / `children_mut()` / `visit` / `visit_mut`。
 - `ColorMatrix`：4×5 色彩矩阵（`grayscale` / `saturate` / `hue_rotate` / `brightness` / `contrast` / `tint` 预设 + `then` 组合），经 `with_color_matrix` 挂在节点上。**烘进 paint 颜色**（两个后端同法，逐像素一致）；图片与作用域机械不受影响。
+- `antialias: Option<bool>`（`with_antialias`）：`None` 沿子树继承（默认开启），`false` 给硬边（SVG `shape-rendering="crispEdges"` / vello `aliasing_threshold = 0`）。
+- `CornerRadii`：圆角矩形的统一半径或四角半径；`Element::rounded_rect(rect, 3.0, style)` 仍接受标量。
 - `NodeScope`：节点与 `Layer` 共用的作用域描述；`Renderer::push_scope` / `pop_scope` 为其唯一实现（`render_layer` 与 `render_node` 共用）。
 - `Scene::push(node)`：`Element: From<Element> → SceneNode` 自动转换。
 
@@ -82,7 +84,8 @@ Canvas 风格**便捷构造**层：纯函数返回 `Element`，不引入可变�
 
 ### 3.3 填充 / 描边
 
-- `Fill`：纯色 / 线性渐变 / 径向渐变 / **扫掠（conic）渐变** / 手绘（sketch）。
+- `Fill`：纯色 / 线性渐变 / 径向渐变 / **扫掠（conic）渐变** / **图片填充**（`ImageFill`）/ 手绘（sketch）。
+- 图片：`SceneImage`（`pixmap` + `object_fit` + `quality`）；`ObjectFit`：`Contain` / `Cover` / `Fill` / `None` / **`Tile`**（按原始像素尺寸平铺）；`ImageQuality`：`Nearest` / `Bilinear`（默认）/ `Bicubic`。`ImageFill { image, tile }` 把图片当画刷按网格重复（`ImageFill::natural(pixmap, at)`）。
 - 渐变：`GradientStop`（offset + color）+ `GradientSpread`（`Pad`（默认）/ `Repeat` / `Reflect`）。
   构造用 `LinearGradient::new` / `RadialGradient::new` / `SweepGradient::new`（或 `SweepGradient::full`），
   再用 `with_spread` 改扩展模式。`SweepGradient::sample(angle)` 可直接取某角度的颜色（SVG 端用它生成扇区）。

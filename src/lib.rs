@@ -62,10 +62,10 @@ pub use geometry::{
 };
 pub use pixmap::Pixmap;
 pub use scene::{
-    BlendMode, Clip, ColorMatrix, Element, Fill, FillStrokeStyle, Filter, GradientSpread,
-    GradientStop, Layer, LineCap, LineJoin, LinearGradient, Mask, NodeKind, ObjectFit,
-    RadialGradient, Scene, SceneImage, SceneNode, SketchFill, SketchFillStyle, Stroke,
-    SweepGradient,
+    BlendMode, Clip, ColorMatrix, CornerRadii, Element, Fill, FillStrokeStyle, Filter,
+    GradientSpread, GradientStop, ImageFill, ImageQuality, Layer, LineCap, LineJoin,
+    LinearGradient, Mask, NodeKind, ObjectFit, RadialGradient, Scene, SceneImage, SceneNode,
+    SketchFill, SketchFillStyle, Stroke, SweepGradient,
 };
 pub use sketch::{
     SketchKind, SketchKinds, SketchOptions, roughen_element, roughen_scene, roughen_scene_fit,

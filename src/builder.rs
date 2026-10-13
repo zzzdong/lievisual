@@ -403,6 +403,8 @@ impl Ctx {
             Some(Fill::LinearGradient(g)) => first_stop_color(&g.stops),
             Some(Fill::RadialGradient(g)) => first_stop_color(&g.stops),
             Some(Fill::SweepGradient(g)) => first_stop_color(&g.stops),
+            // 图片填充同样没有单一颜色（仅用于描边/文本的兜底色）。
+            Some(Fill::Image(_)) => None,
             None => None,
         };
         from_gradient.unwrap_or(self.font.color)
@@ -574,12 +576,31 @@ impl Ctx {
         ))
     }
 
-    /// Rounded rectangle (fill + optional stroke). `radius` is the uniform corner radius.
+    /// Rounded rectangle (fill + optional stroke). `radius` is the uniform corner radius; use
+    /// [`Ctx::round_rect_radii`] for one radius per corner.
     #[must_use]
     pub fn round_rect(&self, x: f64, y: f64, w: f64, h: f64, radius: f64) -> SceneNode {
         self.node(Element::RoundedRect {
             rect: Rect::new(x, y, x + w, y + h),
-            radius,
+            radii: radius.into(),
+            style: self.fill_stroke(),
+        })
+    }
+
+    /// Rounded rectangle with one radius per corner (clockwise from the top-left), e.g. a chat
+    /// bubble that is square in one corner.
+    #[must_use]
+    pub fn round_rect_radii(
+        &self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        radii: crate::scene::CornerRadii,
+    ) -> SceneNode {
+        self.node(Element::RoundedRect {
+            rect: Rect::new(x, y, x + w, y + h),
+            radii,
             style: self.fill_stroke(),
         })
     }
@@ -1585,9 +1606,10 @@ mod tests {
             .into_element()
             .expect("leaf")
         {
-            Element::RoundedRect { rect, radius, .. } => {
+            Element::RoundedRect { rect, radii, .. } => {
                 assert_eq!(rect, Rect::new(1.0, 2.0, 4.0, 6.0));
-                assert_eq!(radius, 0.5);
+                assert_eq!(radii.uniform_value(), 0.5);
+                assert!(radii.is_uniform());
             }
             _ => panic!("expected RoundedRect"),
         }

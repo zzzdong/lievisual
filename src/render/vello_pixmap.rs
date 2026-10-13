@@ -42,6 +42,8 @@ pub struct VelloPixmapRenderer {
     transform_stack: Vec<vello_cpu::kurbo::Affine>,
     /// Colour-matrix stack: the top (composed) matrix is baked into every paint colour.
     color_matrices: Vec<ColorMatrix>,
+    /// Anti-aliasing stack: the top value is the active setting (`true` = anti-aliased).
+    antialias_stack: Vec<bool>,
 }
 
 /// Clamp a canvas dimension (in device pixels) into vello_cpu's `1..=u16::MAX` range.
@@ -80,6 +82,7 @@ impl VelloPixmapRenderer {
             background: None,
             transform_stack: Vec::new(),
             color_matrices: Vec::new(),
+            antialias_stack: Vec::new(),
         }
     }
 
@@ -124,6 +127,10 @@ impl VelloPixmapRenderer {
         }
         self.transform_stack.clear();
         self.color_matrices.clear();
+        self.antialias_stack.clear();
+        // Restore the default (area anti-aliased) state explicitly: `ctx.reset()` is not
+        // documented to reset the aliasing threshold, and a previous frame may have left it off.
+        self.ctx.set_aliasing_threshold(None);
 
         // Background: fall back to the scene's background (the Scene is the authoritative IR);
         // skip painting an alpha-0 background so a transparent canvas stays possible.
@@ -447,7 +454,8 @@ impl Renderer for VelloPixmapRenderer {
         let ih = src.height() as f64;
         let (dw, dh, offx, offy) = match image.object_fit {
             crate::ObjectFit::Fill => (fw, fh, 0.0, 0.0),
-            crate::ObjectFit::None => (iw, ih, 0.0, 0.0),
+            // A tile is drawn at its natural pixel size and repeated (see the blit below).
+            crate::ObjectFit::None | crate::ObjectFit::Tile => (iw, ih, 0.0, 0.0),
             fit => {
                 let scale = if fit == crate::ObjectFit::Cover {
                     (fw / iw).max(fh / ih)
@@ -502,7 +510,14 @@ impl Renderer for VelloPixmapRenderer {
         let dest_w = clamp_px(dw / k);
         let dest_h = clamp_px(dh / k);
         // 缩放源位图（RGBA8）到目标尺寸。
-        let rgba = resize_rgba8(src.pixels(), src.width(), src.height(), dest_w, dest_h);
+        let rgba = resize_rgba8(
+            src.pixels(),
+            src.width(),
+            src.height(),
+            dest_w,
+            dest_h,
+            image.quality,
+        );
 
         // 应用整体 opacity：预乘到 alpha 通道（frame 透明底，src-over 合成正确）。
         // 位图以 **预乘 RGBA8 字节** 构造：vello_cpu 0.3 的 `Pixmap::from_parts` 收 `Vec<u8>`
@@ -520,22 +535,27 @@ impl Renderer for VelloPixmapRenderer {
             })
             .collect();
 
-        // 把缩放后的图片 blit 到 frame 位图（考虑 offx/offy，越界部分被 frame 裁剪）。
-        // 位图按 1/k 分辨率栅格化，故偏移量同样除以 k。
+        // blit 到 frame 位图：`Tile` 时源按整幅图回卷（平铺），其余按 offx/offy 平移、越界即被
+        // frame 裁剪。位图按 1/k 分辨率栅格化，故偏移量同样除以 k。
         let ox = (offx / k).floor() as i64;
         let oy = (offy / k).floor() as i64;
-        for row in 0..(dest_h as i64) {
-            let dy = row + oy;
-            if dy < 0 || dy >= frame_h as i64 {
-                continue;
-            }
-            for col in 0..(dest_w as i64) {
-                let dx = col + ox;
-                if dx < 0 || dx >= frame_w as i64 {
-                    continue;
-                }
-                let sidx = (row * dest_w as i64 + col) as usize;
-                let didx = (dy * frame_w as i64 + dx) as usize * 4;
+        let tile = image.object_fit == crate::ObjectFit::Tile;
+        for row in 0..(frame_h as i64) {
+            for col in 0..(frame_w as i64) {
+                let (sx, sy) = if tile {
+                    (
+                        (col - ox).rem_euclid(dest_w as i64),
+                        (row - oy).rem_euclid(dest_h as i64),
+                    )
+                } else {
+                    let (sx, sy) = (col - ox, row - oy);
+                    if sx < 0 || sx >= dest_w as i64 || sy < 0 || sy >= dest_h as i64 {
+                        continue;
+                    }
+                    (sx, sy)
+                };
+                let sidx = (sy * dest_w as i64 + sx) as usize;
+                let didx = (row * frame_w as i64 + col) as usize * 4;
                 dest_pixels[didx..didx + 4].copy_from_slice(&src_pixels[sidx]);
             }
         }
@@ -715,6 +735,20 @@ impl Renderer for VelloPixmapRenderer {
         self.color_matrices.pop();
     }
 
+    fn push_antialias(&mut self, enabled: bool) {
+        self.antialias_stack.push(enabled);
+        // vello: `None` = area (anti-aliased) coverage, `Some(threshold)` = binary coverage.
+        self.ctx
+            .set_aliasing_threshold(if enabled { None } else { Some(0) });
+    }
+
+    fn pop_antialias(&mut self) {
+        self.antialias_stack.pop();
+        let enabled = self.antialias_stack.last().copied().unwrap_or(true);
+        self.ctx
+            .set_aliasing_threshold(if enabled { None } else { Some(0) });
+    }
+
     fn push_clip(&mut self, clip: &crate::scene::Clip) {
         // vello_cpu 的 clip 路径按当前 transform（clip_path_transform）应用；
         // 我们 push_transform 已设置 ctx transform，故 clip 与节点变换一致复合。
@@ -839,6 +873,46 @@ fn apply_fill(
             set_gradient_paint(ctx, scene_transform, kind, &g.stops, g.spread, matrix);
         }
         Fill::Sketch(sf) => ctx.set_paint(vello_color(&matrix.apply(sf.color))),
+        Fill::Image(f) => {
+            if f.image.width() == 0 || f.image.height() == 0 {
+                return;
+            }
+            use vello_cpu::peniko::{Extend, ImageSampler};
+            let (iw, ih) = (f.image.width() as f64, f.image.height() as f64);
+            let brush = vello_cpu::Image {
+                image: vello_cpu::ImageSource::Pixmap(std::sync::Arc::new(pixmap_to_premul(
+                    &f.image,
+                ))),
+                // The tile repeats across the shape.
+                sampler: ImageSampler {
+                    x_extend: Extend::Repeat,
+                    y_extend: Extend::Repeat,
+                    ..Default::default()
+                },
+            };
+            // `tile` is one cell in user space: map user space back to image pixels, then cancel
+            // the scene transform (the same convention as the gradients above).
+            let sx = if f.tile.width().abs() > 1e-12 {
+                f.tile.width() / iw
+            } else {
+                1.0
+            };
+            let sy = if f.tile.height().abs() > 1e-12 {
+                f.tile.height() / ih
+            } else {
+                1.0
+            };
+            let user_to_image =
+                vello_cpu::kurbo::Affine::translate((-f.tile.min_x(), -f.tile.min_y()))
+                    * vello_cpu::kurbo::Affine::scale_non_uniform(1.0 / sx, 1.0 / sy);
+            let to_paint = if scene_transform.determinant().abs() > 1e-12 {
+                user_to_image * scene_transform.inverse()
+            } else {
+                user_to_image
+            };
+            ctx.set_paint_transform(to_paint);
+            ctx.set_paint(brush);
+        }
     }
 }
 
@@ -926,56 +1000,150 @@ fn premul(c: u8, a: u8) -> u8 {
     ((c as u32 * a as u32 + 127) / 255).min(255) as u8
 }
 
-/// 双线性缩放 RGBA8 位图（`src` 尺寸 `sw×sh` → `dw×dh`）。
+/// 直通 RGBA8 → vello 预乘 `Pixmap`（图片填充用；`draw_image` 走自己的缩放/blit 路径）。
+fn pixmap_to_premul(pm: &crate::Pixmap) -> VelloPixmap {
+    let mut bytes = Vec::with_capacity(pm.pixels().len());
+    for p in pm.pixels().as_chunks::<4>().0 {
+        let a = p[3];
+        bytes.extend_from_slice(&[premul(p[0], a), premul(p[1], a), premul(p[2], a), a]);
+    }
+    VelloPixmap::from_parts(
+        bytes,
+        pm.width().min(u32::from(u16::MAX)) as u16,
+        pm.height().min(u32::from(u16::MAX)) as u16,
+        PixelMetadata::default(),
+    )
+}
+
+/// 按 [`ImageQuality`](crate::scene::ImageQuality) 把 RGBA8 从 `sw×sh` 缩放到 `dw×dh`。
 ///
-/// 用双线性插值替代 `image` 的 `resize_exact`（移除解码依赖后自实现，够图表场景用）。
+/// **可分离**滤波：先水平方向到预乘 `f32` 缓冲，再垂直方向回直通 RGBA8。插值在 **预乘**
+/// 空间进行 —— 直通 RGBA 直接插值会让半透明像素与透明像素混合出偏暗的边缘（halo）。
 ///
-/// 插值在 **预乘** 空间进行：直通 RGBA 直接插值会让半透明像素与透明像素混合出偏暗的
-/// 边缘（halo），预乘后再插值、最后还原为直通值是正确做法。
-fn resize_rgba8(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+/// `Nearest` 取最近像素；`Bilinear` 用三角核；`Bicubic` 用 Catmull-Rom（a = -0.5）。缩小时核
+/// 会按比例加宽（`filter_scale`）退化为预滤波 —— 而单纯 2 抽头双线性缩小会产生明显锯齿。
+/// 落在源之外的抽头按边缘像素钳制（edge extend）。
+fn resize_rgba8(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    dw: u32,
+    dh: u32,
+    quality: crate::scene::ImageQuality,
+) -> Vec<u8> {
     if sw == dw && sh == dh {
         return src.to_vec();
     }
-    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
-    let sx = sw as f64 / dw as f64;
-    let sy = sh as f64 / dh as f64;
-    for dy in 0..dh {
-        let fy = (dy as f64 + 0.5) * sy - 0.5;
-        let y0 = fy.floor().max(0.0) as u32;
-        let y1 = (y0 + 1).min(sh - 1);
-        let wy = (fy - fy.floor()).clamp(0.0, 1.0);
-        for dx in 0..dw {
-            let fx = (dx as f64 + 0.5) * sx - 0.5;
-            let x0 = fx.floor().max(0.0) as u32;
-            let x1 = (x0 + 1).min(sw - 1);
-            let wx = (fx - fx.floor()).clamp(0.0, 1.0);
-            // 四个采样像素（RGBA8，u32 直接读取）。
-            let p00 = &src[((y0 * sw + x0) as usize) * 4..];
-            let p01 = &src[((y0 * sw + x1) as usize) * 4..];
-            let p10 = &src[((y1 * sw + x0) as usize) * 4..];
-            let p11 = &src[((y1 * sw + x1) as usize) * 4..];
-            let out_idx = ((dy * dw + dx) as usize) * 4;
-            // 采样点先按各自 alpha 预乘，再对 RGB 插值。
-            let premul = |px: &[u8]| -> [f64; 3] {
-                let a = px[3] as f64 / 255.0;
-                [px[0] as f64 * a, px[1] as f64 * a, px[2] as f64 * a]
-            };
-            let (q00, q01, q10, q11) = (premul(p00), premul(p01), premul(p10), premul(p11));
-            // alpha 通道单独做直通插值。
-            let a_top = p00[3] as f64 * (1.0 - wx) + p01[3] as f64 * wx;
-            let a_bot = p10[3] as f64 * (1.0 - wx) + p11[3] as f64 * wx;
-            let a = (a_top * (1.0 - wy) + a_bot * wy).round().clamp(0.0, 255.0) as u8;
-            out[out_idx + 3] = a;
-            for c in 0..3 {
-                let top = q00[c] * (1.0 - wx) + q01[c] * wx;
-                let bot = q10[c] * (1.0 - wx) + q11[c] * wx;
-                let v = (top * (1.0 - wy) + bot * wy).round().clamp(0.0, 255.0) as u8;
-                // 由预乘值还原为直通值。
-                out[out_idx + c] = unpremultiply(v, a);
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return vec![0u8; (dw as usize) * (dh as usize) * 4];
+    }
+    let xs = axis_weights(quality, sw, dw);
+    let ys = axis_weights(quality, sh, dh);
+
+    // 水平：src → 预乘 f32（dw × sh）。
+    let mut tmp = vec![0.0f32; (dw as usize) * (sh as usize) * 4];
+    for y in 0..sh {
+        let row = (y * sw) as usize * 4;
+        for (dx, (first, w)) in xs.iter().enumerate() {
+            let mut acc = [0.0f32; 4];
+            for (i, wi) in w.iter().enumerate() {
+                let sx = (*first + i as i64).clamp(0, i64::from(sw) - 1) as usize;
+                let p = &src[row + sx * 4..row + sx * 4 + 4];
+                let a = f32::from(p[3]) / 255.0;
+                let wf = *wi as f32;
+                acc[0] += wf * f32::from(p[0]) * a;
+                acc[1] += wf * f32::from(p[1]) * a;
+                acc[2] += wf * f32::from(p[2]) * a;
+                acc[3] += wf * f32::from(p[3]);
             }
+            let o = (y as usize * dw as usize + dx) * 4;
+            tmp[o..o + 4].copy_from_slice(&acc);
+        }
+    }
+
+    // 垂直：预乘 f32 → 直通 RGBA8。
+    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
+    for (dy, (first, w)) in ys.iter().enumerate() {
+        for x in 0..dw as usize {
+            let mut acc = [0.0f32; 4];
+            for (i, wi) in w.iter().enumerate() {
+                let sy = (*first + i as i64).clamp(0, i64::from(sh) - 1) as usize;
+                let o = (sy * dw as usize + x) * 4;
+                let wf = *wi as f32;
+                for c in 0..4 {
+                    acc[c] += wf * tmp[o + c];
+                }
+            }
+            let a = acc[3].round().clamp(0.0, 255.0) as u8;
+            let o = (dy * dw as usize + x) * 4;
+            for c in 0..3 {
+                out[o + c] = unpremultiply(acc[c].round().clamp(0.0, 255.0) as u8, a);
+            }
+            out[o + 3] = a;
         }
     }
     out
+}
+
+/// One axis of a separable resample: for each output index, the source index its taps start at
+/// plus the (normalized) weights.
+fn axis_weights(
+    quality: crate::scene::ImageQuality,
+    src_len: u32,
+    dst_len: u32,
+) -> Vec<(i64, Vec<f64>)> {
+    use crate::scene::ImageQuality;
+    let scale = f64::from(src_len) / f64::from(dst_len);
+    (0..dst_len)
+        .map(|d| {
+            let center = (f64::from(d) + 0.5) * scale - 0.5;
+            // Nearest ignores the scale: take the pixel the centre falls in (same as SVG's
+            // `image-rendering="pixelated"`), so it stays blocky even when shrinking.
+            if quality == ImageQuality::Nearest {
+                return (center.round() as i64, vec![1.0]);
+            }
+            // Widening the kernel while minifying turns it into a prefilter.
+            let filter_scale = scale.max(1.0);
+            let support = if quality == ImageQuality::Bilinear {
+                1.0
+            } else {
+                2.0
+            };
+            let radius = support * filter_scale;
+            let first = (center - radius).ceil() as i64;
+            let last = (center + radius).floor() as i64;
+            let mut w: Vec<f64> = (first..=last)
+                .map(|i| resample_kernel(quality, (i as f64 - center) / filter_scale))
+                .collect();
+            let sum: f64 = w.iter().sum();
+            if sum != 0.0 {
+                for v in &mut w {
+                    *v /= sum;
+                }
+            }
+            (first, w)
+        })
+        .collect()
+}
+
+/// The 1D reconstruction kernel: box (nearest), triangle (bilinear), Catmull-Rom (bicubic).
+fn resample_kernel(quality: crate::scene::ImageQuality, t: f64) -> f64 {
+    use crate::scene::ImageQuality;
+    let x = t.abs();
+    match quality {
+        ImageQuality::Nearest => f64::from(x <= 0.5),
+        ImageQuality::Bilinear => (1.0 - x).max(0.0),
+        // Catmull-Rom with a = -0.5 — the "bicubic" image scalers use.
+        ImageQuality::Bicubic => {
+            if x < 1.0 {
+                1.5 * x * x * x - 2.5 * x * x + 1.0
+            } else if x < 2.0 {
+                -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0
+            } else {
+                0.0
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1407,6 +1575,174 @@ mod tests {
         let pad = rp.render_scene_to_pixmap(&make(GradientSpread::Pad));
         let (c, d) = (pixel_at(&pad, 5, 10), pixel_at(&pad, 25, 10));
         assert!(c.0 < 200 && d.0 > 240, "Pad 应夹到端色: {c:?} vs {d:?}");
+    }
+
+    /// 每角圆角：只给左上角圆角时，(1,1) 被切掉（露出背景），右上角仍是直角。
+    #[test]
+    fn per_corner_radii_round_only_the_given_corner() {
+        let radii = crate::scene::CornerRadii::new(20.0, 0.0, 0.0, 0.0);
+        let mut scene = Scene::new(40.0, 40.0);
+        scene.push(Element::rounded_rect(
+            Rect::new(0.0, 0.0, 40.0, 40.0),
+            radii,
+            FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+        ));
+        let mut r = VelloPixmapRenderer::new(40, 40).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let (tl, tg, _, _) = pixel_at(&pix, 1, 1);
+        let (tr, tg2, _, _) = pixel_at(&pix, 38, 1);
+        assert!(tl > 240 && tg > 240, "左上应被圆角切掉: ({tl},{tg})");
+        assert!(tr > 200 && tg2 < 60, "右上应是直角红: ({tr},{tg2})");
+    }
+
+    /// 4×4 测试图：四个 2×2 象限（左上红 / 右上绿 / 左下蓝 / 右下白）。
+    fn quad_pixmap() -> crate::Pixmap {
+        let mut px = Vec::with_capacity(4 * 4 * 4);
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let (r, g, b) = match (x < 2, y < 2) {
+                    (true, true) => (255u8, 0u8, 0u8),
+                    (false, true) => (0, 255, 0),
+                    (true, false) => (0, 0, 255),
+                    (false, false) => (255, 255, 255),
+                };
+                px.extend_from_slice(&[r, g, b, 255]);
+            }
+        }
+        crate::Pixmap::from_rgba8(4, 4, px).unwrap()
+    }
+
+    fn image_scene(image: crate::SceneImage, frame: Rect) -> Scene {
+        let mut s = Scene::new(frame.width(), frame.height());
+        s.push(Element::image(image, frame));
+        s
+    }
+
+    /// 采样质量：最近邻保持原值（块状），双线性混合出中间值，且三者互不相同。
+    #[test]
+    fn image_quality_selects_the_resampling_filter() {
+        use crate::scene::ImageQuality;
+        let render = |q: ImageQuality| {
+            let img = crate::SceneImage::from_pixmap(quad_pixmap())
+                .with_object_fit(crate::ObjectFit::Fill)
+                .with_quality(q);
+            let mut r = VelloPixmapRenderer::new(8, 8);
+            pixels(&r.render_scene_to_pixmap(&image_scene(img, Rect::new(0.0, 0.0, 8.0, 8.0))))
+        };
+        let near = render(ImageQuality::Nearest);
+        let bil = render(ImageQuality::Bilinear);
+        let bic = render(ImageQuality::Bicubic);
+
+        // 4×4 → 8×8（×2）：最近邻是 2×2 的纯色块。
+        let at = |buf: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let i = (y * 8 + x) * 4;
+            [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+        };
+        assert_eq!(at(&near, 1, 1), [255, 0, 0, 255], "左上象限纯红");
+        assert_eq!(at(&near, 5, 1), [0, 255, 0, 255], "右上象限纯绿");
+        // 双线性在象限交界（x=4）处混色，双三次更"锐"（更贴近主色）。
+        assert!(
+            at(&bil, 4, 1)[0] > 20 && at(&bil, 4, 1)[1] > 20,
+            "双线性应混色"
+        );
+        assert!(
+            at(&bic, 4, 1)[1] > at(&bil, 4, 1)[1],
+            "双三次更锐: bic={:?} bil={:?}",
+            at(&bic, 4, 1),
+            at(&bil, 4, 1)
+        );
+        assert_ne!(near, bil);
+        assert_ne!(bil, bic);
+    }
+
+    /// 缩小：最近邻保留块状原值，双线性/双三次用加宽的核预滤波（得到中间灰）。
+    #[test]
+    fn minification_prefilters_with_bilinear_and_bicubic() {
+        use crate::scene::ImageQuality;
+        // 8×8 棋盘格 → 1×1。
+        let px: Vec<u8> = (0..64u32)
+            .flat_map(|i| {
+                let v = if (i % 8 + i / 8) % 2 == 0 { 0u8 } else { 255 };
+                [v, v, v, 255]
+            })
+            .collect();
+        let img = crate::Pixmap::from_rgba8(8, 8, px).unwrap();
+        let render = |q: ImageQuality| {
+            let scene_img = crate::SceneImage::from_pixmap(img.clone())
+                .with_object_fit(crate::ObjectFit::Fill)
+                .with_quality(q);
+            let mut r = VelloPixmapRenderer::new(1, 1);
+            pixel_at(
+                &r.render_scene_to_pixmap(&image_scene(scene_img, Rect::new(0.0, 0.0, 1.0, 1.0))),
+                0,
+                0,
+            )
+            .0
+        };
+        let near = render(ImageQuality::Nearest);
+        assert!(near == 0 || near == 255, "最近邻应保留原值: {near}");
+        let bil = render(ImageQuality::Bilinear);
+        assert!((100..=155).contains(&bil), "双线性应预滤波成中灰: {bil}");
+        let bic = render(ImageQuality::Bicubic);
+        assert!((90..=165).contains(&bic), "双三次应预滤波成中灰: {bic}");
+    }
+
+    /// `ObjectFit::Tile`：按原始像素尺寸在 frame 内重复（4×4 的图 → 每 4px 一轮）。
+    #[test]
+    fn tile_object_fit_repeats_the_image() {
+        let img =
+            crate::SceneImage::from_pixmap(quad_pixmap()).with_object_fit(crate::ObjectFit::Tile);
+        let mut r = VelloPixmapRenderer::new(8, 8);
+        let pix = r.render_scene_to_pixmap(&image_scene(img, Rect::new(0.0, 0.0, 8.0, 8.0)));
+        assert_eq!(pixel_at(&pix, 0, 0), (255, 0, 0, 255));
+        assert_eq!(pixel_at(&pix, 3, 3), (255, 255, 255, 255));
+        // 第二轮的同一相位颜色相同。
+        assert_eq!(pixel_at(&pix, 4, 4), (255, 0, 0, 255));
+        assert_eq!(pixel_at(&pix, 7, 7), (255, 255, 255, 255));
+    }
+
+    /// `Fill::Image`：用图片做填充，按 tile 网格在形状内重复。
+    #[test]
+    fn image_fill_tiles_inside_the_shape() {
+        let mut scene = Scene::new(8.0, 8.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 8.0, 8.0),
+            FillStrokeStyle::fill_gradient(crate::scene::ImageFill::natural(
+                quad_pixmap(),
+                Point::new(0.0, 0.0),
+            )),
+        ));
+        let mut r = VelloPixmapRenderer::new(8, 8);
+        let pix = r.render_scene_to_pixmap(&scene);
+        assert_eq!(pixel_at(&pix, 0, 0), (255, 0, 0, 255));
+        assert_eq!(pixel_at(&pix, 3, 3), (255, 255, 255, 255));
+        assert_eq!(pixel_at(&pix, 4, 4), (255, 0, 0, 255), "第二块应重复");
+    }
+
+    /// 抗锯齿开关：关闭后边缘像素变为二值（不再有半覆盖的灰），开启时是灰。
+    #[test]
+    fn antialias_off_gives_binary_edges() {
+        let scene_with = |aa: bool| {
+            let mut s = Scene::new(20.0, 20.0);
+            // 右边缘落在 10.5 → 像素 x=10 被覆盖 50%。
+            s.push(
+                SceneNode::new(Element::rect(
+                    Rect::new(0.0, 0.0, 10.5, 10.0),
+                    FillStrokeStyle::fill(Color::BLACK),
+                ))
+                .with_antialias(aa),
+            );
+            s
+        };
+        let mut ra = VelloPixmapRenderer::new(20, 20).with_background(Color::WHITE);
+        let aa = pixel_at(&ra.render_scene_to_pixmap(&scene_with(true)), 10, 5);
+        let mut rn = VelloPixmapRenderer::new(20, 20).with_background(Color::WHITE);
+        let crisp = pixel_at(&rn.render_scene_to_pixmap(&scene_with(false)), 10, 5);
+        assert!(aa.0 > 0 && aa.0 < 255, "开启时应有半覆盖的灰: {aa:?}");
+        assert!(
+            crisp.0 <= 20,
+            "关闭后覆盖率 > 0 即应填满（纯黑）: {crisp:?}"
+        );
     }
 
     /// 色彩矩阵（方案 B：烘进 paint）：灰度把红填充变成等亮度灰（0.213 × 255 ≈ 54）。

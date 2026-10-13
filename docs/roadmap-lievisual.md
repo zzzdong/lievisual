@@ -116,6 +116,29 @@
 - **抗锯齿开关**（per-node）：vello 有 `set_aliasing_threshold`。
 - **色彩空间 / gamma**：目前 sRGB 空间混合（Skia 默认线性空间混合）；宽色域无。
 
+> **状态（2026-10-13）**：
+> - **每角圆角已实现** —— `CornerRadii`（`uniform` / `new` 四角 / `From<f64>`），
+>   `Element::RoundedRect { radii }`、`Ctx::round_rect_radii`、`Renderer::draw_rounded_rect_radii`。
+>   统一半径仍走 SVG 原生 `<rect rx>`（**输出与旧版逐字节一致**），每角半径退化为路径；
+>   sketch 的圆角取点也按四角半径走 kurbo。**破坏性**：`RoundedRect` 的 `radius: f64` → `radii: CornerRadii`
+>   （`Element::rounded_rect(rect, 3.0, style)` 仍可用）。
+> - **抗锯齿开关已实现** —— `SceneNode.antialias: Option<bool>`（`with_antialias`），
+>   `None` 表示**沿子树继承**（根默认开启），经 `Renderer::push_antialias` / `pop_antialias` 落地：
+>   SVG 给形状加 `shape-rendering="crispEdges"`，vello 把 `set_aliasing_threshold` 设为 `Some(0)`
+>   （每帧复位）。文本不受影响（SVG 另有 `text-rendering`）。
+> - **图片进阶已实现（2026-10-13）** ——
+>   `ImageQuality::{Nearest, Bilinear, Bicubic}`（`SceneImage.quality` + `with_quality`）：栅格侧
+>   自实现**可分离**滤波（缩小时核按比例加宽退化为预滤波，避免纯双线性缩小的锯齿；最近邻恒取最近
+>   像素），SVG 侧只能给浏览器提示 `image-rendering`（`pixelated` / 省略 / `high-quality`）。
+>   `ObjectFit::Tile`（按**原始像素尺寸**在 frame 内平铺）：vello 在 blit 时按整幅图回卷，SVG 输出
+>   `<pattern>` + 覆盖 frame 的 `<rect>`。`Fill::Image(ImageFill)`（**图片作为填充 shader**）：按
+>   `tile` 网格在形状内重复 —— vello 用 `Extend::Repeat` 图片画刷 + paint transform，SVG 用
+>   `<pattern>`。图片（无论 `Element::Image` 还是 `Fill::Image`）都**不受 `ColorMatrix` 影响**。
+> - **仍未做**：路径运算族（bool ops / path measure / offset-inset / stroke-to-path）、描边对齐、
+>   文本进阶（多行裁剪+省略号 / 沿路径 / 竖排 CJK / decoration 细节）、色彩空间。其中**路径运算族
+>   需要一个几何依赖**（如 `i_overlay` 之类）才能做 bool ops，而 stroke-to-path 又依赖 bool ops
+>   —— 这是唯一需要先拍板的决定，其余可按需增量。
+
 ### P3 — 工程化 / 生态
 
 - `Scene` 的 **serde 序列化**（缓存 / 传输 / 快照测试）。
@@ -222,3 +245,4 @@
 3. **P1 低成本项**：Mask ✅、Sweep 渐变 ✅、渐变 spread ✅、ColorFilter ✅。
 4. **P1 中成本项**：drop-shadow / blur 滤镜 ✅。（**至此 §2 的 P1 全部落地。**）
 5. **P2 / P3** 按下游实际需求驱动，避免为"对齐 Skia"而过度设计。
+   （P2 已完成：**每角圆角** ✅、**抗锯齿开关** ✅ —— 见 §2 P2 的状态说明；剩余项的阻塞点也已列在那里。）

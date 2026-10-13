@@ -81,8 +81,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   machinery is not content (the scene background, a mask's paint and a `Filter`'s own drop-shadow
   colour are not colour-filtered).
 
+- **Per-corner rounded rectangles** — `CornerRadii` (`uniform(radius)` / `new(tl, tr, br, bl)` /
+  `From<f64>`), carried by `Element::RoundedRect { radii }` and produced by
+  `Element::rounded_rect(rect, radius, style)` (a plain `f64` still works) and
+  `builder::Ctx::round_rect_radii`. `Renderer::draw_rounded_rect_radii` is the new entry point; a
+  **uniform** radius keeps going through SVG's native `<rect rx="…">` (so existing output is
+  byte-identical) while a per-corner shape degrades to a path. The sketch pass honours all four
+  radii (kurbo clamps each to half the shorter side).
+- **Per-node anti-aliasing** — `SceneNode::antialias: Option<bool>` + `with_antialias`, resolved
+  down the tree (`None` inherits; the root is anti-aliased) through
+  `Renderer::push_antialias` / `pop_antialias`. `Some(false)` gives crisp, hard edges: SVG emits
+  `shape-rendering="crispEdges"` on each shape, vello sets its aliasing threshold to `Some(0)`
+  (and the threshold is reset at the start of every frame, since `ctx.reset()` does not document
+  restoring it). Text is unaffected (SVG has a separate `text-rendering`).
+- **Image resampling quality** — `ImageQuality::{Nearest, Bilinear, Bicubic}` on
+  `SceneImage.quality` (+ `with_quality`). The raster backend now implements a **separable**
+  resampler: `Nearest` samples the closest pixel (blocky — exact for pixel art), `Bilinear` uses a
+  triangle kernel, `Bicubic` Catmull-Rom (a = -0.5). When *minifying*, the kernel is widened in
+  proportion to the scale so it acts as a prefilter — the previous fixed 2-tap bilinear downscale
+  aliased badly. Interpolation stays in premultiplied space (no dark halos). SVG can only hint the
+  browser: `image-rendering="pixelated"` / omitted (default) / `"high-quality"`.
+- **`ObjectFit::Tile`** — repeat an image at its **original pixel size** across the frame (clipped
+  to it): the raster backend wraps while blitting, SVG emits a `<pattern>` plus a rect covering the
+  frame.
+- **`Fill::Image(ImageFill)`** — an image used as a **paint** (pattern fill): `ImageFill { image,
+  tile }` repeats the bitmap on a `tile`-sized (user space) grid, with
+  `ImageFill::natural(pixmap, at)` for the natural-size case. Both backends express it natively and
+  identically (SVG `<pattern>`; peniko image brush in `Repeat` mode with a paint transform). Like
+  `Element::Image`, an image fill is **exempt from `ColorMatrix`**.
+
 ### Changed
 
+- **BREAKING:** `SceneImage` gained a `quality` field and `Fill` gained an `Image` variant, so
+  struct literals / exhaustive `Fill` matches need updating (`SceneImage::from_pixmap` /
+  `from_rgba8` / `from_png` and node constructors are unaffected). No downstream change was needed.
+- **BREAKING:** `Element::RoundedRect`'s `radius: f64` became `radii: CornerRadii`, and
+  `SceneNode` gained an `antialias` field — struct literals / patterns need updating
+  (`Element::rounded_rect(rect, 3.0, style)` and the node constructors are unaffected).
+  Downstream adaptations: `liecharts` 2 sites, `liemermaid` / `liepress` none.
 - **BREAKING:** `LinearGradient` / `RadialGradient` gained a `spread` field, so struct literals no
   longer compile — construct with `LinearGradient::new(...)` / `RadialGradient::new(...)` (then
   `.with_spread(...)`). `Fill` gained a `SweepGradient` variant, so exhaustive matches need a new

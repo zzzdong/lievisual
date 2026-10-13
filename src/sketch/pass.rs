@@ -266,8 +266,8 @@ fn outline_path(el: &Element, rng: &mut Rng, opts: &SketchOptions) -> Option<Bez
         Element::Rect { rect, .. } => {
             rough::polyline(rng, &mut p, &rough::rect_points(*rect), true, opts)
         }
-        Element::RoundedRect { rect, radius, .. } => {
-            let pts = rough::rounded_rect_points(*rect, *radius, opts.curve_step);
+        Element::RoundedRect { rect, radii, .. } => {
+            let pts = rough::rounded_rect_points(*rect, *radii, opts.curve_step);
             rough::polyline(rng, &mut p, &pts, true, opts);
         }
         Element::Circle { center, radius, .. } => rough::ellipse(
@@ -378,7 +378,8 @@ fn fill_color(el: &Element) -> Option<Color> {
             Fill::LinearGradient(g) => last_stop(&g.stops),
             Fill::RadialGradient(g) => last_stop(&g.stops),
             Fill::SweepGradient(g) => last_stop(&g.stops),
-            Fill::Sketch(_) => None,
+            // 图片填充没有"单一颜色"可降级；保持原样（描边仍会被手绘化）。
+            Fill::Image(_) | Fill::Sketch(_) => None,
         },
     }
 }

@@ -21,6 +21,7 @@ use kurbo::{ParamCurve, ParamCurveArclen, Shape};
 use super::SketchOptions;
 use super::rng::Rng;
 use crate::geometry::{BezPath, Point, Rect, RoundedRect, Vec2};
+use crate::scene::CornerRadii;
 
 /// rough.js' `maxRandomnessOffset`: the base amplitude (in scene units) that `roughness` scales.
 const MAX_OFFSET: f64 = 2.0;
@@ -248,7 +249,7 @@ pub(crate) fn rect_points(rect: Rect) -> [Point; 4] {
 
 /// Rounded-rectangle outline as a point list (sampled from kurbo's path, so the corner radius is
 /// honoured).
-pub(crate) fn rounded_rect_points(rect: Rect, radius: f64, step: f64) -> Vec<Point> {
+pub(crate) fn rounded_rect_points(rect: Rect, radii: CornerRadii, step: f64) -> Vec<Point> {
     let (x0, y0) = (
         rect.min_x().min(rect.max_x()),
         rect.min_y().min(rect.max_y()),
@@ -257,8 +258,8 @@ pub(crate) fn rounded_rect_points(rect: Rect, radius: f64, step: f64) -> Vec<Poi
         rect.max_x().max(rect.min_x()),
         rect.max_y().max(rect.min_y()),
     );
-    let r = radius.abs().min((x1 - x0).min(y1 - y0) / 2.0).max(0.0);
-    let shape = RoundedRect::new(x0, y0, x1, y1, r);
+    // kurbo clamps each radius to half the shorter side, so an oversized value degrades safely.
+    let shape = RoundedRect::from_rect(Rect::new(x0, y0, x1, y1), radii.to_kurbo());
     flatten_points(&shape.to_path(0.1), step)
         .into_iter()
         .next()
@@ -431,7 +432,7 @@ mod tests {
 
     #[test]
     fn rounded_rect_sampling_follows_the_corner_radius() {
-        let pts = rounded_rect_points(Rect::new(0.0, 0.0, 100.0, 50.0), 12.0, 12.0);
+        let pts = rounded_rect_points(Rect::new(0.0, 0.0, 100.0, 50.0), 12.0.into(), 12.0);
         assert!(pts.len() >= 8, "圆角应有足够的采样点, got {}", pts.len());
         let bbox = Rect::from_points(pts[0], pts[0]);
         let bbox = pts.iter().fold(bbox, |b, p| b.union_pt(*p));
