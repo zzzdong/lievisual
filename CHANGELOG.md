@@ -5,7 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — 2026-10-13
+
+Breaking release aligned with `vello_cpu` 0.3 / `parley` 0.12: scene-tree containers, the full
+compositing stack (`BlendMode` incl. Porter-Duff / `Mask` / `Filter` / `ColorMatrix`), sweep
+(conic) gradients, image fills, per-corner rounding and path operations. Downstream can now depend
+on lievisual alone for rasterization and text layout — no direct `vello_cpu` / `parley` dependency.
 
 ### Added
 
@@ -166,23 +171,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SceneNode::z_index` is documented as **sibling-local ordering only** — it never reorders across a
   container boundary, and the default `Scene::nodes` list always draws below the named `Layer`s
   regardless of value. Regression test: `z_index_does_not_cross_root_lists`.
-
-### Fixed
-
-- **Node / layer opacity is now isolated compositing.** The vello backend previously multiplied the
-  opacity into each primitive's color alpha, so a `Group`/`Layer` with **overlapping** sub-shapes
-  composited differently from the SVG backend's `<g opacity="…">` (overlaps came out darker). Opacity
-  is now applied as a `vello_cpu` layer (`RenderContext::push_layer`), i.e. to the *composited
-  result* of the scope — matching SVG and fixing the cross-backend inconsistency (roadmap P0-1).
-  Regression test: `render::vello_pixmap::tests::group_opacity_is_isolated`.
-
-## [0.3.0] — 2026-10-13
-
-Breaking release aligned with `vello_cpu` 0.3 / `parley` 0.12. Downstream can now depend on
-lievisual alone for rasterization and text layout — no direct `vello_cpu` / `parley` dependency.
-
-### Changed
-
 - **`VelloPixmapRenderer::render_scene_to_pixmap` now returns [`crate::Pixmap`]** (lievisual's own
   non-premultiplied RGBA8 bitmap) instead of `vello_cpu::Pixmap`. This removes the last public API
   that leaked a `vello_cpu` type, so downstream no longer needs `vello_cpu` in its dependency tree.
@@ -202,6 +190,30 @@ lievisual alone for rasterization and text layout — no direct `vello_cpu` / `p
   box is now derived from font-level metrics (`TextLine::logical_bounds` / `cap_bounds`). This is a
   **breaking** change for downstream code that imported `GlyphOutline` (e.g. for PDF/DOCX vector
   glyphs).
+
+### Fixed
+
+- **Node / layer opacity is now isolated compositing.** The vello backend previously multiplied the
+  opacity into each primitive's color alpha, so a `Group`/`Layer` with **overlapping** sub-shapes
+  composited differently from the SVG backend's `<g opacity="…">` (overlaps came out darker). Opacity
+  is now applied as a `vello_cpu` layer (`RenderContext::push_layer`), i.e. to the *composited
+  result* of the scope — matching SVG and fixing the cross-backend inconsistency (roadmap P0-1).
+  Regression test: `render::vello_pixmap::tests::group_opacity_is_isolated`.
+- **SVG masks were luminance masks.** The emitted `<mask>` now carries `mask-type="alpha"`: SVG
+  defaults to *luminance*, so an opaque black mask hid everything on SVG while showing fully on the
+  raster backend (alpha = 255) — contradicting the `scene::Mask` contract (the paint's *alpha* is
+  the mask value).
+- **Partial sweep gradients had a seam mismatch between backends.** The SVG wedge approximation
+  sampled wedge colours by the unwrapped angle, painting the whole `[end_angle, start_angle)` gap
+  with the end colour; the raster backend evaluates per pixel at the angle mod 2π, so the band just
+  below `start_angle` takes the **start** colour (`Pad`) / mirrored colours (`Reflect`). Wedges are
+  now sampled at the wrapped angle too — agreement for every spread, not just full turns starting
+  at 0. Regression tests: `sweep_partial_wrapped_wedges_take_start_color` (SVG) /
+  `sweep_partial_pad_clamps_wrapped_region_to_start_color` (raster).
+- **Gradient stops interpolated in premultiplied alpha on the raster backend.** SVG `<stop>`
+  interpolates straight (non-premultiplied), so semi-transparent stops showed a slight colour
+  difference between backends; the raster side now uses
+  `peniko::InterpolationAlphaSpace::Unpremultiplied`, matching SVG and `scene::sample_stops`.
 
 ## [0.2.0-beta.2] — 2026-08-31
 
@@ -349,7 +361,8 @@ primitive and reads worse — so a wholesale rewrite is *not* recommended. Inste
 3. **Keep the existing helper layers** — they are not wrong, and the paradigm mismatch makes
    mechanical migration a net loss.
 
-[Unreleased]: https://github.com/zzzdong/lievisual/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/zzzdong/lievisual/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/zzzdong/lievisual/compare/v0.2.0...v0.3.0
 [0.2.0-beta.2]: https://github.com/zzzdong/lievisual/compare/v0.2.0-beta.1...v0.2.0-beta.2
 [0.2.0-beta.1]: https://github.com/zzzdong/lievisual/compare/v0.1.4...v0.2.0-beta.1
 [0.2.0]: https://github.com/zzzdong/lievisual/compare/v0.1.4...v0.2.0
