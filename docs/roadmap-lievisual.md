@@ -134,10 +134,17 @@
 >   `<pattern>` + 覆盖 frame 的 `<rect>`。`Fill::Image(ImageFill)`（**图片作为填充 shader**）：按
 >   `tile` 网格在形状内重复 —— vello 用 `Extend::Repeat` 图片画刷 + paint transform，SVG 用
 >   `<pattern>`。图片（无论 `Element::Image` 还是 `Fill::Image`）都**不受 `ColorMatrix` 影响**。
-> - **仍未做**：路径运算族（bool ops / path measure / offset-inset / stroke-to-path）、描边对齐、
->   文本进阶（多行裁剪+省略号 / 沿路径 / 竖排 CJK / decoration 细节）、色彩空间。其中**路径运算族
->   需要一个几何依赖**（如 `i_overlay` 之类）才能做 bool ops，而 stroke-to-path 又依赖 bool ops
->   —— 这是唯一需要先拍板的决定，其余可按需增量。
+> - **路径运算族已实现（2026-10-13）** —— 新增 `path` 模块 / `PathOps`：布尔运算（`boolean` +
+>   `BoolOp`，便捷 `union` / `intersect` / `difference` / `xor`）、`normalize`（自并规范化）、
+>   **stroke-to-path**（`outline`，保留曲线）、弧长测量（`path_length` / `point_at_length` →
+>   `PathSample`（点 + 单位切向）/ `trim`）、**膨胀 / 收缩**（`offset` / `inset`，Minkowski 圆盘，
+>   圆角化）。**拍板结果**：引入 **`i_overlay`**（纯 Rust、无 unsafe、默认不开线程）承担 bool ops
+>   —— kurbo 0.13 已移除 `BooleanOps`。代价：布尔结果**多边形化**（按 `tolerance` 展平，默认
+>   `0.1`）；填充按**非零**规则，与两个后端默认一致。**构建期、IR 中立**（`BezPath` → `BezPath`），
+>   两后端天然一致；便捷入口 `Ctx::boolean_path` / `Ctx::outline_path`；`Stroke::to_kurbo()` 统一
+>   了"描边长什么样"的定义。
+> - **仍未做**：**描边对齐**（inside / outside —— 注：`inset` + `outline` 已能表达"内描边"的
+>   近似）、文本进阶（多行裁剪+省略号 / 沿路径 / 竖排 CJK / decoration 细节）、色彩空间 / gamma。
 
 ### P3 — 工程化 / 生态
 
@@ -245,4 +252,5 @@
 3. **P1 低成本项**：Mask ✅、Sweep 渐变 ✅、渐变 spread ✅、ColorFilter ✅。
 4. **P1 中成本项**：drop-shadow / blur 滤镜 ✅。（**至此 §2 的 P1 全部落地。**）
 5. **P2 / P3** 按下游实际需求驱动，避免为"对齐 Skia"而过度设计。
-   （P2 已完成：**每角圆角** ✅、**抗锯齿开关** ✅ —— 见 §2 P2 的状态说明；剩余项的阻塞点也已列在那里。）
+   （P2 已完成：**每角圆角** ✅、**抗锯齿开关** ✅、**图片进阶** ✅、**路径运算族** ✅ —— 见 §2 P2 的
+   状态说明；剩余项（描边对齐 / 文本进阶 / 色彩空间）的阻塞点也已列在那里。）

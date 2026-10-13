@@ -1749,6 +1749,36 @@ impl Stroke {
             ..Default::default()
         }
     }
+
+    /// The kurbo stroke style (caps / join / miter limit / dashes; `color` has no equivalent and
+    /// is dropped).
+    ///
+    /// Shared by the raster backend and by the stroke-to-path conversion
+    /// ([`crate::path::PathOps::outline`]), so "what the stroked shape looks like" has exactly one
+    /// definition.
+    #[must_use]
+    pub fn to_kurbo(&self) -> kurbo::Stroke {
+        let cap = match self.line_cap {
+            LineCap::Butt => kurbo::Cap::Butt,
+            LineCap::Round => kurbo::Cap::Round,
+            LineCap::Square => kurbo::Cap::Square,
+        };
+        let join = match self.line_join {
+            LineJoin::Miter => kurbo::Join::Miter,
+            LineJoin::Round => kurbo::Join::Round,
+            LineJoin::Bevel => kurbo::Join::Bevel,
+        };
+        let mut k = kurbo::Stroke::new(self.width)
+            .with_join(join)
+            .with_caps(cap)
+            .with_miter_limit(self.miter_limit);
+        // An empty dash array means "solid" — leave kurbo's own default (no dashes) in place.
+        if !self.dash_array.is_empty() {
+            k.dash_pattern = self.dash_array.iter().copied().collect();
+            k.dash_offset = self.dash_offset;
+        }
+        k
+    }
 }
 
 /// Layer blend mode when compositing a scope onto its backdrop.

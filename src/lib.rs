@@ -17,6 +17,11 @@
 //!   groups — covering common chart / flowchart / Markdown needs.
 //! - **Varied fills**: solid color, linear gradient, radial gradient ([`scene::Fill`]); strokes
 //!   support line caps / joins, dashes (`dash_array` / `dash_offset`), and `miter_limit`.
+//! - **Path operations** ([`path`]): boolean combinations (`union` / `intersect` / `difference` /
+//!   `xor`), stroke-to-path (`outline`), arc-length measurement (`path_length` /
+//!   `point_at_length` / `trim`) and offset / inset — all **build-time** on
+//!   [`geometry::BezPath`], so results render identically on every backend. Boolean ops flatten
+//!   curves (via `i_overlay`), so their output is polygonal.
 //! - **Hand-drawn style (opt-in)**: [`sketch`] is a post-pass that turns selected elements into
 //!   rough, pen-drawn outlines plus [`scene::Fill::Sketch`] fills. It never runs on its own: call
 //!   [`sketch::roughen_scene`] (or the selective [`sketch::roughen_scene_if`]) to enable it, and
@@ -40,6 +45,7 @@
 pub mod builder;
 pub mod fit;
 pub mod geometry;
+pub mod path;
 pub mod pixmap;
 pub mod render;
 pub mod scene;
@@ -60,6 +66,7 @@ pub use geometry::{
     RoundedRectRadii, Segments, Shape, Size, Transform, TranslateScale, Triangle, TrianglePathIter,
     Vec2,
 };
+pub use path::{BoolOp, DEFAULT_TOLERANCE, PathOps, PathSample};
 pub use pixmap::Pixmap;
 pub use scene::{
     BlendMode, Clip, ColorMatrix, CornerRadii, Element, Fill, FillStrokeStyle, Filter,

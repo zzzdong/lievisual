@@ -25,8 +25,8 @@ use crate::geometry::{Color, Point, Rect, Transform};
 use crate::pixmap::Pixmap;
 use crate::render::Renderer;
 use crate::scene::{
-    BlendMode, ColorMatrix, Fill, FillStrokeStyle, GradientSpread, GradientStop, LineCap, LineJoin,
-    LinearGradient, Scene, SketchFill, Stroke,
+    BlendMode, ColorMatrix, Fill, FillStrokeStyle, GradientSpread, GradientStop, LinearGradient,
+    Scene, SketchFill, Stroke,
 };
 use crate::text::TextStyle;
 
@@ -207,32 +207,6 @@ impl VelloPixmapRenderer {
         vello_color(&self.current_color_matrix().apply(*color))
     }
 
-    fn kurbo_stroke(stroke: &Stroke) -> KurboStroke {
-        let cap = match stroke.line_cap {
-            LineCap::Butt => kurbo::Cap::Butt,
-            LineCap::Round => kurbo::Cap::Round,
-            LineCap::Square => kurbo::Cap::Square,
-        };
-        let join = match stroke.line_join {
-            LineJoin::Miter => kurbo::Join::Miter,
-            LineJoin::Round => kurbo::Join::Round,
-            LineJoin::Bevel => kurbo::Join::Bevel,
-        };
-        let mut k = KurboStroke {
-            width: stroke.width,
-            join,
-            start_cap: cap,
-            end_cap: cap,
-            miter_limit: stroke.miter_limit,
-            ..Default::default()
-        };
-        if !stroke.dash_array.is_empty() {
-            k.dash_pattern = stroke.dash_array.iter().copied().collect();
-            k.dash_offset = stroke.dash_offset;
-        }
-        k
-    }
-
     /// The currently active scene (composed) transform: the top of the stack, or identity when
     /// no transform is applied.
     fn current_transform(&self) -> vello_cpu::kurbo::Affine {
@@ -294,7 +268,7 @@ impl VelloPixmapRenderer {
         }
         if let Some(s) = &style.stroke {
             self.ctx.set_paint(self.to_vello(&s.color));
-            self.ctx.set_stroke(Self::kurbo_stroke(s));
+            self.ctx.set_stroke(s.to_kurbo());
             self.ctx.stroke_path(path);
         }
     }
@@ -370,7 +344,7 @@ impl Renderer for VelloPixmapRenderer {
         path.move_to(VPoint::new(start.x, start.y));
         path.line_to(VPoint::new(end.x, end.y));
         self.ctx.set_paint(self.to_vello(&style.color));
-        self.ctx.set_stroke(Self::kurbo_stroke(style));
+        self.ctx.set_stroke(style.to_kurbo());
         self.ctx.stroke_path(&path);
     }
 
@@ -384,7 +358,7 @@ impl Renderer for VelloPixmapRenderer {
             path.line_to(VPoint::new(p.x, p.y));
         }
         self.ctx.set_paint(self.to_vello(&style.color));
-        self.ctx.set_stroke(Self::kurbo_stroke(style));
+        self.ctx.set_stroke(style.to_kurbo());
         self.ctx.stroke_path(&path);
     }
 
@@ -426,7 +400,7 @@ impl Renderer for VelloPixmapRenderer {
 
         if let Some(s) = stroke {
             self.ctx.set_paint(self.to_vello(&s.color));
-            self.ctx.set_stroke(Self::kurbo_stroke(s));
+            self.ctx.set_stroke(s.to_kurbo());
             self.ctx.stroke_path(path);
         }
     }

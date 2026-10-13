@@ -27,6 +27,7 @@
 | `scene` | 声明式场景图 IR：`Scene` / `SceneNode` / `Element` / 样式 / `Layer` |
 | `text` | 文本排版与测量：`RichSpan` / `TextStyle` / `TextLayout` / 字体注册 |
 | `geometry` | 几何与颜色：re-export kurbo + 自研 `Color` / `Transform` |
+| `path` | 路径运算：布尔运算 / stroke-to-path / 弧长测量 / 膨胀收缩 |
 | `pixmap` | 自包含 RGBA8 位图 `Pixmap`（PNG 编解码；lievisual 不做图片解码） |
 | `builder` | Canvas 风格便捷构造层（可选糖衣） |
 | `render` | 渲染后端 trait + SVG / vello_cpu 实现 |
@@ -57,6 +58,8 @@ Canvas 风格**便捷构造**层：纯函数返回 `Element`，不引入可变�
 | `fill_circle` / `fill_ellipse` | `arc`+fill / `ellipse`+fill | 圆心/半径/半轴 |
 | `line` / `polyline` / `polygon` | `moveTo` / `lineTo` | 线/折线/多边形 |
 | `path(path, closed)` | `beginPath`+fill | 贝塞尔路径 |
+| `boolean_path(a, b, op)` | — | 两路径的布尔运算结果（lievisual 扩展） |
+| `outline_path(path, stroke)` | — | stroke-to-path：描边轮廓当填充画（lievisual 扩展） |
 
 ### 关键语义
 
@@ -140,9 +143,25 @@ Canvas 风格**便捷构造**层：纯函数返回 `Element`，不引入可变�
 
 ---
 
-## 7. 几何（`geometry`）
+## 7. 几何（`geometry`）与路径运算（`path`）
 
 re-export kurbo：`Point` / `Rect` / `Size` / `Vec2`；自研 `Color` / `Transform` / `LineCap` / `LineJoin` 等。
+
+### 路径运算（`path`）
+
+`use lievisual::PathOps;` 之后可在任意 `BezPath` 上：
+
+- **布尔运算**：`boolean(other, op, tolerance)` + 便捷的 `union` / `intersect` / `difference` / `xor`（`BoolOp`）。
+- **规范化**：`normalize(tolerance)` —— 解自交、合并重叠 contour（"自并"）。
+- **stroke-to-path**：`outline(stroke, tolerance)` —— 描边转可填充轮廓，**保留曲线**（不展平）。
+- **弧长测量**：`path_length()` / `point_at_length(d)` → `PathSample`（点 + 单位切向 + 实际弧长）/ `trim(from, to)`。
+- **膨胀 / 收缩**：`offset(d, tolerance)` / `inset(d, tolerance)` —— 圆盘 Minkowski（圆角化），把路径当**填充区域**处理。
+
+要点：
+
+- **构建期、IR 中立**：`BezPath` 进、`BezPath` 出，不进 `scene`、不碰后端 → 结果交给 `Ctx::path` 后，SVG 与栅格**天然一致**。
+- 布尔运算由 **`i_overlay`**（纯 Rust）完成（kurbo 0.13 已移除 `BooleanOps`）：曲线先按 `tolerance`（默认 `DEFAULT_TOLERANCE = 0.1`）展平成多边形，**结果也是多边形**；填充按**非零**规则（两个后端的默认），洞以反向绕的 contour 表达。
+- 便捷入口：`Ctx::boolean_path(a, b, op)`、`Ctx::outline_path(path, stroke)`；`Stroke::to_kurbo()` 是描边样式的唯一定义（后端与 `outline` 共用）。
 
 ---
 

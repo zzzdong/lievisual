@@ -66,6 +66,7 @@
 //! ```
 
 use crate::geometry::{Color, Point, Rect, Size, Transform, Vec2};
+use crate::path::{BoolOp, DEFAULT_TOLERANCE, PathOps};
 use crate::scene::{
     BlendMode, Clip, Element, Fill, FillStrokeStyle, Filter, Layer, Mask, SceneImage, SceneNode,
     Stroke,
@@ -750,6 +751,33 @@ impl Ctx {
             path,
             style: self.fill_stroke(),
             closed,
+        })
+    }
+
+    /// **Boolean combination** of two paths (`union` / `intersect` / `difference` / `xor`), filled
+    /// with this context's fill.
+    ///
+    /// The result is always a closed region; see [`crate::path::PathOps`] for the operations and
+    /// the flattening tolerance they expose.
+    #[must_use]
+    pub fn boolean_path(&self, a: &BezPath, b: &BezPath, op: BoolOp) -> SceneNode {
+        self.path(a.boolean(b, op, DEFAULT_TOLERANCE), true)
+    }
+
+    /// **Stroke-to-path**: the outline of `path` stroked with `stroke`, as a *filled* node in the
+    /// stroke's color.
+    ///
+    /// Unlike [`Ctx::stroke`] the outline is real geometry, not a stroked primitive — use it to
+    /// hit-test a stroke, clip by a stroke, or feed a stroke into a boolean op.
+    #[must_use]
+    pub fn outline_path(&self, path: &BezPath, stroke: &Stroke) -> SceneNode {
+        self.node(Element::Path {
+            path: path.outline(stroke, DEFAULT_TOLERANCE),
+            style: FillStrokeStyle {
+                fill: Some(Fill::Solid(stroke.color)),
+                stroke: None,
+            },
+            closed: false,
         })
     }
 

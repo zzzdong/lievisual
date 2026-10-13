@@ -109,6 +109,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ImageFill::natural(pixmap, at)` for the natural-size case. Both backends express it natively and
   identically (SVG `<pattern>`; peniko image brush in `Repeat` mode with a paint transform). Like
   `Element::Image`, an image fill is **exempt from `ColorMatrix`**.
+- **Path operations** (`path`): the new `PathOps` trait adds boolean combinations (`boolean` with
+  `BoolOp`, plus `union` / `intersect` / `difference` / `xor`), self-union clean-up (`normalize`),
+  **stroke-to-path** (`outline`, curve-preserving), arc-length measurement (`path_length` /
+  `point_at_length` → `PathSample` with a unit tangent / `trim`) and morphological **offset /
+  inset**. Everything is **build-time and IR-neutral** — a `BezPath` in, a `BezPath` out — so the SVG
+  and the raster backend render the result identically, with no per-backend work. Convenience entry
+  points: `builder::Ctx::boolean_path` and `builder::Ctx::outline_path`.
+  - Boolean ops go through **`i_overlay`** (new dependency; pure Rust, no `unsafe`, no threading by
+    default) because kurbo 0.13 dropped `BooleanOps`. Curves are flattened at `tolerance`
+    (`DEFAULT_TOLERANCE = 0.1`), so **the result is polygonal**; filling uses the **non-zero** rule —
+    the default of both backends — so holes (opposite-wound contours) render as holes everywhere.
+  - `offset` / `inset` are dilation / erosion by a disk (Minkowski), built from stroke-to-path plus a
+    boolean op: they round convex (resp. concave) corners and treat the path as a **filled region**.
+  - `Stroke::to_kurbo()` is now public — the single definition of a stroke style, shared by the
+    raster backend and `PathOps::outline` (it used to be duplicated inside `VelloPixmapRenderer`).
 
 ### Changed
 

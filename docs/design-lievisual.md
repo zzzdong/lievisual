@@ -67,6 +67,8 @@ src/
                 from_points）直接用 kurbo 原生；Color/Transform 保留自定义（仿射桥接 kurbo）
   scene.rs      Scene（元数据 + 图层 layers）/ Layer / SceneNode（层级+节点属性）/
                 Element（图元枚举）/ 样式（FillStrokeStyle/Fill:Solid·Linear·Radial/Stroke 含虚线）
+  path.rs       路径运算（PathOps）：布尔运算 / stroke-to-path / 弧长测量 / 膨胀收缩。
+                构建期、IR 中立（BezPath → BezPath）；布尔运算经 i_overlay 承担
   text.rs       Canvas 风格文本 API：TextStyle/TextAlign/TextBaseline/TextMetrics/
                 measure_text（thread-local 排版上下文缓存）
   render/
@@ -144,6 +146,8 @@ Pango 独有而 parley 0.11 尚未提供的：`rise`（上标/下标）与文本
 - `kurbo = "0.13"`：与 `vello_cpu 0.2` 内部 kurbo 0.13 对齐，避免双版本类型不兼容。
 - `parley = "0.11"`、`vello_cpu = "0.2"`：参考 liemermaid 已验证可用的组合。
 - `peniko 0.6`（随 vello_cpu）：支持 Linear / Radial / Sweep 三种渐变。
+- `i_overlay = "9"`（[`path`]）：kurbo 0.13 移除了 `BooleanOps`，路径布尔运算改由 i_overlay 承担
+  （纯 Rust、无 `unsafe`、默认单线程）；只在**构建期**用到，渲染路径不受影响。
 
 ## 后续规划
 

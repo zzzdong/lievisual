@@ -72,8 +72,12 @@ cargo run --example demo   # writes demo.svg + demo.png
   hug the canvas to the content (stroke widths, node transforms and text rotation included);
   built for "content-driven canvas" exporters.
 - **Rich primitives** — rects, circles, ellipses (rotatable), rounded rects, lines, polylines,
-  polygons, arcs, pies, paths, gradient paths, images, groups; solid/linear/radial fills,
+  polygons, arcs, pies, paths, gradient paths, images, groups; solid/linear/radial/sweep fills,
   dashes, caps, joins, miter limit; clips consistent across backends.
+- **Path operations** — `PathOps` on any `BezPath`: boolean combinations (union / intersect /
+  difference / xor), stroke-to-path, arc-length measurement (`path_length` / `point_at_length` /
+  `trim`) and offset / inset. Build-time and backend-agnostic: the result is a plain path, so SVG
+  and the raster backend agree by construction.
 - **Cross-backend text** — glyphs typeset once (parley) into a shared `TextLayout`; the SVG
   backend emits native `<text>`, the raster backend renders the layout. `register_font` is
   process-wide, visible to all threads.
@@ -94,6 +98,7 @@ src/
   scene.rs      Scene / Layer / SceneNode / Element / styles / Clip
   text/         Canvas-style text API + parley-backed layout engine
   builder.rs    Ctx + Path2D (Canvas 2D superset)
+  path.rs       PathOps: boolean ops / stroke-to-path / measure / offset-inset
   fit.rs        content bounds + fit_scene
   render/       Renderer trait, SvgRenderer, VelloPixmapRenderer
   pixmap.rs     self-contained RGBA8 bitmap + PNG encode/decode
@@ -102,7 +107,7 @@ src/
 ## Testing
 
 ```sh
-cargo test   # 153 unit tests + 4 doc tests, incl. bug regressions & backend-contract locks
+cargo test   # 281 unit tests + 6 doc tests, incl. bug regressions & backend-contract locks
 ```
 
 ## License
