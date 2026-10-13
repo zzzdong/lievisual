@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (default no-op). The mask is the **outermost** compositing scope. vello rasterizes it into a
   canvas-sized `vello_cpu::Mask` and uses `push_layer(mask)`; SVG emits
   `<mask maskContentUnits="userSpaceOnUse">` + `mask="url(#…)"`.
+- **`Filter`** — a post-processing filter applied to a node's subtree (rendered offscreen,
+  filtered, then composited): `Filter::blur(std_dev)` and
+  `Filter::drop_shadow(dx, dy, std_dev, color)`; `SceneNode::filter` + `SceneNode::with_filter`,
+  `builder::Ctx::with_filter`, and `Renderer::push_filter` / `pop_filter` (default no-op). Scope
+  order is `clip → filter → opacity → blend → mask` (mirrors CSS `filter` → opacity →
+  `mix-blend-mode`). vello maps to `filter_effects::{FilterFunction::Blur,
+  FilterPrimitive::DropShadow}`; SVG emits `<filter>` with `feGaussianBlur` / `feDropShadow`.
+  Note: vello's filter support is single-primitive and panics under multi-threaded rendering
+  (which lievisual does not enable).
 
 ### Fixed
 

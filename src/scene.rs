@@ -460,6 +460,8 @@ pub struct SceneNode {
     pub blend_mode: BlendMode,
     /// Optional alpha mask applied to the subtree's composited result.
     pub mask: Option<Mask>,
+    /// Optional post-processing filter applied to the subtree (blur / drop shadow).
+    pub filter: Option<Filter>,
 }
 
 impl SceneNode {
@@ -474,6 +476,7 @@ impl SceneNode {
             clip: None,
             blend_mode: BlendMode::Normal,
             mask: None,
+            filter: None,
         }
     }
 
@@ -489,6 +492,7 @@ impl SceneNode {
             clip: None,
             blend_mode: BlendMode::Normal,
             mask: None,
+            filter: None,
         }
     }
 
@@ -603,6 +607,13 @@ impl SceneNode {
     #[must_use]
     pub fn with_mask(mut self, mask: Mask) -> Self {
         self.mask = Some(mask);
+        self
+    }
+
+    /// Set a post-processing filter (blur / drop shadow) applied to the subtree.
+    #[must_use]
+    pub fn with_filter(mut self, filter: Filter) -> Self {
+        self.filter = Some(filter);
         self
     }
 }
@@ -739,6 +750,51 @@ impl Mask {
     pub fn with_fill(mut self, fill: impl Into<Fill>) -> Self {
         self.fill = fill.into();
         self
+    }
+}
+
+/// A post-processing filter applied to a node's subtree.
+///
+/// The subtree is rendered into an offscreen layer, filtered, then composited — mirroring CSS
+/// `filter` / SVG filter effects. Only effects supported by **both** backends are exposed (vello's
+/// filter support is single-primitive and experimental; it also panics under multi-threaded
+/// rendering, which lievisual does not enable by default).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Filter {
+    /// Gaussian blur; `std_dev` is the standard deviation σ in px (visible reach ≈ 3σ).
+    Blur {
+        /// Standard deviation of the Gaussian kernel (px).
+        std_dev: f64,
+    },
+    /// Drop shadow (the source is composited on top of the shadow).
+    DropShadow {
+        /// Horizontal offset (px; positive = right).
+        dx: f64,
+        /// Vertical offset (px; positive = down).
+        dy: f64,
+        /// Blur standard deviation of the shadow (px).
+        std_dev: f64,
+        /// Shadow color (its alpha is the shadow opacity).
+        color: Color,
+    },
+}
+
+impl Filter {
+    /// A Gaussian blur with standard deviation `std_dev` (px).
+    #[must_use]
+    pub fn blur(std_dev: f64) -> Self {
+        Self::Blur { std_dev }
+    }
+
+    /// A drop shadow offset by `(dx, dy)`, blurred by `std_dev`, in `color`.
+    #[must_use]
+    pub fn drop_shadow(dx: f64, dy: f64, std_dev: f64, color: Color) -> Self {
+        Self::DropShadow {
+            dx,
+            dy,
+            std_dev,
+            color,
+        }
     }
 }
 

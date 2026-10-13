@@ -67,7 +67,8 @@
 
 use crate::geometry::{Color, Point, Rect, Size, Transform, Vec2};
 use crate::scene::{
-    BlendMode, Clip, Element, Fill, FillStrokeStyle, Layer, Mask, SceneImage, SceneNode, Stroke,
+    BlendMode, Clip, Element, Fill, FillStrokeStyle, Filter, Layer, Mask, SceneImage, SceneNode,
+    Stroke,
 };
 use crate::text::{RichSpan, TextMeasure, TextStyle, measure_text};
 use kurbo::{BezPath, Shape};
@@ -106,6 +107,8 @@ pub struct Ctx {
     pub blend_mode: BlendMode,
     /// Alpha mask applied to every produced node's subtree.
     pub mask: Option<Mask>,
+    /// Post-processing filter applied to every produced node's subtree.
+    pub filter: Option<Filter>,
     /// Optional name / id attached to every produced node (debugging, hit-testing, SVG `id`).
     pub name: Option<String>,
     /// z-order attached to every produced node.
@@ -123,6 +126,7 @@ impl Default for Ctx {
             clip: None,
             blend_mode: BlendMode::Normal,
             mask: None,
+            filter: None,
             name: None,
             z_index: 0,
         }
@@ -356,6 +360,13 @@ impl Ctx {
         self
     }
 
+    /// Apply a post-processing filter (blur / drop shadow) to every produced node's subtree.
+    #[must_use]
+    pub fn with_filter(mut self, filter: Filter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
     /// Attach a name / id to every produced node (debugging, hit-testing, SVG `id`).
     #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
@@ -428,6 +439,9 @@ impl Ctx {
         }
         if let Some(m) = &self.mask {
             n = n.with_mask(m.clone());
+        }
+        if let Some(f) = &self.filter {
+            n = n.with_filter(f.clone());
         }
         if let Some(name) = &self.name {
             n = n.with_name(name.clone());

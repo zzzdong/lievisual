@@ -78,7 +78,9 @@
 > **状态（2026-10-13）**：**Mask 已实现** —— `Mask { shape: Clip, fill: Fill }`（`SceneNode.mask` /
 > `builder::Ctx::with_mask` / `Renderer::push_mask`），支持实心（含部分 alpha）与**渐变遮罩**；
 > vello 光栅化为画布尺寸 `vello_cpu::Mask` 后 `push_layer(mask)`，SVG 输出 `<mask>`。
-> **图像滤镜（blur / drop-shadow）未做** —— vello_cpu 的 filter 在多线程渲染下会 panic，需先评估。
+> **图像滤镜（blur / drop-shadow）已实现** —— `Filter::{blur, drop_shadow}`（`SceneNode.filter` /
+> `Renderer::push_filter`）；vello 用 `filter_effects` 单原语，SVG 用 `<filter>`（feGaussianBlur /
+> feDropShadow）。注意 vello filter 在**多线程**渲染下会 panic（lievisual 默认单线程，不受影响）。
 
 ### P2 — 能力补齐
 

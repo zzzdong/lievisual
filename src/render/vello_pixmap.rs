@@ -667,6 +667,15 @@ impl Renderer for VelloPixmapRenderer {
         self.ctx.pop_layer();
     }
 
+    fn push_filter(&mut self, filter: &crate::scene::Filter) {
+        self.ctx
+            .push_layer(None, None, None, None, Some(to_vello_filter(filter)));
+    }
+
+    fn pop_filter(&mut self) {
+        self.ctx.pop_layer();
+    }
+
     fn push_clip(&mut self, clip: &crate::scene::Clip) {
         // vello_cpu 的 clip 路径按当前 transform（clip_path_transform）应用；
         // 我们 push_transform 已设置 ctx transform，故 clip 与节点变换一致复合。
@@ -762,6 +771,29 @@ fn apply_fill(ctx: &mut RenderContext, scene_transform: vello_cpu::kurbo::Affine
             set_gradient_paint(ctx, scene_transform, kind, &g.stops);
         }
         Fill::Sketch(sf) => ctx.set_paint(vello_color(&sf.color)),
+    }
+}
+
+/// Map a lievisual [`Filter`](crate::scene::Filter) to a vello filter (a single primitive;
+/// vello's filter graphs are not yet implemented).
+fn to_vello_filter(filter: &crate::scene::Filter) -> vello_cpu::filter_effects::Filter {
+    use vello_cpu::filter_effects::{Filter as VFilter, FilterFunction, FilterPrimitive};
+    match filter {
+        crate::scene::Filter::Blur { std_dev } => VFilter::from_function(FilterFunction::Blur {
+            radius: *std_dev as f32,
+        }),
+        crate::scene::Filter::DropShadow {
+            dx,
+            dy,
+            std_dev,
+            color,
+        } => VFilter::from_primitive(FilterPrimitive::DropShadow {
+            dx: *dx as f32,
+            dy: *dy as f32,
+            std_deviation: *std_dev as f32,
+            color: vello_color(color),
+            edge_mode: Default::default(),
+        }),
     }
 }
 
@@ -865,8 +897,8 @@ mod tests {
     use super::*;
     use crate::geometry::{Color, Point, Rect, Transform};
     use crate::scene::{
-        BlendMode, Clip, Element, FillStrokeStyle, GradientStop, LinearGradient, Scene, SceneNode,
-        SketchFillStyle,
+        BlendMode, Clip, Element, FillStrokeStyle, Filter, GradientStop, LinearGradient, Scene,
+        SceneNode, SketchFillStyle,
     };
 
     /// 提取 pixmap 像素为 RGBA u8 数组（非预乘，用于比较）。
@@ -1282,6 +1314,52 @@ mod tests {
             rr > 200 && rg > 200 && rb > 200,
             "右侧应被遮罩淡出为白, got ({rr},{rg},{rb})"
         );
+    }
+
+    /// Filter：高斯模糊让矩形边缘之外也变暗（无滤镜时该点为纯白背景）。
+    #[test]
+    fn blur_filter_softens_edges() {
+        let rect = Element::rect(
+            Rect::new(0.0, 0.0, 10.0, 20.0),
+            FillStrokeStyle::fill(Color::BLACK),
+        );
+        let mut plain = Scene::new(20.0, 20.0);
+        plain.push(rect.clone());
+        let mut blurred = Scene::new(20.0, 20.0);
+        blurred.push_node(SceneNode::new(rect).with_filter(Filter::blur(2.0)));
+
+        let mut rp = VelloPixmapRenderer::new(20, 20).with_background(Color::WHITE);
+        let mut rb = VelloPixmapRenderer::new(20, 20).with_background(Color::WHITE);
+        let pp = rp.render_scene_to_pixmap(&plain);
+        let pb = rb.render_scene_to_pixmap(&blurred);
+        let plain_px = pixel_at(&pp, 11, 10).0;
+        let blur_px = pixel_at(&pb, 11, 10).0;
+        assert_eq!(plain_px, 255, "无滤镜时边界外应为纯白");
+        assert!(
+            (20..250).contains(&blur_px),
+            "模糊应使边界外变暗, got {blur_px}"
+        );
+    }
+
+    /// Filter：投影在矩形外的偏移方向产生非白像素（无滤镜时为白背景）。
+    #[test]
+    fn drop_shadow_filter_adds_shadow() {
+        let rect = Element::rect(
+            Rect::new(2.0, 2.0, 8.0, 8.0),
+            FillStrokeStyle::fill(Color::BLACK),
+        );
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(SceneNode::new(rect).with_filter(Filter::drop_shadow(
+            4.0,
+            4.0,
+            1.5,
+            Color::BLACK,
+        )));
+        let mut r = VelloPixmapRenderer::new(20, 20).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&scene);
+        // 投影中心 ≈ (2,2)+(4,4) + 半尺寸 → (6,6)+... 取 (10,10) 处应有阴影。
+        let (pr, _, _, _) = pixel_at(&pix, 10, 10);
+        assert!(pr < 250, "投影应在偏移位置产生非白像素, got {pr}");
     }
 
     /// 节点 visible=false：整棵子树跳过，不产生像素。

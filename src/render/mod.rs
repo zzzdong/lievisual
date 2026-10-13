@@ -222,6 +222,12 @@ pub trait Renderer {
     /// Exit the scope established by [`Renderer::push_mask`].
     fn pop_mask(&mut self) {}
 
+    /// Enter a filter scope: everything drawn until [`Renderer::pop_filter`] is rendered into an
+    /// offscreen layer and filtered (blur / drop shadow). Empty by default.
+    fn push_filter(&mut self, _filter: &crate::scene::Filter) {}
+    /// Exit the scope established by [`Renderer::push_filter`].
+    fn pop_filter(&mut self) {}
+
     /// Enter a named scope (for a node with `name`; emits `id` on the SVG side).
     /// `name` is an `Option`: `None` means no `id` attribute is emitted.
     fn push_name(&mut self, _name: Option<&str>) {}
@@ -242,6 +248,11 @@ pub trait Renderer {
         }
         if let Some(clip) = &node.clip {
             self.push_clip(clip);
+        }
+        // Filter is applied to the subtree's rendered content, before opacity / blend / mask
+        // (mirrors CSS `filter` → opacity → `mix-blend-mode`).
+        if let Some(filter) = &node.filter {
+            self.push_filter(filter);
         }
         if node.opacity != 1.0 {
             self.push_opacity(node.opacity);
@@ -274,6 +285,9 @@ pub trait Renderer {
         }
         if node.opacity != 1.0 {
             self.pop_opacity();
+        }
+        if node.filter.is_some() {
+            self.pop_filter();
         }
         if node.clip.is_some() {
             self.pop_clip();

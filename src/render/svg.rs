@@ -54,6 +54,7 @@ pub struct SvgRenderer {
     gradient_id: usize,
     clip_id: usize,
     mask_id: usize,
+    filter_id: usize,
     /// Hand-drawn fill patterns already emitted: index = `sk{n}` id, deduplicated by value so
     /// a hundred same-coloured cells share one `<pattern>`.
     patterns: Vec<SketchFill>,
@@ -81,6 +82,7 @@ impl SvgRenderer {
             gradient_id: 0,
             clip_id: 0,
             mask_id: 0,
+            filter_id: 0,
             patterns: Vec::new(),
             title: None,
             description: None,
@@ -681,6 +683,43 @@ impl Renderer for SvgRenderer {
         self.buf.push_str("</g>");
     }
 
+    fn push_filter(&mut self, filter: &crate::scene::Filter) {
+        let id = self.filter_id;
+        self.filter_id += 1;
+        let prim = match filter {
+            crate::scene::Filter::Blur { std_dev } => {
+                format!(r#"<feGaussianBlur stdDeviation="{std_dev:.2}"/>"#)
+            }
+            crate::scene::Filter::DropShadow {
+                dx,
+                dy,
+                std_dev,
+                color,
+            } => {
+                let opacity = if color.a == 255 {
+                    String::new()
+                } else {
+                    format!(r#" flood-opacity="{:.3}""#, color.a as f64 / 255.0)
+                };
+                format!(
+                    r##"<feDropShadow dx="{dx:.2}" dy="{dy:.2}" stdDeviation="{std_dev:.2}" flood-color="#{:02x}{:02x}{:02x}"{opacity}/>"##,
+                    color.r, color.g, color.b
+                )
+            }
+        };
+        // Generous filter region: the default -10%/120% of the bbox would clip the blur / shadow.
+        let defs = format!(
+            r#"<defs><filter id="filter{id}" x="-50%" y="-50%" width="200%" height="200%" filterUnits="objectBoundingBox">{prim}</filter></defs>"#
+        );
+        self.buf.push_str(&defs);
+        let m = format!(r#"<g filter="url(#filter{id})">"#);
+        self.buf.push_str(&m);
+    }
+
+    fn pop_filter(&mut self) {
+        self.buf.push_str("</g>");
+    }
+
     fn push_name(&mut self, name: Option<&str>) {
         match name {
             Some(id) => self
@@ -1236,6 +1275,35 @@ mod tests {
         let out = render(&scene);
         assert!(out.contains(r#"<mask id="mask0""#), "{out}");
         assert!(out.contains(r#"mask="url(#mask0)""#), "{out}");
+    }
+
+    /// Filter 输出 `<filter>` 定义（feGaussianBlur / feDropShadow）+ `filter="url(#filterN)"`。
+    #[test]
+    fn filter_emits_svg_filter() {
+        let make = |f: crate::scene::Filter| {
+            let mut scene = Scene::new(20.0, 20.0);
+            scene.push_node(
+                SceneNode::new(Element::rect(
+                    Rect::new(0.0, 0.0, 10.0, 10.0),
+                    FillStrokeStyle::fill(Color::BLACK),
+                ))
+                .with_filter(f),
+            );
+            render(&scene)
+        };
+        let blur = make(crate::scene::Filter::blur(2.0));
+        assert!(blur.contains(r#"<filter id="filter0""#), "{blur}");
+        assert!(blur.contains("feGaussianBlur"), "{blur}");
+        assert!(blur.contains(r#"filter="url(#filter0)""#), "{blur}");
+
+        let shadow = make(crate::scene::Filter::drop_shadow(
+            3.0,
+            3.0,
+            2.0,
+            Color::rgba(0x00, 0x00, 0x00, 128),
+        ));
+        assert!(shadow.contains("feDropShadow"), "{shadow}");
+        assert!(shadow.contains(r#"flood-opacity="0.502""#), "{shadow}");
     }
 
     #[test]
