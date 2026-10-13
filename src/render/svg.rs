@@ -18,8 +18,8 @@
 use crate::geometry::{Color, Point, Rect, Transform, Vec2};
 use crate::render::Renderer;
 use crate::scene::{
-    Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene, SketchFill,
-    SketchFillStyle, Stroke,
+    BlendMode, Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene,
+    SketchFill, SketchFillStyle, Stroke,
 };
 use crate::text::TextStyle;
 use std::fmt::Write;
@@ -649,6 +649,17 @@ impl Renderer for SvgRenderer {
         self.buf.push_str("</g>");
     }
 
+    fn push_blend(&mut self, mode: BlendMode) {
+        // `Normal` never reaches here (the traversal skips it); stay defensive with a fallback.
+        let kw = mode.css_keyword().unwrap_or("normal");
+        let m = format!(r#"<g style="mix-blend-mode:{kw}">"#);
+        self.buf.push_str(&m);
+    }
+
+    fn pop_blend(&mut self) {
+        self.buf.push_str("</g>");
+    }
+
     fn push_name(&mut self, name: Option<&str>) {
         match name {
             Some(id) => self
@@ -1129,6 +1140,28 @@ mod tests {
         let mut svg = SvgRenderer::new(scene.width, scene.height).with_background(scene.background);
         scene.render(&mut svg);
         svg.into_string()
+    }
+
+    /// BlendMode 输出为 `mix-blend-mode`（Normal 不输出）。
+    #[test]
+    fn blend_mode_emits_mix_blend_mode() {
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(Color::rgb(0x80, 0x80, 0x80)),
+            ))
+            .with_blend_mode(BlendMode::Multiply),
+        );
+        let out = render(&scene);
+        assert!(out.contains("mix-blend-mode:multiply"), "{out}");
+        // Normal 节点不产生 blend 包装。
+        let mut plain = Scene::new(20.0, 20.0);
+        plain.push(Element::rect(
+            Rect::new(0.0, 0.0, 20.0, 20.0),
+            FillStrokeStyle::fill(Color::BLACK),
+        ));
+        assert!(!render(&plain).contains("mix-blend-mode"));
     }
 
     #[test]

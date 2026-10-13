@@ -66,7 +66,9 @@
 //! ```
 
 use crate::geometry::{Color, Point, Rect, Size, Transform, Vec2};
-use crate::scene::{Clip, Element, Fill, FillStrokeStyle, Layer, SceneImage, SceneNode, Stroke};
+use crate::scene::{
+    BlendMode, Clip, Element, Fill, FillStrokeStyle, Layer, SceneImage, SceneNode, Stroke,
+};
 use crate::text::{RichSpan, TextMeasure, TextStyle, measure_text};
 use kurbo::{BezPath, Shape};
 
@@ -99,6 +101,9 @@ pub struct Ctx {
     pub alpha: f64,
     /// Clip shape applied to every produced node's subtree.
     pub clip: Option<Clip>,
+    /// Blend mode applied to every produced node (compositing onto the backdrop);
+    /// default [`BlendMode::Normal`].
+    pub blend_mode: BlendMode,
     /// Optional name / id attached to every produced node (debugging, hit-testing, SVG `id`).
     pub name: Option<String>,
     /// z-order attached to every produced node.
@@ -114,6 +119,7 @@ impl Default for Ctx {
             transform: None,
             alpha: 1.0,
             clip: None,
+            blend_mode: BlendMode::Normal,
             name: None,
             z_index: 0,
         }
@@ -333,6 +339,13 @@ impl Ctx {
         self
     }
 
+    /// Set the blend mode applied to every produced node (`mix-blend-mode`).
+    #[must_use]
+    pub fn with_blend(mut self, mode: BlendMode) -> Self {
+        self.blend_mode = mode;
+        self
+    }
+
     /// Attach a name / id to every produced node (debugging, hit-testing, SVG `id`).
     #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
@@ -399,6 +412,9 @@ impl Ctx {
         }
         if let Some(c) = &self.clip {
             n = n.with_clip(c.clone());
+        }
+        if !self.blend_mode.is_normal() {
+            n = n.with_blend_mode(self.blend_mode);
         }
         if let Some(name) = &self.name {
             n = n.with_name(name.clone());
@@ -719,6 +735,9 @@ impl Ctx {
         }
         if (self.alpha - 1.0).abs() > f64::EPSILON {
             l = l.with_opacity(self.alpha);
+        }
+        if !self.blend_mode.is_normal() {
+            l = l.with_blend_mode(self.blend_mode);
         }
         l
     }

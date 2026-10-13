@@ -15,7 +15,7 @@
 //! these to emit native markup (e.g. SVG `<ellipse>` / `<rect rx>`).
 
 use crate::geometry::{Point, Rect, Transform, Vec2};
-use crate::scene::{Element, FillStrokeStyle, Layer, Scene, SceneNode, Stroke};
+use crate::scene::{BlendMode, Element, FillStrokeStyle, Layer, Scene, SceneNode, Stroke};
 use kurbo::Shape;
 
 pub use svg::{SvgRenderer, SvgSizing};
@@ -209,6 +209,13 @@ pub trait Renderer {
     /// Exit the scope established by [`Renderer::push_opacity`].
     fn pop_opacity(&mut self) {}
 
+    /// Enter a blend-mode scope: everything drawn until [`Renderer::pop_blend`] is composited
+    /// with the backdrop using `mode`. Empty by default (backends without blend support ignore
+    /// it, degrading to [`BlendMode::Normal`]).
+    fn push_blend(&mut self, _mode: BlendMode) {}
+    /// Exit the scope established by [`Renderer::push_blend`].
+    fn pop_blend(&mut self) {}
+
     /// Enter a named scope (for a node with `name`; emits `id` on the SVG side).
     /// `name` is an `Option`: `None` means no `id` attribute is emitted.
     fn push_name(&mut self, _name: Option<&str>) {}
@@ -233,6 +240,11 @@ pub trait Renderer {
         if node.opacity != 1.0 {
             self.push_opacity(node.opacity);
         }
+        // Blend is pushed after opacity so it forms the outer compositing layer: the scope's
+        // content is first scaled by opacity, then blended with the backdrop.
+        if !node.blend_mode.is_normal() {
+            self.push_blend(node.blend_mode);
+        }
         if node.name.is_some() {
             self.push_name(node.name.as_deref());
         }
@@ -242,6 +254,9 @@ pub trait Renderer {
     fn pop_node_scope(&mut self, node: &SceneNode) {
         if node.name.is_some() {
             self.pop_name();
+        }
+        if !node.blend_mode.is_normal() {
+            self.pop_blend();
         }
         if node.opacity != 1.0 {
             self.pop_opacity();
@@ -295,6 +310,9 @@ pub trait Renderer {
         if layer.opacity != 1.0 {
             self.push_opacity(layer.opacity);
         }
+        if !layer.blend_mode.is_normal() {
+            self.push_blend(layer.blend_mode);
+        }
         if !layer.name.is_empty() {
             self.push_name(Some(&layer.name));
         }
@@ -303,6 +321,9 @@ pub trait Renderer {
 
         if !layer.name.is_empty() {
             self.pop_name();
+        }
+        if !layer.blend_mode.is_normal() {
+            self.pop_blend();
         }
         if layer.opacity != 1.0 {
             self.pop_opacity();

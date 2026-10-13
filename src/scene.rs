@@ -356,6 +356,9 @@ pub struct Layer {
     pub opacity: f64,
     /// Layer-wide transform (applied to all nodes inside).
     pub transform: Option<Transform>,
+    /// Layer-wide blend mode when compositing the layer onto the backdrop;
+    /// default [`BlendMode::Normal`].
+    pub blend_mode: BlendMode,
     /// Nodes inside the layer (drawn after stable `z_index` sorting).
     pub nodes: Vec<SceneNode>,
 }
@@ -367,6 +370,7 @@ impl Layer {
             visible: true,
             opacity: 1.0,
             transform: None,
+            blend_mode: BlendMode::Normal,
             nodes: Vec::new(),
         }
     }
@@ -424,6 +428,13 @@ impl Layer {
         self.transform = Some(t);
         self
     }
+
+    /// Set the layer's blend mode (compositing onto the backdrop).
+    #[must_use]
+    pub fn with_blend_mode(mut self, mode: BlendMode) -> Self {
+        self.blend_mode = mode;
+        self
+    }
 }
 
 /// A single node in the scene: primitive + layer + local transform + node attributes.
@@ -444,6 +455,9 @@ pub struct SceneNode {
     pub visible: bool,
     /// Optional clip shape: restrict the whole subtree to its interior.
     pub clip: Option<Clip>,
+    /// Blend mode when compositing this node (and its Group subtree) onto the backdrop;
+    /// default [`BlendMode::Normal`] (no blending).
+    pub blend_mode: BlendMode,
 }
 
 impl SceneNode {
@@ -456,6 +470,7 @@ impl SceneNode {
             name: None,
             visible: true,
             clip: None,
+            blend_mode: BlendMode::Normal,
         }
     }
 
@@ -469,6 +484,7 @@ impl SceneNode {
             name: None,
             visible: true,
             clip: None,
+            blend_mode: BlendMode::Normal,
         }
     }
 
@@ -569,6 +585,13 @@ impl SceneNode {
     #[must_use]
     pub fn with_clip(mut self, clip: Clip) -> Self {
         self.clip = Some(clip);
+        self
+    }
+
+    /// Set the blend mode used when compositing this node (and its subtree) onto the backdrop.
+    #[must_use]
+    pub fn with_blend_mode(mut self, mode: BlendMode) -> Self {
+        self.blend_mode = mode;
         self
     }
 }
@@ -933,6 +956,65 @@ impl Stroke {
             dash_array,
             ..Default::default()
         }
+    }
+}
+
+/// Layer blend mode when compositing a scope onto its backdrop.
+///
+/// Mirrors CSS `mix-blend-mode` (W3C Compositing and Blending Level 1). Backends map it to
+/// `peniko::Mix` (vello) or the `mix-blend-mode` style property (SVG). `Normal` (the default)
+/// performs no blending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendMode {
+    /// No blending: the source replaces the backdrop (per its own alpha).
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl BlendMode {
+    /// Whether this is [`BlendMode::Normal`] (no blending).
+    #[must_use]
+    pub fn is_normal(self) -> bool {
+        matches!(self, BlendMode::Normal)
+    }
+
+    /// The CSS `mix-blend-mode` keyword, or `None` for [`BlendMode::Normal`] (which emits no
+    /// blending and can be skipped entirely).
+    #[must_use]
+    pub fn css_keyword(self) -> Option<&'static str> {
+        Some(match self {
+            BlendMode::Normal => return None,
+            BlendMode::Multiply => "multiply",
+            BlendMode::Screen => "screen",
+            BlendMode::Overlay => "overlay",
+            BlendMode::Darken => "darken",
+            BlendMode::Lighten => "lighten",
+            BlendMode::ColorDodge => "color-dodge",
+            BlendMode::ColorBurn => "color-burn",
+            BlendMode::HardLight => "hard-light",
+            BlendMode::SoftLight => "soft-light",
+            BlendMode::Difference => "difference",
+            BlendMode::Exclusion => "exclusion",
+            BlendMode::Hue => "hue",
+            BlendMode::Saturation => "saturation",
+            BlendMode::Color => "color",
+            BlendMode::Luminosity => "luminosity",
+        })
     }
 }
 

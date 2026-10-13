@@ -13,7 +13,9 @@
 //!   `miter_limit`.
 //! - Transforms are maintained with an independent stack (`push_transform` composes with the
 //!   parent transform, `pop_transform` restores it), supporting nested Groups.
-//! - Node opacity is applied by multiplying the current `opacity` into the color's alpha.
+//! - Node / layer opacity is applied as an **isolated compositing layer** (`RenderContext::
+//!   push_layer`), i.e. the alpha scales the *composited result* of the scope — matching the SVG
+//!   backend's `<g opacity>` even when sub-shapes overlap.
 
 use kurbo::{BezPath, Circle, Point as VPoint, Rect as VRect, Shape, Stroke as KurboStroke};
 use vello_cpu::peniko::color::AlphaColor;
@@ -23,8 +25,8 @@ use crate::geometry::{Color, Point, Rect, Transform};
 use crate::pixmap::Pixmap;
 use crate::render::Renderer;
 use crate::scene::{
-    Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene, SketchFill,
-    Stroke,
+    BlendMode, Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene,
+    SketchFill, Stroke,
 };
 use crate::text::TextStyle;
 
@@ -38,8 +40,6 @@ pub struct VelloPixmapRenderer {
     background: Option<Color>,
     /// Transform stack: top is the currently active composed transform.
     transform_stack: Vec<vello_cpu::kurbo::Affine>,
-    /// Opacity stack: top is the currently active composed opacity (layers multiplied together).
-    opacity_stack: Vec<f64>,
 }
 
 /// Clamp a canvas dimension (in device pixels) into vello_cpu's `1..=u16::MAX` range.
@@ -77,7 +77,6 @@ impl VelloPixmapRenderer {
             height: h,
             background: None,
             transform_stack: Vec::new(),
-            opacity_stack: Vec::new(),
         }
     }
 
@@ -113,15 +112,14 @@ impl VelloPixmapRenderer {
         // second time. Pixel density is the caller's choice via the constructor.
         let out_w = clamp_canvas(self.width as f64);
         let out_h = clamp_canvas(self.height as f64);
-        // Clear the previous frame's scene and state (including transform/opacity stacks, to
-        // avoid residue after an abnormal interruption of the previous frame).
+        // Clear the previous frame's scene and state (including the transform stack, to avoid
+        // residue after an abnormal interruption of the previous frame).
         if self.ctx.width() != out_w || self.ctx.height() != out_h {
             self.ctx.reset_and_resize(out_w, out_h);
         } else {
             self.ctx.reset();
         }
         self.transform_stack.clear();
-        self.opacity_stack.clear();
 
         // Background: fall back to the scene's background (the Scene is the authoritative IR);
         // skip painting an alpha-0 background so a transparent canvas stays possible.
@@ -186,17 +184,13 @@ impl VelloPixmapRenderer {
         self.render_scene_to_pixmap(scene).to_png()
     }
 
-    /// The currently active composed opacity (default 1.0).
-    fn current_opacity(&self) -> f64 {
-        self.opacity_stack.last().copied().unwrap_or(1.0)
-    }
-
-    /// Convert to a vello color, multiplying in the current opacity.
+    /// Convert a lievisual color to a vello color (channels are used as-is).
+    ///
+    /// Node / layer opacity is deliberately **not** baked into the color: it is applied as an
+    /// isolated compositing layer (see [`Renderer::push_opacity`]) so a scope's sub-shapes
+    /// composite before the alpha is scaled — matching the SVG backend's `<g opacity>`.
     fn to_vello(&self, color: &Color) -> AlphaColor<vello_cpu::color::Srgb> {
-        // `color` stores exact 8-bit channels; only the alpha is modulated by opacity.
-        // Round (instead of truncating) so e.g. 50% opacity maps to 128 rather than 127.
-        let a = (color.a as f64 / 255.0 * self.current_opacity()).clamp(0.0, 1.0);
-        AlphaColor::from_rgba8(color.r, color.g, color.b, (a * 255.0).round() as u8)
+        AlphaColor::from_rgba8(color.r, color.g, color.b, color.a)
     }
 
     fn kurbo_stroke(stroke: &Stroke) -> KurboStroke {
@@ -454,9 +448,9 @@ impl Renderer for VelloPixmapRenderer {
         if src.width() == 0 || src.height() == 0 {
             return;
         }
-        // 图片自身的 opacity 与节点 / 图层的 opacity 复合（其它图元都经 to_vello 乘入
-        // 当前 opacity；此前图片只用了自身 opacity，导致节点 opacity 对图片无效）。
-        let op = (opacity * self.current_opacity()).clamp(0.0, 1.0);
+        // 图片自身的 opacity 单独作用于此位图；节点 / 图层的 opacity 由 `push_opacity`
+        // 推入的隔离层负责（不再逐图元乘 alpha）。
+        let op = opacity.clamp(0.0, 1.0);
         if op <= 0.0 {
             return;
         }
@@ -685,12 +679,26 @@ impl Renderer for VelloPixmapRenderer {
     }
 
     fn push_opacity(&mut self, opacity: f64) {
-        let cur = self.current_opacity();
-        self.opacity_stack.push(cur * opacity.clamp(0.0, 1.0));
+        // Isolated layer: the alpha scales the *composited result* of the scope, so a node /
+        // layer with overlapping children matches SVG's `<g opacity>` (the previous
+        // per-primitive alpha multiplication darkened overlaps).
+        self.ctx
+            .push_layer(None, None, Some(opacity.clamp(0.0, 1.0) as f32), None, None);
     }
 
     fn pop_opacity(&mut self) {
-        self.opacity_stack.pop();
+        self.ctx.pop_layer();
+    }
+
+    fn push_blend(&mut self, mode: BlendMode) {
+        // Isolated blend layer: the scope's content is composited with the backdrop using `mode`
+        // (matching SVG `mix-blend-mode`).
+        self.ctx
+            .push_layer(None, Some(to_peniko_blend(mode)), None, None, None);
+    }
+
+    fn pop_blend(&mut self) {
+        self.ctx.pop_layer();
     }
 
     fn push_clip(&mut self, clip: &crate::scene::Clip) {
@@ -718,6 +726,30 @@ fn unpremultiply(c: u8, a: u8) -> u8 {
     } else {
         (((c as u32 * 255) + (a as u32 / 2)) / a as u32).min(255) as u8
     }
+}
+
+/// Map a lievisual [`BlendMode`] to peniko's blend mode (mix function + `SrcOver` composition).
+fn to_peniko_blend(mode: BlendMode) -> vello_cpu::peniko::BlendMode {
+    use vello_cpu::peniko::{BlendMode as PenikoBlend, Compose, Mix};
+    let mix = match mode {
+        BlendMode::Normal => Mix::Normal,
+        BlendMode::Multiply => Mix::Multiply,
+        BlendMode::Screen => Mix::Screen,
+        BlendMode::Overlay => Mix::Overlay,
+        BlendMode::Darken => Mix::Darken,
+        BlendMode::Lighten => Mix::Lighten,
+        BlendMode::ColorDodge => Mix::ColorDodge,
+        BlendMode::ColorBurn => Mix::ColorBurn,
+        BlendMode::HardLight => Mix::HardLight,
+        BlendMode::SoftLight => Mix::SoftLight,
+        BlendMode::Difference => Mix::Difference,
+        BlendMode::Exclusion => Mix::Exclusion,
+        BlendMode::Hue => Mix::Hue,
+        BlendMode::Saturation => Mix::Saturation,
+        BlendMode::Color => Mix::Color,
+        BlendMode::Luminosity => Mix::Luminosity,
+    };
+    PenikoBlend::new(mix, Compose::SrcOver)
 }
 
 /// vello 预乘 Pixmap → 非预乘 RGBA8 字节。
@@ -796,7 +828,8 @@ mod tests {
     use super::*;
     use crate::geometry::{Color, Point, Rect, Transform};
     use crate::scene::{
-        Element, FillStrokeStyle, GradientStop, LinearGradient, Scene, SceneNode, SketchFillStyle,
+        BlendMode, Element, FillStrokeStyle, GradientStop, LinearGradient, Scene, SceneNode,
+        SketchFillStyle,
     };
 
     /// 提取 pixmap 像素为 RGBA u8 数组（非预乘，用于比较）。
@@ -1116,6 +1149,61 @@ mod tests {
         assert!(r_.abs_diff(128) <= 40, "R={r_}");
         assert!(g.abs_diff(128) <= 40, "G={g}");
         assert!(b <= 40, "B={b}");
+    }
+
+    /// Bug 回归（跨后端一致）：Group/Layer 的 opacity 必须是**隔离合成**——子图元重叠处与
+    /// 不重叠处结果一致（等价 SVG `<g opacity>`），而非逐图元乘 alpha 让重叠处更暗。
+    #[test]
+    fn group_opacity_is_isolated() {
+        // 两个完全重合的不透明红矩形，放进 opacity=0.5 的 Group，白底。
+        let mut scene = Scene::new(20.0, 20.0);
+        let mut group = SceneNode::group(vec![
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+            )),
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+            )),
+        ]);
+        group.opacity = 0.5;
+        scene.push_node(group);
+        let mut r = VelloPixmapRenderer::new(20, 20).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let (pr, pg, pb, _) = pixel_at(&pix, 10, 10);
+        // 隔离合成：0.5 × 红 over 白 = (255,128,128)。
+        // 旧实现（逐图元乘 alpha）叠加两次 → (255,64,64)，会明显偏暗。
+        assert!(
+            pr > 240 && (124..=131).contains(&pg) && (124..=131).contains(&pb),
+            "隔离 opacity 应为 (255,128,128), got ({pr},{pg},{pb})"
+        );
+    }
+
+    /// BlendMode：Multiply 把不透明灰 (128) 叠在不透明灰 (128) 上 ≈ 64（Normal 则为 128）。
+    #[test]
+    fn blend_mode_multiply_darkens() {
+        let gray = Color::rgb(0x80, 0x80, 0x80);
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 20.0, 20.0),
+            FillStrokeStyle::fill(gray),
+        ));
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(gray),
+            ))
+            .with_blend_mode(BlendMode::Multiply),
+        );
+        let mut r = VelloPixmapRenderer::new(20, 20).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let (pr, pg, pb, _) = pixel_at(&pix, 10, 10);
+        // multiply(0.502, 0.502) = 0.252 → ≈64；Normal 会得到 128。
+        assert!(
+            (60..=68).contains(&pr) && (60..=68).contains(&pg) && (60..=68).contains(&pb),
+            "multiply 应使 128 灰变暗到 ~64, got ({pr},{pg},{pb})"
+        );
     }
 
     /// 节点 visible=false：整棵子树跳过，不产生像素。

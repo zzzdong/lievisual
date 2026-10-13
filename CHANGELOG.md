@@ -20,6 +20,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Renderer::render_children` — the single recursion used by the default list, layers and groups.
   Internally this collapses the ad-hoc `match Element::Group` in the sketch / fit / render passes
   onto the shared accessors.
+- **`BlendMode`** (CSS `mix-blend-mode` / W3C Compositing Level 1) as a first-class compositing
+  attribute:
+  - `SceneNode::blend_mode` + `SceneNode::with_blend_mode`, and `Layer::blend_mode` +
+    `Layer::with_blend_mode`; `builder::Ctx::with_blend` applies it to every produced node.
+  - `Renderer::push_blend` / `pop_blend` (default no-op, so backends without blend support degrade
+    to `Normal`). The default node/layer scope pushes blend **outside** opacity, so a scope is first
+    scaled by opacity and then blended with the backdrop.
+  - vello maps to `peniko::BlendMode`; SVG emits `<g style="mix-blend-mode:…">`.
+
+### Fixed
+
+- **Node / layer opacity is now isolated compositing.** The vello backend previously multiplied the
+  opacity into each primitive's color alpha, so a `Group`/`Layer` with **overlapping** sub-shapes
+  composited differently from the SVG backend's `<g opacity="…">` (overlaps came out darker). Opacity
+  is now applied as a `vello_cpu` layer (`RenderContext::push_layer`), i.e. to the *composited
+  result* of the scope — matching SVG and fixing the cross-backend inconsistency (roadmap P0-1).
+  Regression test: `render::vello_pixmap::tests::group_opacity_is_isolated`.
 
 ## [0.3.0] — 2026-10-13
 

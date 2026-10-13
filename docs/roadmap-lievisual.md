@@ -50,10 +50,17 @@
 - 修复：改用 `vello_cpu` 0.3 的 `RenderContext::push_layer(clip_path, blend_mode, opacity, mask, filter)`
   做真正的隐式离屏层；SVG 端保持 `<g opacity>`（已是隔离语义）。
 
+  > **状态：已修复（2026-10-13）** —— vello 端 `push_opacity` 改为 `push_layer(opacity)`，不再逐图元乘
+  > alpha；新增回归测试 `group_opacity_is_isolated`。跨后端一致。
+
 **P0-2｜混合模式（BlendMode）缺失**
 
 - 无法表达 multiply / screen / overlay / darken / lighten / Porter-Duff 等。
 - 后端已具备：vello_cpu `push_layer(..., blend_mode, ...)`；SVG 可输出 `mix-blend-mode` + `isolation: isolate`。
+
+  > **状态：已实现 mix 模式（2026-10-13）** —— 新增 `BlendMode`（16 种，对应 CSS `mix-blend-mode`），
+  > 挂在 `SceneNode` / `Layer` / `builder::Ctx`，经 `Renderer::push_blend` 由 vello（`peniko::BlendMode`）
+  > 与 SVG（`mix-blend-mode`）落地。**Porter-Duff（`Compose`）暂未暴露**（vello 已具备，属后续增量）。
 
 > P0-1 与 P0-2 共用"隔离层（layer/group compositing）"这一抽象，建议一并设计：
 > 给节点引入 `compositing` 语义（见 §3 Step 2）。
@@ -126,6 +133,9 @@
   - vello：`RenderContext::push_layer(clip, blend, opacity, mask, filter)`；
   - SVG：`<g opacity="…" style="mix-blend-mode:…; isolation:isolate" mask="url(#…)">`。
   这一步**比"改成树"重要得多** —— 同时修复 P0-1 的跨后端不一致，并解锁 blend / mask。
+
+  > **状态：opacity + blend 已完成（2026-10-13）**；**mask 未做** —— vello 的 `Mask` 是
+  > **与画布等尺寸的位图**（非路径），需先设计"路径 → mask 位图"的渲染与缓存，属后续单独增量。
 
 - **Step 3 · 遍历 API（可选）**
   提供 `visit` / `visit_mut`（深度优先 + 层级路径），供 fit / sketch / hit-test 复用；
