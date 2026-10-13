@@ -81,7 +81,10 @@ Canvas 风格**便捷构造**层：纯函数返回 `Element`，不引入可变�
 
 ### 3.3 填充 / 描边
 
-- `Fill`：纯色 / 线性渐变 / 径向渐变。
+- `Fill`：纯色 / 线性渐变 / 径向渐变 / **扫掠（conic）渐变** / 手绘（sketch）。
+- 渐变：`GradientStop`（offset + color）+ `GradientSpread`（`Pad`（默认）/ `Repeat` / `Reflect`）。
+  构造用 `LinearGradient::new` / `RadialGradient::new` / `SweepGradient::new`（或 `SweepGradient::full`），
+  再用 `with_spread` 改扩展模式。`SweepGradient::sample(angle)` 可直接取某角度的颜色（SVG 端用它生成扇区）。
 - `Stroke`：颜色 + 宽度 + `LineCap` / `LineJoin` + 虚线（`dash_array` / `dash_offset`）+ `miter_limit`。
 - `FillStrokeStyle`：组合填充 + 描边。
 

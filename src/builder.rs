@@ -402,6 +402,7 @@ impl Ctx {
             Some(Fill::Sketch(sf)) => return sf.color,
             Some(Fill::LinearGradient(g)) => first_stop_color(&g.stops),
             Some(Fill::RadialGradient(g)) => first_stop_color(&g.stops),
+            Some(Fill::SweepGradient(g)) => first_stop_color(&g.stops),
             None => None,
         };
         from_gradient.unwrap_or(self.font.color)
@@ -1423,14 +1424,14 @@ mod tests {
     /// 渐变可作为填充（Canvas 需要额外的 gradient 对象，这里是直接 Fill）。
     #[test]
     fn gradient_fill() {
-        let g = LinearGradient {
-            start: Point::new(0.0, 0.0),
-            end: Point::new(100.0, 0.0),
-            stops: vec![crate::scene::GradientStop {
+        let g = LinearGradient::new(
+            Point::new(0.0, 0.0),
+            Point::new(100.0, 0.0),
+            vec![crate::scene::GradientStop {
                 offset: 0.0,
                 color: Color::RED,
             }],
-        };
+        );
         let ctx = Ctx::new().with_fill_gradient(g.clone());
         match ctx
             .fill_rect(0.0, 0.0, 10.0, 10.0)

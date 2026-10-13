@@ -49,8 +49,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peniko's `Compose` (with the identity mix). `BlendMode::is_porter_duff()` distinguishes them.
   They are **raster-only**: SVG (and the browser) expose no per-element equivalent, so the SVG
   backend degrades them to `Normal` (rendered without a `mix-blend-mode` group).
+- **Sweep (conic) gradients** — `SweepGradient` / `Fill::SweepGradient`, the natural fit for
+  gauges, progress rings and pie sectors: the **angle** around a centre drives the ramp.
+  `SweepGradient::new(center, start_angle, end_angle, stops)` (radians, y-down, clockwise — the
+  same convention as `Element::Arc` / `Element::Pie`) and `SweepGradient::full(center, start, stops)`
+  for a whole turn; a partial range expresses a progress arc. Exact on the raster backend
+  (`peniko::GradientKind::Sweep`). SVG has no conic paint, so the SVG backend **approximates** it by
+  using the shape itself as a `<clipPath>` and painting `SWEEP_WEDGES` (120) solid wedges sampled
+  from the ramp (a whole turn is painted; `spread` decides what the angles outside the range look
+  like). Inside `<mask>` content a sweep degrades to the colour at the middle of its ramp.
+- **Gradient spread** — `GradientSpread::{Pad, Repeat, Reflect}` (SVG `spreadMethod`) on
+  `LinearGradient` / `RadialGradient` via `with_spread`, mapped to peniko `Extend` (raster) and
+  `spreadMethod` (SVG; `Pad` is the default, so it stays implicit and the common output is
+  byte-identical). New constructors `LinearGradient::new(start, end, stops)` /
+  `RadialGradient::new(center, radius, stops)`.
+- `scene::sample_stops` (ramp sampling: clamp outside, linear interpolation inside),
+  `SweepGradient::ramp_t` / `SweepGradient::sample` — the shared sampling used by the SVG wedge
+  approximation.
 
 ### Changed
+
+- **BREAKING:** `LinearGradient` / `RadialGradient` gained a `spread` field, so struct literals no
+  longer compile — construct with `LinearGradient::new(...)` / `RadialGradient::new(...)` (then
+  `.with_spread(...)`). `Fill` gained a `SweepGradient` variant, so exhaustive matches need a new
+  arm. Downstream adaptations: `liecharts` 1 literal, `liemermaid` 1 literal.
+
 
 - **BREAKING — container vs. drawing content is now modelled by `NodeKind`.** `SceneNode.element`
   became `SceneNode.kind`: `NodeKind::Draw(Element)` (a drawable leaf) or

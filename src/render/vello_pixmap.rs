@@ -25,8 +25,8 @@ use crate::geometry::{Color, Point, Rect, Transform};
 use crate::pixmap::Pixmap;
 use crate::render::Renderer;
 use crate::scene::{
-    BlendMode, Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene,
-    SketchFill, Stroke,
+    BlendMode, Fill, FillStrokeStyle, GradientSpread, GradientStop, LineCap, LineJoin,
+    LinearGradient, Scene, SketchFill, Stroke,
 };
 use crate::text::TextStyle;
 
@@ -387,7 +387,13 @@ impl Renderer for VelloPixmapRenderer {
             VPoint::new(gradient.end.x, gradient.end.y),
         ));
         let scene_transform = self.current_transform();
-        set_gradient_paint(&mut self.ctx, scene_transform, kind, &gradient.stops);
+        set_gradient_paint(
+            &mut self.ctx,
+            scene_transform,
+            kind,
+            &gradient.stops,
+            gradient.spread,
+        );
         self.ctx.fill_path(path);
         // 渐变 fill 设置了 user-space paint transform，绘制后复位。
         self.ctx.reset_paint_transform();
@@ -720,6 +726,16 @@ fn peniko_stops(stops: &[GradientStop]) -> Vec<vello_cpu::peniko::ColorStop> {
         .collect()
 }
 
+/// Map a lievisual spread mode to peniko's `Extend`.
+fn to_peniko_extend(spread: GradientSpread) -> vello_cpu::peniko::Extend {
+    use vello_cpu::peniko::Extend;
+    match spread {
+        GradientSpread::Pad => Extend::Pad,
+        GradientSpread::Repeat => Extend::Repeat,
+        GradientSpread::Reflect => Extend::Reflect,
+    }
+}
+
 /// Set a gradient paint on `ctx`, keeping gradient coordinates in user space by cancelling the
 /// scene transform (mirrors SVG `gradientUnits="userSpaceOnUse"`). A singular scene transform
 /// (det = 0) has no meaningful inverse, so identity is used (the gradient follows the shape).
@@ -728,15 +744,15 @@ fn set_gradient_paint(
     scene_transform: vello_cpu::kurbo::Affine,
     kind: vello_cpu::peniko::GradientKind,
     stops: &[GradientStop],
+    spread: GradientSpread,
 ) {
     use vello_cpu::peniko::{
-        ColorStops, Extend, Gradient, InterpolationAlphaSpace, color::ColorSpaceTag,
-        color::HueDirection,
+        ColorStops, Gradient, InterpolationAlphaSpace, color::ColorSpaceTag, color::HueDirection,
     };
     let stops_vec = peniko_stops(stops);
     let gradient = Gradient {
         kind,
-        extend: Extend::Pad,
+        extend: to_peniko_extend(spread),
         interpolation_cs: ColorSpaceTag::Srgb,
         hue_direction: HueDirection::default(),
         interpolation_alpha_space: InterpolationAlphaSpace::Premultiplied,
@@ -750,10 +766,13 @@ fn set_gradient_paint(
     ctx.set_paint(gradient);
 }
 
-/// Set `fill` as the paint on `ctx` (solid / linear / radial gradient), with user-space gradient
-/// coordinates. Sketch fills degrade to their pen colour (they are drawn as strokes elsewhere).
+/// Set `fill` as the paint on `ctx` (solid / linear / radial / sweep gradient), with user-space
+/// gradient coordinates. Sketch fills degrade to their pen colour (they are drawn as strokes
+/// elsewhere).
 fn apply_fill(ctx: &mut RenderContext, scene_transform: vello_cpu::kurbo::Affine, fill: &Fill) {
-    use vello_cpu::peniko::{GradientKind, LinearGradientPosition, RadialGradientPosition};
+    use vello_cpu::peniko::{
+        GradientKind, LinearGradientPosition, RadialGradientPosition, SweepGradientPosition,
+    };
     match fill {
         Fill::Solid(c) => ctx.set_paint(vello_color(c)),
         Fill::LinearGradient(g) => {
@@ -761,14 +780,22 @@ fn apply_fill(ctx: &mut RenderContext, scene_transform: vello_cpu::kurbo::Affine
                 VPoint::new(g.start.x, g.start.y),
                 VPoint::new(g.end.x, g.end.y),
             ));
-            set_gradient_paint(ctx, scene_transform, kind, &g.stops);
+            set_gradient_paint(ctx, scene_transform, kind, &g.stops, g.spread);
         }
         Fill::RadialGradient(g) => {
             let kind = GradientKind::Radial(RadialGradientPosition::new(
                 VPoint::new(g.center.x, g.center.y),
                 g.radius as f32,
             ));
-            set_gradient_paint(ctx, scene_transform, kind, &g.stops);
+            set_gradient_paint(ctx, scene_transform, kind, &g.stops, g.spread);
+        }
+        Fill::SweepGradient(g) => {
+            let kind = GradientKind::Sweep(SweepGradientPosition::new(
+                VPoint::new(g.center.x, g.center.y),
+                g.start_angle as f32,
+                g.end_angle as f32,
+            ));
+            set_gradient_paint(ctx, scene_transform, kind, &g.stops, g.spread);
         }
         Fill::Sketch(sf) => ctx.set_paint(vello_color(&sf.color)),
     }
@@ -915,8 +942,8 @@ mod tests {
     use super::*;
     use crate::geometry::{Color, Point, Rect, Transform};
     use crate::scene::{
-        BlendMode, Clip, Element, FillStrokeStyle, Filter, GradientStop, LinearGradient, Scene,
-        SceneNode, SketchFillStyle,
+        BlendMode, Clip, Element, FillStrokeStyle, Filter, GradientSpread, GradientStop,
+        LinearGradient, Scene, SceneNode, SketchFillStyle, SweepGradient,
     };
 
     /// 提取 pixmap 像素为 RGBA u8 数组（非预乘，用于比较）。
@@ -934,10 +961,10 @@ mod tests {
     /// 一个横跨矩形、左右颜色差异明显的线性渐变矩形。
     /// `rect` 为矩形坐标；`t` 为节点局部变换（None = 无）。
     fn gradient_rect_scene(rect: Rect, t: Option<Transform>) -> Scene {
-        let grad = LinearGradient {
-            start: Point::new(10.0, 10.0),
-            end: Point::new(90.0, 10.0),
-            stops: vec![
+        let grad = LinearGradient::new(
+            Point::new(10.0, 10.0),
+            Point::new(90.0, 10.0),
+            vec![
                 GradientStop {
                     offset: 0.0,
                     color: Color::rgb(0xff, 0x00, 0x00),
@@ -947,7 +974,7 @@ mod tests {
                     color: Color::rgb(0x00, 0x00, 0xff),
                 },
             ],
-        };
+        );
         let style = FillStrokeStyle {
             fill: Some(grad.into()),
             stroke: None,
@@ -1267,6 +1294,80 @@ mod tests {
         );
     }
 
+    /// sweep 渐变：颜色随**角度**变化（角度 0 → 起点色，角度 π → ramp 中点）。
+    #[test]
+    fn sweep_gradient_varies_with_angle() {
+        let mut scene = Scene::new(100.0, 100.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            FillStrokeStyle::fill_gradient(SweepGradient::full(
+                Point::new(50.0, 50.0),
+                0.0,
+                vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: Color::rgb(0xff, 0x00, 0x00),
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: Color::rgb(0x00, 0x00, 0xff),
+                    },
+                ],
+            )),
+        ));
+        let mut r = VelloPixmapRenderer::new(100, 100);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let right = pixel_at(&pix, 80, 50); // 角度 0 → 起点（红）
+        let left = pixel_at(&pix, 20, 50); // 角度 π → 中点（紫）
+        assert!(
+            right.0 > left.0 && left.2 > right.2,
+            "sweep 应随角度变化: right={right:?} left={left:?}"
+        );
+    }
+
+    /// spread：`Repeat` 按 ramp 长度平铺（同一相位颜色相同），`Pad` 则夹到端色。
+    #[test]
+    fn linear_gradient_spread_repeat_tiles() {
+        let make = |spread: GradientSpread| {
+            let mut scene = Scene::new(60.0, 20.0);
+            scene.push(Element::rect(
+                Rect::new(0.0, 0.0, 60.0, 20.0),
+                FillStrokeStyle::fill_gradient(
+                    LinearGradient::new(
+                        Point::new(0.0, 0.0),
+                        Point::new(20.0, 0.0),
+                        vec![
+                            GradientStop {
+                                offset: 0.0,
+                                color: Color::rgb(0x00, 0x00, 0x00),
+                            },
+                            GradientStop {
+                                offset: 1.0,
+                                color: Color::rgb(0xff, 0xff, 0xff),
+                            },
+                        ],
+                    )
+                    .with_spread(spread),
+                ),
+            ));
+            scene
+        };
+
+        let mut rr = VelloPixmapRenderer::new(60, 20);
+        let rep = rr.render_scene_to_pixmap(&make(GradientSpread::Repeat));
+        // x=5（t=0.25）与 x=25（t=1.25 → 回卷 0.25）落在同一相位。
+        let (a, b) = (pixel_at(&rep, 5, 10), pixel_at(&rep, 25, 10));
+        assert!(
+            a.0.abs_diff(b.0) <= 2 && a.0 < 200,
+            "Repeat 应平铺: {a:?} vs {b:?}"
+        );
+
+        let mut rp = VelloPixmapRenderer::new(60, 20);
+        let pad = rp.render_scene_to_pixmap(&make(GradientSpread::Pad));
+        let (c, d) = (pixel_at(&pad, 5, 10), pixel_at(&pad, 25, 10));
+        assert!(c.0 < 200 && d.0 > 240, "Pad 应夹到端色: {c:?} vs {d:?}");
+    }
+
     /// BlendMode：Multiply 把不透明灰 (128) 叠在不透明灰 (128) 上 ≈ 64（Normal 则为 128）。
     #[test]
     fn blend_mode_multiply_darkens() {
@@ -1338,10 +1439,10 @@ mod tests {
     #[test]
     fn gradient_mask_fades_alpha() {
         let mask = crate::scene::Mask::new(Clip::Rect(Rect::new(0.0, 0.0, 20.0, 20.0))).with_fill(
-            LinearGradient {
-                start: Point::new(0.0, 0.0),
-                end: Point::new(20.0, 0.0),
-                stops: vec![
+            LinearGradient::new(
+                Point::new(0.0, 0.0),
+                Point::new(20.0, 0.0),
+                vec![
                     GradientStop {
                         offset: 0.0,
                         color: Color::WHITE,
@@ -1351,7 +1452,7 @@ mod tests {
                         color: Color::rgba(0xff, 0xff, 0xff, 0),
                     },
                 ],
-            },
+            ),
         );
         let mut scene = Scene::new(20.0, 20.0);
         scene.push_node(

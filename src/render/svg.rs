@@ -18,10 +18,11 @@
 use crate::geometry::{Color, Point, Rect, Transform, Vec2};
 use crate::render::Renderer;
 use crate::scene::{
-    BlendMode, Fill, FillStrokeStyle, GradientStop, LineCap, LineJoin, LinearGradient, Scene,
-    SketchFill, SketchFillStyle, Stroke,
+    BlendMode, Fill, FillStrokeStyle, GradientSpread, GradientStop, LineCap, LineJoin,
+    LinearGradient, Scene, SketchFill, SketchFillStyle, Stroke, SweepGradient,
 };
 use crate::text::TextStyle;
+use kurbo::Shape as _;
 use std::fmt::Write;
 
 /// 根节点 `width` / `height` 的写法 —— 即 SVG **视口**尺寸的来源。
@@ -252,7 +253,7 @@ impl Renderer for SvgRenderer {
             rect.width(),
             rect.height()
         );
-        self.apply_fill_stroke(&mut el, style);
+        self.apply_fill_stroke(&mut el, style, rect);
         let _ = writeln!(el, "/>");
         self.buf.push_str(&el);
     }
@@ -264,7 +265,7 @@ impl Renderer for SvgRenderer {
             r#"<circle cx="{:.2}" cy="{:.2}" r="{:.2}" "#,
             center.x, center.y, radius
         );
-        self.apply_fill_stroke(&mut el, style);
+        self.apply_fill_stroke(&mut el, style, square_bbox(center, radius));
         let _ = writeln!(el, "/>");
         self.buf.push_str(&el);
     }
@@ -285,7 +286,12 @@ impl Renderer for SvgRenderer {
                 center.y
             );
         }
-        self.apply_fill_stroke(&mut el, style);
+        // A rotated ellipse is covered by the square around its larger semi-axis.
+        self.apply_fill_stroke(
+            &mut el,
+            style,
+            square_bbox(center, radii.x.abs().max(radii.y.abs())),
+        );
         let _ = writeln!(el, "/>");
         self.buf.push_str(&el);
     }
@@ -305,7 +311,7 @@ impl Renderer for SvgRenderer {
             r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="{:.2}" "#,
             x, y, w, h, radius
         );
-        self.apply_fill_stroke(&mut el, style);
+        self.apply_fill_stroke(&mut el, style, Rect::new(x, y, x + w, y + h));
         let _ = writeln!(el, "/>");
         self.buf.push_str(&el);
     }
@@ -341,7 +347,7 @@ impl Renderer for SvgRenderer {
             .collect();
         let mut el = String::new();
         let _ = write!(el, r#"<polygon points="{}" "#, pts.join(" "));
-        self.apply_fill_stroke(&mut el, style);
+        self.apply_fill_stroke(&mut el, style, points_bbox(points));
         let _ = writeln!(el, "/>");
         self.buf.push_str(&el);
     }
@@ -379,7 +385,7 @@ impl Renderer for SvgRenderer {
         );
         let mut el = String::new();
         let _ = write!(el, r#"<path d="{}" "#, d);
-        self.apply_fill_stroke(&mut el, style);
+        self.apply_fill_stroke(&mut el, style, square_bbox(center, radius));
         let _ = writeln!(el, "/>");
         self.buf.push_str(&el);
     }
@@ -394,7 +400,7 @@ impl Renderer for SvgRenderer {
         };
         let mut el = String::new();
         let _ = write!(el, r#"<path d="{}" "#, d);
-        self.apply_fill_stroke(&mut el, style);
+        self.apply_fill_stroke(&mut el, style, path.bounding_box());
         let _ = writeln!(el, "/>");
         self.buf.push_str(&el);
     }
@@ -408,24 +414,14 @@ impl Renderer for SvgRenderer {
         let mut p = path.clone();
         p.close_path();
         let d = p.to_svg();
-        let gid = self.next_gradient_id();
-        let defs = format!(
-            r#"<defs><linearGradient id="grad{}" gradientUnits="userSpaceOnUse" x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}">{}</linearGradient></defs>"#,
-            gid,
-            gradient.start.x,
-            gradient.start.y,
-            gradient.end.x,
-            gradient.end.y,
-            gradient.stops.iter().map(stop_svg).collect::<String>()
-        );
-        let fill = format!("url(#grad{})", gid);
+        let fill = self.linear_gradient_fill(gradient);
         let mut el = String::new();
-        let _ = write!(el, r#"<path d="{}" fill="{}" "#, d, fill);
+        let _ = write!(el, r#"<path d="{d}""#);
+        el.push_str(&fill);
         if let Some(s) = stroke {
             self.append_stroke(&mut el, s);
         }
         let _ = writeln!(el, "/>");
-        self.buf.push_str(&defs);
         self.buf.push_str(&el);
     }
 
@@ -801,80 +797,128 @@ impl Renderer for SvgRenderer {
 }
 
 impl SvgRenderer {
-    /// A `fill="…"` attribute for mask content, emitting gradient `<defs>` into `buf` as needed.
+    /// A ` fill="…"` attribute for mask content (same emission as a normal fill).
+    ///
+    /// Two deviations, both deliberate: a sketch fill uses its flat pen colour (a mask only reads
+    /// the paint's *alpha*, and a `<pattern>` would make the mask depend on the tile phase), and a
+    /// sweep gradient degrades to the colour at the middle of its ramp (wedge geometry is a poor
+    /// fit for a `<mask>`).
     fn mask_fill_attr(&mut self, fill: &Fill) -> String {
         match fill {
-            Fill::Solid(c) => color_attr_str("fill", *c),
             Fill::Sketch(sf) => color_attr_str("fill", sf.color),
-            Fill::LinearGradient(g) => {
-                let gid = self.next_gradient_id();
-                let defs = format!(
-                    r#"<defs><linearGradient id="grad{}" gradientUnits="userSpaceOnUse" x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}">{}</linearGradient></defs>"#,
-                    gid,
-                    g.start.x,
-                    g.start.y,
-                    g.end.x,
-                    g.end.y,
-                    g.stops.iter().map(stop_svg).collect::<String>()
-                );
-                self.buf.push_str(&defs);
-                format!(r#" fill="url(#grad{gid})""#)
+            Fill::SweepGradient(g) => {
+                color_attr_str("fill", g.sample(0.5 * (g.start_angle + g.end_angle)))
             }
-            Fill::RadialGradient(g) => {
-                let gid = self.next_gradient_id();
-                let defs = format!(
-                    r#"<defs><radialGradient id="grad{}" gradientUnits="userSpaceOnUse" cx="{:.2}" cy="{:.2}" r="{:.2}">{}</radialGradient></defs>"#,
-                    gid,
-                    g.center.x,
-                    g.center.y,
-                    g.radius,
-                    g.stops.iter().map(stop_svg).collect::<String>()
-                );
-                self.buf.push_str(&defs);
-                format!(r#" fill="url(#grad{gid})""#)
-            }
+            other => self.fill_attr(other),
         }
     }
 
-    fn apply_fill_stroke(&mut self, el: &mut String, style: &FillStrokeStyle) {
+    fn apply_fill_stroke(&mut self, el: &mut String, style: &FillStrokeStyle, bbox: Rect) {
         match &style.fill {
-            Some(Fill::Solid(c)) => el.push_str(&color_attr_str("fill", *c)),
-            Some(Fill::LinearGradient(g)) => {
-                let gid = self.next_gradient_id();
-                let defs = format!(
-                    r#"<defs><linearGradient id="grad{}" gradientUnits="userSpaceOnUse" x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}">{}</linearGradient></defs>"#,
-                    gid,
-                    g.start.x,
-                    g.start.y,
-                    g.end.x,
-                    g.end.y,
-                    g.stops.iter().map(stop_svg).collect::<String>()
-                );
-                self.buf.push_str(&defs);
-                write!(el, r#" fill="url(#grad{})""#, gid).unwrap();
+            // A sweep gradient has no SVG paint: bake it into clipped wedges *before* the shape and
+            // leave the shape itself unfilled (its stroke, if any, is drawn on top).
+            Some(Fill::SweepGradient(g)) => {
+                self.emit_sweep_overlay(el, g, bbox);
+                let _ = write!(el, r#" fill="none""#);
             }
-            Some(Fill::RadialGradient(g)) => {
-                let gid = self.next_gradient_id();
-                let defs = format!(
-                    r#"<defs><radialGradient id="grad{}" gradientUnits="userSpaceOnUse" cx="{:.2}" cy="{:.2}" r="{:.2}">{}</radialGradient></defs>"#,
-                    gid,
-                    g.center.x,
-                    g.center.y,
-                    g.radius,
-                    g.stops.iter().map(stop_svg).collect::<String>()
-                );
-                self.buf.push_str(&defs);
-                write!(el, r#" fill="url(#grad{})""#, gid).unwrap();
+            Some(fill) => el.push_str(&self.fill_attr(fill)),
+            None => {
+                let _ = write!(el, r#" fill="none""#);
             }
-            Some(Fill::Sketch(sf)) => {
-                let pid = self.sketch_pattern(sf);
-                let _ = write!(el, r#" fill="url(#sk{})""#, pid);
-            }
-            None => write!(el, r#" fill="none""#).unwrap(),
         }
         if let Some(s) = &style.stroke {
             self.append_stroke(el, s);
         }
+    }
+
+    /// Emit a `<linearGradient>` `<defs>` into `buf` and return the matching ` fill="url(#…)"`.
+    fn linear_gradient_fill(&mut self, g: &LinearGradient) -> String {
+        let gid = self.next_gradient_id();
+        let defs = format!(
+            r#"<defs><linearGradient id="grad{gid}" gradientUnits="userSpaceOnUse" x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}"{}>{}</linearGradient></defs>"#,
+            g.start.x,
+            g.start.y,
+            g.end.x,
+            g.end.y,
+            spread_attr(g.spread),
+            g.stops.iter().map(stop_svg).collect::<String>()
+        );
+        self.buf.push_str(&defs);
+        format!(r#" fill="url(#grad{gid})""#)
+    }
+
+    /// A ` fill="…"` attribute for `fill`, emitting gradient / pattern `<defs>` into `buf` as
+    /// needed.
+    ///
+    /// Sweep gradients are **not** painted here — SVG (and the browsers) have no conic paint. See
+    /// [`SvgRenderer::emit_sweep_overlay`], which bakes the ramp into clipped geometry and returns
+    /// `fill="none"`.
+    fn fill_attr(&mut self, fill: &Fill) -> String {
+        match fill {
+            Fill::Solid(c) => color_attr_str("fill", *c),
+            Fill::Sketch(sf) => {
+                let pid = self.sketch_pattern(sf);
+                format!(r#" fill="url(#sk{pid})""#)
+            }
+            Fill::LinearGradient(g) => self.linear_gradient_fill(g),
+            Fill::RadialGradient(g) => {
+                let gid = self.next_gradient_id();
+                let defs = format!(
+                    r#"<defs><radialGradient id="grad{gid}" gradientUnits="userSpaceOnUse" cx="{:.2}" cy="{:.2}" r="{:.2}"{}>{}</radialGradient></defs>"#,
+                    g.center.x,
+                    g.center.y,
+                    g.radius,
+                    spread_attr(g.spread),
+                    g.stops.iter().map(stop_svg).collect::<String>()
+                );
+                self.buf.push_str(&defs);
+                format!(r#" fill="url(#grad{gid})""#)
+            }
+            // Handled by the caller (see `apply_fill_stroke`).
+            Fill::SweepGradient(_) => r#" fill="none""#.to_string(),
+        }
+    }
+
+    /// Approximate a sweep (conic) gradient with clipped pie wedges.
+    ///
+    /// SVG has no conic paint, so the ramp is **baked into geometry**: the shape's own markup
+    /// (everything already written into `el`, minus the final `/>`) becomes a `<clipPath>`, and
+    /// `SWEEP_WEDGES` solid wedges — one per sector, sampled at the sector's mid angle with the
+    /// spread applied — are painted inside it. `bbox` is the shape's bounds and only has to give a
+    /// radius that reaches the farthest corner; the clip trims everything outside the shape.
+    fn emit_sweep_overlay(&mut self, shape: &str, g: &SweepGradient, bbox: Rect) {
+        let cid = self.next_gradient_id();
+        let _ = write!(
+            self.buf,
+            r#"<defs><clipPath id="swc{cid}">{shape}/></clipPath></defs><g clip-path="url(#swc{cid})">"#
+        );
+        let (cx, cy) = (g.center.x, g.center.y);
+        // Farthest bbox corner from the centre; never below 1pt so a degenerate box still paints.
+        let x0 = bbox.min_x().min(bbox.max_x());
+        let x1 = bbox.min_x().max(bbox.max_x());
+        let y0 = bbox.min_y().min(bbox.max_y());
+        let y1 = bbox.min_y().max(bbox.max_y());
+        let r = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+            .iter()
+            .map(|&(x, y)| (x - cx).hypot(y - cy))
+            .fold(1.0_f64, f64::max);
+        // A whole turn is always painted (the ramp's `spread` decides what the angles outside
+        // `start_angle..end_angle` look like), so `Pad` clamps and `Repeat` / `Reflect` tile.
+        let step = std::f64::consts::TAU / SWEEP_WEDGES as f64;
+        let large = u8::from(step > std::f64::consts::PI);
+        for i in 0..SWEEP_WEDGES {
+            let a0 = g.start_angle + step * i as f64;
+            let a1 = a0 + step;
+            let color = g.sample(0.5 * (a0 + a1));
+            let (p0x, p0y) = (cx + r * a0.cos(), cy + r * a0.sin());
+            let (p1x, p1y) = (cx + r * a1.cos(), cy + r * a1.sin());
+            let fill = color_attr_str("fill", color);
+            let _ = write!(
+                self.buf,
+                r#"<path d="M {cx:.2} {cy:.2} L {p0x:.2} {p0y:.2} A {r:.2} {r:.2} 0 {large} 1 {p1x:.2} {p1y:.2} Z"{fill}/>"#
+            );
+        }
+        self.buf.push_str("</g>");
     }
 
     /// Emit (or reuse) the `<pattern>` for a hand-drawn fill, returning its numeric id.
@@ -1110,6 +1154,41 @@ fn deco_keyword(underline: bool, strikethrough: bool) -> &'static str {
         (true, false) => "underline",
         (false, true) => "line-through",
         (true, true) => "underline line-through",
+    }
+}
+
+/// Number of wedges used to approximate a sweep gradient in SVG (2π/120 = 3° per step).
+const SWEEP_WEDGES: usize = 120;
+
+/// A square box of half-side `r` around `center` (bounds helper for sweep overlay radii).
+fn square_bbox(center: Point, r: f64) -> Rect {
+    Rect::new(center.x - r, center.y - r, center.x + r, center.y + r)
+}
+
+/// Bounding box of a point list (an empty list yields an empty box at the origin).
+fn points_bbox(points: &[Point]) -> Rect {
+    let Some(first) = points.first() else {
+        return Rect::ZERO;
+    };
+    points
+        .iter()
+        .fold(Rect::new(first.x, first.y, first.x, first.y), |r, p| {
+            Rect::new(
+                r.min_x().min(p.x),
+                r.min_y().min(p.y),
+                r.max_x().max(p.x),
+                r.max_y().max(p.y),
+            )
+        })
+}
+
+/// The ` spreadMethod` fragment for a gradient. `Pad` is the SVG default, so it is omitted
+/// (keeping the common case byte-identical to before).
+fn spread_attr(spread: GradientSpread) -> &'static str {
+    match spread {
+        GradientSpread::Pad => "",
+        GradientSpread::Repeat => r#" spreadMethod="repeat""#,
+        GradientSpread::Reflect => r#" spreadMethod="reflect""#,
     }
 }
 
@@ -1415,10 +1494,10 @@ mod tests {
     #[test]
     fn radial_gradient_and_dash() {
         let mut scene = Scene::new(100.0, 100.0);
-        let radial = crate::scene::RadialGradient {
-            center: Point::new(50.0, 50.0),
-            radius: 20.0,
-            stops: vec![
+        let radial = crate::scene::RadialGradient::new(
+            Point::new(50.0, 50.0),
+            20.0,
+            vec![
                 GradientStop {
                     offset: 0.0,
                     color: Color::WHITE,
@@ -1428,7 +1507,7 @@ mod tests {
                     color: Color::BLACK,
                 },
             ],
-        };
+        );
         scene.push(Element::circle(
             Point::new(50.0, 50.0),
             20.0,
@@ -1442,6 +1521,78 @@ mod tests {
         assert!(out.contains("gradientUnits=\"userSpaceOnUse\""));
         assert!(out.contains("stroke-dasharray=\"3.00,2.00\""));
         assert!(out.contains("stroke-miterlimit=\"10.00\""));
+    }
+
+    /// spread：`Pad` 是 SVG 默认值（不写属性），其余映射到同名的 `spreadMethod`。
+    #[test]
+    fn gradient_spread_maps_to_spread_method() {
+        let grad = LinearGradient::new(
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 0.0),
+            vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Color::WHITE,
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: Color::BLACK,
+                },
+            ],
+        );
+        let scene_with = |g: LinearGradient| {
+            let mut s = Scene::new(100.0, 100.0);
+            s.push(Element::rect(
+                Rect::new(0.0, 0.0, 100.0, 100.0),
+                FillStrokeStyle::fill_gradient(g),
+            ));
+            s
+        };
+        let pad = render(&scene_with(grad.clone()));
+        assert!(!pad.contains("spreadMethod"), "Pad 应省略属性: {pad}");
+        let reflect = render(&scene_with(
+            grad.clone().with_spread(GradientSpread::Reflect),
+        ));
+        assert!(reflect.contains(r#"spreadMethod="reflect""#));
+        let repeat = render(&scene_with(grad.with_spread(GradientSpread::Repeat)));
+        assert!(repeat.contains(r#"spreadMethod="repeat""#));
+    }
+
+    /// sweep：SVG 无 conic 画法，退化为「形状作 clipPath + 逐扇区实心填充」，形状自身不再填充。
+    #[test]
+    fn sweep_gradient_becomes_clipped_wedges() {
+        let mut scene = Scene::new(100.0, 100.0);
+        let g = crate::scene::SweepGradient::full(
+            Point::new(50.0, 50.0),
+            0.0,
+            vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Color::rgb(0xff, 0x00, 0x00),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: Color::rgb(0x00, 0x00, 0xff),
+                },
+            ],
+        );
+        scene.push(Element::circle(
+            Point::new(50.0, 50.0),
+            40.0,
+            FillStrokeStyle::fill_gradient(g),
+        ));
+        let out = render(&scene);
+        assert!(out.contains("<clipPath"), "应有裁切路径: {out}");
+        assert!(out.contains(r#"clip-path="url(#swc"#));
+        assert_eq!(
+            out.matches(r#"<path d="M 50.00 50.00 L"#).count(),
+            SWEEP_WEDGES,
+            "每个扇区一个 wedge"
+        );
+        assert!(
+            out.contains(r#"fill="none""#),
+            "形状自身不再填充（由 wedge 着色）"
+        );
     }
 
     #[test]
@@ -2018,10 +2169,10 @@ mod tests {
     #[test]
     fn gradient_stop_alpha_uses_stop_opacity() {
         let mut scene = Scene::new(100.0, 100.0);
-        let grad = LinearGradient {
-            start: Point::new(0.0, 0.0),
-            end: Point::new(100.0, 0.0),
-            stops: vec![
+        let grad = LinearGradient::new(
+            Point::new(0.0, 0.0),
+            Point::new(100.0, 0.0),
+            vec![
                 GradientStop {
                     offset: 0.0,
                     color: Color::rgba(0xff, 0x00, 0x00, 128),
@@ -2031,7 +2182,7 @@ mod tests {
                     color: Color::rgb(0x00, 0x00, 0xff),
                 },
             ],
-        };
+        );
         scene.push(Element::rect(
             Rect::new(0.0, 0.0, 100.0, 100.0),
             FillStrokeStyle {

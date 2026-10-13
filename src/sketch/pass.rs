@@ -377,6 +377,7 @@ fn fill_color(el: &Element) -> Option<Color> {
             Fill::Solid(c) => Some(*c),
             Fill::LinearGradient(g) => last_stop(&g.stops),
             Fill::RadialGradient(g) => last_stop(&g.stops),
+            Fill::SweepGradient(g) => last_stop(&g.stops),
             Fill::Sketch(_) => None,
         },
     }
@@ -842,10 +843,10 @@ mod tests {
 
     #[test]
     fn gradient_degrades_to_its_last_stop() {
-        let g = crate::scene::LinearGradient {
-            start: Point::new(0.0, 0.0),
-            end: Point::new(10.0, 0.0),
-            stops: vec![
+        let g = crate::scene::LinearGradient::new(
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 0.0),
+            vec![
                 crate::scene::GradientStop {
                     offset: 0.0,
                     color: Color::WHITE,
@@ -855,7 +856,7 @@ mod tests {
                     color: Color::rgb(0x12, 0x34, 0x56),
                 },
             ],
-        };
+        );
         let el = Element::GradientPath {
             path: BezPath::new(),
             gradient: g,

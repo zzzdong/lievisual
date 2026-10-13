@@ -84,6 +84,17 @@
 > **图像滤镜（blur / drop-shadow）已实现** —— `Filter::{blur, drop_shadow}`（`SceneNode.filter` /
 > `Renderer::push_filter`）；vello 用 `filter_effects` 单原语，SVG 用 `<filter>`（feGaussianBlur /
 > feDropShadow）。注意 vello filter 在**多线程**渲染下会 panic（lievisual 默认单线程，不受影响）。
+>
+> **渐变增强已实现（2026-10-13）**：
+> - **Sweep / Conic** —— `SweepGradient`（`Fill::SweepGradient`），角度制 ramp，仪表盘 / 进度环 /
+>   扇形刚需。vello 走 peniko `GradientKind::Sweep`（**精确**）；SVG 无 conic 画法，按
+>   「形状作 `<clipPath>` + `SWEEP_WEDGES`(120) 个实心扇区」**近似**（每个扇区取 ramp 中点色，
+>   `Pad` 时整圈都画、范围外夹紧）。`<mask>` 内容里退化为 ramp 中点色。
+> - **spread（Pad / Reflect / Repeat）** —— `GradientSpread` 挂到 `LinearGradient` /
+>   `RadialGradient`；vello → peniko `Extend`，SVG → `spreadMethod`（`Pad` 是默认值，不写属性）。
+> - **破坏性**：两个渐变结构体新增 `spread` 字段，字面量构造不再编译 —— 改用
+>   `LinearGradient::new(...)` / `RadialGradient::new(...)` + `with_spread(...)`；
+>   `Fill` 新增 `SweepGradient` 变体（穷举 `match` 需补分支）。
 
 ### P2 — 能力补齐
 
@@ -198,6 +209,6 @@
 
 1. **Step 1（容器收敛）** —— 纯重构、零行为变化，为后续铺路。
 2. **P0-1 + P0-2（隔离合成 + BlendMode）** —— 合并为同一个 `compositing` 设计；加跨后端一致性回归测试。
-3. **P1 低成本项**：Mask、Sweep 渐变、渐变 spread、ColorFilter。
+3. **P1 低成本项**：Mask ✅、Sweep 渐变 ✅、渐变 spread ✅、**ColorFilter（待办）**。
 4. **P1 中成本项**：drop-shadow / blur 滤镜。
 5. **P2 / P3** 按下游实际需求驱动，避免为"对齐 Skia"而过度设计。

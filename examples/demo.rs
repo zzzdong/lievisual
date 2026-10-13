@@ -43,10 +43,10 @@ fn build_scene() -> Scene {
     ));
 
     // ---------- shapes 层 ----------
-    let linear = LinearGradient {
-        start: Point::new(0.0, 0.0),
-        end: Point::new(200.0, 200.0),
-        stops: vec![
+    let linear = LinearGradient::new(
+        Point::new(0.0, 0.0),
+        Point::new(200.0, 200.0),
+        vec![
             GradientStop {
                 offset: 0.0,
                 color: Color::rgb(0x00, 0x66, 0xcc),
@@ -56,7 +56,7 @@ fn build_scene() -> Scene {
                 color: Color::rgb(0xcc, 0x00, 0x66),
             },
         ],
-    };
+    );
     let mut shapes = Layer::new("shapes").with_opacity(0.95);
 
     // 圆（描边）
@@ -82,10 +82,10 @@ fn build_scene() -> Scene {
         .with_name("ellipse-rotated"),
     );
     // 圆角矩形（径向渐变填充）
-    let radial = RadialGradient {
-        center: Point::new(300.0, 70.0),
-        radius: 60.0,
-        stops: vec![
+    let radial = RadialGradient::new(
+        Point::new(300.0, 70.0),
+        60.0,
+        vec![
             GradientStop {
                 offset: 0.0,
                 color: Color::rgb(0xff, 0xff, 0xff),
@@ -95,7 +95,7 @@ fn build_scene() -> Scene {
                 color: Color::rgb(0xee, 0x99, 0x00),
             },
         ],
-    };
+    );
     shapes.push(
         SceneNode::new(Element::rounded_rect(
             lievisual::Rect::new(270.0, 30.0, 120.0, 70.0),

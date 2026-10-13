@@ -965,6 +965,13 @@ pub enum Fill {
     Solid(Color),
     LinearGradient(LinearGradient),
     RadialGradient(RadialGradient),
+    /// Sweep (conic) gradient — see [`SweepGradient`].
+    ///
+    /// Exact on the raster backend (`peniko::GradientKind::Sweep`). SVG has no conic paint, so
+    /// [`SvgRenderer`](crate::render::SvgRenderer) approximates it by clipped wedges (see the
+    /// backend docs); strokes cannot carry a gradient at all in this IR, so a fill is the only
+    /// place a sweep appears.
+    SweepGradient(SweepGradient),
     /// Hand-drawn ("sketch") fill: a *style hint*, not literal geometry.
     ///
     /// The IR only records "this shape wants a hand-drawn fill"; each backend decides how to
@@ -1091,12 +1098,52 @@ impl From<RadialGradient> for Fill {
     }
 }
 
+impl From<SweepGradient> for Fill {
+    fn from(g: SweepGradient) -> Self {
+        Self::SweepGradient(g)
+    }
+}
+
+/// How a gradient behaves **outside** its base range (SVG `spreadMethod`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GradientSpread {
+    /// Clamp to the end colours (SVG `pad`; the default).
+    #[default]
+    Pad,
+    /// Repeat the ramp (SVG `repeat`).
+    Repeat,
+    /// Mirror the ramp (SVG `reflect`).
+    Reflect,
+}
+
 /// Linear gradient (shared by `GradientPath` and `Fill::LinearGradient`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearGradient {
     pub start: Point,
     pub end: Point,
     pub stops: Vec<GradientStop>,
+    /// Behaviour outside `start..end`; default [`GradientSpread::Pad`].
+    pub spread: GradientSpread,
+}
+
+impl LinearGradient {
+    /// Gradient from `start` to `end` (`spread = Pad`).
+    #[must_use]
+    pub fn new(start: Point, end: Point, stops: Vec<GradientStop>) -> Self {
+        Self {
+            start,
+            end,
+            stops,
+            spread: GradientSpread::Pad,
+        }
+    }
+
+    /// Set the spread mode (behaviour outside `start..end`).
+    #[must_use]
+    pub fn with_spread(mut self, spread: GradientSpread) -> Self {
+        self.spread = spread;
+        self
+    }
 }
 
 /// Radial gradient: spreads outward from `center` with `radius` as the outer circle radius.
@@ -1105,12 +1152,148 @@ pub struct RadialGradient {
     pub center: Point,
     pub radius: f64,
     pub stops: Vec<GradientStop>,
+    /// Behaviour outside `0..radius`; default [`GradientSpread::Pad`].
+    pub spread: GradientSpread,
+}
+
+impl RadialGradient {
+    /// Gradient centred on `center` with `radius` (`spread = Pad`).
+    #[must_use]
+    pub fn new(center: Point, radius: f64, stops: Vec<GradientStop>) -> Self {
+        Self {
+            center,
+            radius,
+            stops,
+            spread: GradientSpread::Pad,
+        }
+    }
+
+    /// Set the spread mode (behaviour outside `0..radius`).
+    #[must_use]
+    pub fn with_spread(mut self, spread: GradientSpread) -> Self {
+        self.spread = spread;
+        self
+    }
+}
+
+/// Sweep (conic) gradient: the **angle** around `center` drives the ramp — the natural fit for
+/// gauges, progress rings and pie sectors.
+///
+/// Angles are radians in the scene's y-down system, measured from the +x axis and increasing
+/// **clockwise** (the same convention as [`Element::Arc`] / [`Element::Pie`]). `start_angle` maps
+/// to ramp offset 0 and `end_angle` to offset 1, so a partial range expresses a progress arc; use
+/// [`SweepGradient::full`] for a whole turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SweepGradient {
+    pub center: Point,
+    /// Angle (radians) mapped to ramp offset 0.
+    pub start_angle: f64,
+    /// Angle (radians) mapped to ramp offset 1.
+    pub end_angle: f64,
+    pub stops: Vec<GradientStop>,
+    /// Behaviour outside `start_angle..end_angle`; default [`GradientSpread::Pad`].
+    pub spread: GradientSpread,
+}
+
+impl SweepGradient {
+    /// Sweep from `start_angle` to `end_angle` (`spread = Pad`).
+    #[must_use]
+    pub fn new(center: Point, start_angle: f64, end_angle: f64, stops: Vec<GradientStop>) -> Self {
+        Self {
+            center,
+            start_angle,
+            end_angle,
+            stops,
+            spread: GradientSpread::Pad,
+        }
+    }
+
+    /// A whole turn starting at `start_angle` (i.e. `start_angle .. start_angle + 2π`).
+    #[must_use]
+    pub fn full(center: Point, start_angle: f64, stops: Vec<GradientStop>) -> Self {
+        Self::new(
+            center,
+            start_angle,
+            start_angle + std::f64::consts::TAU,
+            stops,
+        )
+    }
+
+    /// Set the spread mode (behaviour outside `start_angle..end_angle`).
+    #[must_use]
+    pub fn with_spread(mut self, spread: GradientSpread) -> Self {
+        self.spread = spread;
+        self
+    }
+
+    /// Ramp position (`0..1`, or outside it for non-[`Pad`](GradientSpread::Pad) spreads) that
+    /// `angle` maps to.
+    #[must_use]
+    pub fn ramp_t(&self, angle: f64) -> f64 {
+        let span = self.end_angle - self.start_angle;
+        if span.abs() < 1e-12 {
+            return 0.0;
+        }
+        let raw = (angle - self.start_angle) / span;
+        match self.spread {
+            GradientSpread::Pad => raw.clamp(0.0, 1.0),
+            GradientSpread::Repeat => raw.rem_euclid(1.0),
+            GradientSpread::Reflect => {
+                let m = raw.rem_euclid(2.0);
+                if m > 1.0 { 2.0 - m } else { m }
+            }
+        }
+    }
+
+    /// Colour at `angle` (radians, scene convention), interpolating the stops.
+    #[must_use]
+    pub fn sample(&self, angle: f64) -> Color {
+        sample_stops(&self.stops, self.ramp_t(angle))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GradientStop {
     pub offset: f64,
     pub color: Color,
+}
+
+/// Sample a sorted stop ramp at `t`: clamp to the end colours outside the ramp, otherwise
+/// linearly interpolate between the two surrounding stops.
+///
+/// Interpolation is straight (non-premultiplied) RGBA, matching how the backends blend adjacent
+/// stops of a native gradient.
+#[must_use]
+pub fn sample_stops(stops: &[GradientStop], t: f64) -> Color {
+    let Some(first) = stops.first() else {
+        return Color::default();
+    };
+    if t <= first.offset {
+        return first.color;
+    }
+    for w in stops.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if t >= a.offset && t <= b.offset {
+            let span = b.offset - a.offset;
+            let u = if span > 1e-12 {
+                (t - a.offset) / span
+            } else {
+                1.0
+            };
+            return lerp_color(a.color, b.color, u);
+        }
+    }
+    stops.last().map_or(first.color, |s| s.color)
+}
+
+/// Straight (non-premultiplied) RGBA interpolation, rounded to the nearest byte.
+fn lerp_color(a: Color, b: Color, t: f64) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| {
+        let v = f64::from(x) + (f64::from(y) - f64::from(x)) * t;
+        v.round().clamp(0.0, 255.0) as u8
+    };
+    Color::rgba(ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b), ch(a.a, b.a))
 }
 
 /// Stroke definition.
@@ -1760,10 +1943,10 @@ mod tests {
 
         #[test]
         fn radial_gradient_into_fill() {
-            let g = RadialGradient {
-                center: Point::new(0.0, 0.0),
-                radius: 10.0,
-                stops: vec![
+            let g = RadialGradient::new(
+                Point::new(0.0, 0.0),
+                10.0,
+                vec![
                     GradientStop {
                         offset: 0.0,
                         color: Color::BLACK,
@@ -1773,7 +1956,7 @@ mod tests {
                         color: Color::WHITE,
                     },
                 ],
-            };
+            );
             let style = FillStrokeStyle::fill_gradient(g);
             assert!(matches!(style.fill, Some(Fill::RadialGradient(_))));
         }
@@ -2024,6 +2207,59 @@ mod tests {
 
             // 无名且全默认的 layer 不产生任何作用域。
             assert!(Layer::new("").scope().is_identity());
+        }
+    }
+
+    /// 渐变：stop 采样与 sweep 的 spread 语义。
+    mod gradient {
+        use super::*;
+
+        fn ramp() -> Vec<GradientStop> {
+            vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Color::rgb(0, 0, 0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: Color::rgb(255, 255, 255),
+                },
+            ]
+        }
+
+        #[test]
+        fn sample_stops_interpolates_and_clamps() {
+            let s = ramp();
+            assert_eq!(sample_stops(&s, -1.0).r, 0);
+            assert_eq!(sample_stops(&s, 0.0).r, 0);
+            assert_eq!(sample_stops(&s, 0.5).r, 128);
+            assert_eq!(sample_stops(&s, 2.0).r, 255);
+        }
+
+        #[test]
+        fn sweep_ramp_honours_spread() {
+            use std::f64::consts::{FRAC_PI_2, PI, TAU};
+            let s = ramp();
+            // 四分之一圈的 ramp。
+            let g = SweepGradient::new(Point::ZERO, 0.0, FRAC_PI_2, s.clone());
+            assert!(g.ramp_t(0.0).abs() < 1e-12);
+            assert!((g.ramp_t(FRAC_PI_2) - 1.0).abs() < 1e-12);
+            // Pad：范围外夹到端色。
+            assert!((g.ramp_t(PI) - 1.0).abs() < 1e-12);
+            assert_eq!(g.sample(0.0).r, 0);
+            assert_eq!(g.sample(PI).r, 255);
+
+            // Repeat：整周期回卷（π 恰好 2 个周期）。
+            let rep = g.clone().with_spread(GradientSpread::Repeat);
+            assert!(rep.ramp_t(PI).abs() < 1e-12);
+            // Reflect：2.5 个周期处折回 0.5。
+            let refl = g.with_spread(GradientSpread::Reflect);
+            assert!((refl.ramp_t(1.25 * PI) - 0.5).abs() < 1e-12);
+
+            // full() 覆盖整圈，且可直接作为 Fill。
+            let full = SweepGradient::full(Point::ZERO, 0.0, s);
+            assert!((full.end_angle - TAU).abs() < 1e-12);
+            assert!(matches!(Fill::from(full), Fill::SweepGradient(_)));
         }
     }
 
