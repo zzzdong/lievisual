@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     to `Normal`). The default node/layer scope pushes blend **outside** opacity, so a scope is first
     scaled by opacity and then blended with the backdrop.
   - vello maps to `peniko::BlendMode`; SVG emits `<g style="mix-blend-mode:…">`.
+- **`Mask`** — an alpha mask applied to a node's subtree at **compositing** time (not a
+  per-primitive clip), so non-binary masks work (a translucent solid or a gradient gives a smooth
+  fade): `Mask { shape: Clip, fill: Fill }` (`Mask::new` / `with_fill`), `SceneNode::mask` +
+  `SceneNode::with_mask`, `builder::Ctx::with_mask`, and `Renderer::push_mask` / `pop_mask`
+  (default no-op). The mask is the **outermost** compositing scope. vello rasterizes it into a
+  canvas-sized `vello_cpu::Mask` and uses `push_layer(mask)`; SVG emits
+  `<mask maskContentUnits="userSpaceOnUse">` + `mask="url(#…)"`.
 
 ### Fixed
 

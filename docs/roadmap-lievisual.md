@@ -75,6 +75,11 @@
 | 渐变 **spread**（Pad/Reflect/Repeat） | 目前 `paint_gradient` 硬编码 `Extend::Pad`、`ColorSpaceTag::Srgb` | 低 |
 | **ColorFilter**（灰度 / 色调 / 色彩矩阵） | 图表主题化常用 | 中 |
 
+> **状态（2026-10-13）**：**Mask 已实现** —— `Mask { shape: Clip, fill: Fill }`（`SceneNode.mask` /
+> `builder::Ctx::with_mask` / `Renderer::push_mask`），支持实心（含部分 alpha）与**渐变遮罩**；
+> vello 光栅化为画布尺寸 `vello_cpu::Mask` 后 `push_layer(mask)`，SVG 输出 `<mask>`。
+> **图像滤镜（blur / drop-shadow）未做** —— vello_cpu 的 filter 在多线程渲染下会 panic，需先评估。
+
 ### P2 — 能力补齐
 
 - 路径运算：bool ops（union/intersect/difference/xor）、path measure、offset/inset、**stroke-to-path**。

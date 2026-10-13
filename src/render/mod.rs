@@ -216,6 +216,12 @@ pub trait Renderer {
     /// Exit the scope established by [`Renderer::push_blend`].
     fn pop_blend(&mut self) {}
 
+    /// Enter a mask scope: everything drawn until [`Renderer::pop_mask`] has its composited alpha
+    /// multiplied by `mask`. Empty by default (backends without mask support ignore it).
+    fn push_mask(&mut self, _mask: &crate::scene::Mask) {}
+    /// Exit the scope established by [`Renderer::push_mask`].
+    fn pop_mask(&mut self) {}
+
     /// Enter a named scope (for a node with `name`; emits `id` on the SVG side).
     /// `name` is an `Option`: `None` means no `id` attribute is emitted.
     fn push_name(&mut self, _name: Option<&str>) {}
@@ -245,6 +251,11 @@ pub trait Renderer {
         if !node.blend_mode.is_normal() {
             self.push_blend(node.blend_mode);
         }
+        // Mask is outermost of the compositing scopes: it multiplies the final alpha of the
+        // (opacity- and blend-applied) subtree.
+        if let Some(mask) = &node.mask {
+            self.push_mask(mask);
+        }
         if node.name.is_some() {
             self.push_name(node.name.as_deref());
         }
@@ -254,6 +265,9 @@ pub trait Renderer {
     fn pop_node_scope(&mut self, node: &SceneNode) {
         if node.name.is_some() {
             self.pop_name();
+        }
+        if node.mask.is_some() {
+            self.pop_mask();
         }
         if !node.blend_mode.is_normal() {
             self.pop_blend();

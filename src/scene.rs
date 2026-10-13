@@ -458,6 +458,8 @@ pub struct SceneNode {
     /// Blend mode when compositing this node (and its Group subtree) onto the backdrop;
     /// default [`BlendMode::Normal`] (no blending).
     pub blend_mode: BlendMode,
+    /// Optional alpha mask applied to the subtree's composited result.
+    pub mask: Option<Mask>,
 }
 
 impl SceneNode {
@@ -471,6 +473,7 @@ impl SceneNode {
             visible: true,
             clip: None,
             blend_mode: BlendMode::Normal,
+            mask: None,
         }
     }
 
@@ -485,6 +488,7 @@ impl SceneNode {
             visible: true,
             clip: None,
             blend_mode: BlendMode::Normal,
+            mask: None,
         }
     }
 
@@ -594,6 +598,13 @@ impl SceneNode {
         self.blend_mode = mode;
         self
     }
+
+    /// Set an alpha mask applied to the subtree's composited result.
+    #[must_use]
+    pub fn with_mask(mut self, mask: Mask) -> Self {
+        self.mask = Some(mask);
+        self
+    }
 }
 
 /// Construct a node from an [`Element`] (default `z_index = 0`, no transform), enabling
@@ -692,6 +703,42 @@ impl Clip {
                 .to_path(0.1),
             Clip::Path(path) => path.clone(),
         }
+    }
+}
+
+/// An alpha mask applied to a node's subtree.
+///
+/// Unlike [`Clip`] (which clips each primitive at draw time), a mask multiplies the alpha of the
+/// subtree's **composited result**, so non-binary content is supported: the mask value is the
+/// paint's alpha where `shape` covers — a translucent solid gives a uniform partial mask, a
+/// gradient gives a smooth fade.
+///
+/// Backends: vello builds a canvas-sized mask bitmap and uses `RenderContext::push_layer`; SVG
+/// emits `<mask>` (`maskContentUnits="userSpaceOnUse"`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mask {
+    /// Shape the mask paint fills (reuses the [`Clip`] geometry vocabulary).
+    pub shape: Clip,
+    /// Paint whose alpha becomes the mask value.
+    pub fill: Fill,
+}
+
+impl Mask {
+    /// Opaque mask covering `shape` (equal to a [`Clip`], but applied at composite time).
+    #[must_use]
+    pub fn new(shape: Clip) -> Self {
+        Self {
+            shape,
+            fill: Fill::Solid(Color::WHITE),
+        }
+    }
+
+    /// Set the mask paint: its alpha is the mask value (`impl Into<Fill>` accepts a [`Color`],
+    /// [`LinearGradient`] or [`RadialGradient`]).
+    #[must_use]
+    pub fn with_fill(mut self, fill: impl Into<Fill>) -> Self {
+        self.fill = fill.into();
+        self
     }
 }
 

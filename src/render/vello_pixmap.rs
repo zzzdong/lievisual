@@ -190,7 +190,7 @@ impl VelloPixmapRenderer {
     /// isolated compositing layer (see [`Renderer::push_opacity`]) so a scope's sub-shapes
     /// composite before the alpha is scaled — matching the SVG backend's `<g opacity>`.
     fn to_vello(&self, color: &Color) -> AlphaColor<vello_cpu::color::Srgb> {
-        AlphaColor::from_rgba8(color.r, color.g, color.b, color.a)
+        vello_color(color)
     }
 
     fn kurbo_stroke(stroke: &Stroke) -> KurboStroke {
@@ -219,38 +219,6 @@ impl VelloPixmapRenderer {
         k
     }
 
-    /// Build peniko color stops carrying the current opacity.
-    fn peniko_stops(&self, stops: &[GradientStop]) -> Vec<vello_cpu::peniko::ColorStop> {
-        stops
-            .iter()
-            .map(|s| vello_cpu::peniko::ColorStop {
-                offset: s.offset as f32,
-                color: vello_cpu::peniko::color::DynamicColor::from_alpha_color(
-                    self.to_vello(&s.color),
-                ),
-            })
-            .collect()
-    }
-
-    /// Set a gradient fill (keeping user-space coordinates, cancelling node/layer transforms).
-    fn paint_gradient(&mut self, kind: vello_cpu::peniko::GradientKind, stops: &[GradientStop]) {
-        use vello_cpu::peniko::{
-            ColorStops, Extend, Gradient, InterpolationAlphaSpace, color::ColorSpaceTag,
-            color::HueDirection,
-        };
-        let stops_vec = self.peniko_stops(stops);
-        let gradient = Gradient {
-            kind,
-            extend: Extend::Pad,
-            interpolation_cs: ColorSpaceTag::Srgb,
-            hue_direction: HueDirection::default(),
-            interpolation_alpha_space: InterpolationAlphaSpace::Premultiplied,
-            stops: ColorStops::from(stops_vec.as_slice()),
-        };
-        self.set_user_space_paint();
-        self.ctx.set_paint(gradient);
-    }
-
     /// The currently active scene (composed) transform: the top of the stack, or identity when
     /// no transform is applied.
     fn current_transform(&self) -> vello_cpu::kurbo::Affine {
@@ -260,45 +228,32 @@ impl VelloPixmapRenderer {
             .unwrap_or(vello_cpu::kurbo::Affine::IDENTITY)
     }
 
-    /// Set the paint transform so gradient coordinates stay in user (root) space, cancelling the
-    /// `set_transform` already applied by nodes/layers (consistent with SVG
-    /// `gradientUnits="userSpaceOnUse"`). Under a singular transform (det=0) the inverse is
-    /// meaningless, so we fall back to the identity matrix (gradient follows the shape).
-    fn set_user_space_paint(&mut self) {
-        use vello_cpu::kurbo::Affine;
-        let scene = self.current_transform();
-        if scene.determinant().abs() > 1e-12 {
-            self.ctx.set_paint_transform(scene.inverse());
-        } else {
-            self.ctx.set_paint_transform(Affine::IDENTITY);
-        }
-    }
-
     /// Set the current brush according to `Fill` (Solid / linear / radial gradient).
     ///
     /// [`Fill::Sketch`] is *not* painted here — a hand-drawn fill is pen strokes, not a brush;
     /// it goes through [`Self::paint_sketch_fill`]. This arm only exists so an accidental direct
     /// call degrades to the pen colour instead of doing nothing.
     fn set_fill(&mut self, fill: &Fill) {
-        use vello_cpu::peniko::{GradientKind, LinearGradientPosition, RadialGradientPosition};
-        match fill {
-            Fill::Solid(c) => self.ctx.set_paint(self.to_vello(c)),
-            Fill::LinearGradient(g) => {
-                let kind = GradientKind::Linear(LinearGradientPosition::new(
-                    VPoint::new(g.start.x, g.start.y),
-                    VPoint::new(g.end.x, g.end.y),
-                ));
-                self.paint_gradient(kind, &g.stops);
-            }
-            Fill::RadialGradient(g) => {
-                let kind = GradientKind::Radial(RadialGradientPosition::new(
-                    VPoint::new(g.center.x, g.center.y),
-                    g.radius as f32,
-                ));
-                self.paint_gradient(kind, &g.stops);
-            }
-            Fill::Sketch(sf) => self.ctx.set_paint(self.to_vello(&sf.color)),
-        }
+        let scene_transform = self.current_transform();
+        apply_fill(&mut self.ctx, scene_transform, fill);
+    }
+
+    /// Rasterize a mask into a canvas-sized [`vello_cpu::Mask`] (device space).
+    ///
+    /// The mask shape/paint are drawn with the node's current transform, so the shape is in the
+    /// node's local coordinates — the same space the masked content is drawn in. A new bitmap is
+    /// built per masked node (masks are comparatively rare; caching is a possible optimisation).
+    fn build_mask(&self, mask: &crate::scene::Mask) -> vello_cpu::Mask {
+        let (w, h) = (self.ctx.width(), self.ctx.height());
+        let scene_transform = self.current_transform();
+        let mut ctx = RenderContext::new(w, h);
+        ctx.set_transform(scene_transform);
+        apply_fill(&mut ctx, scene_transform, &mask.fill);
+        ctx.fill_path(&mask.shape.to_bezpath());
+        let mut pm = VelloPixmap::new(w, h);
+        let mut resources = Resources::new();
+        ctx.render(&mut pm, &mut resources);
+        vello_cpu::Mask::new_alpha(&pm)
     }
 
     /// Unified drawing: fill (any type) + optional stroke (including dashes).
@@ -431,7 +386,8 @@ impl Renderer for VelloPixmapRenderer {
             VPoint::new(gradient.start.x, gradient.start.y),
             VPoint::new(gradient.end.x, gradient.end.y),
         ));
-        self.paint_gradient(kind, &gradient.stops);
+        let scene_transform = self.current_transform();
+        set_gradient_paint(&mut self.ctx, scene_transform, kind, &gradient.stops);
         self.ctx.fill_path(path);
         // 渐变 fill 设置了 user-space paint transform，绘制后复位。
         self.ctx.reset_paint_transform();
@@ -701,6 +657,16 @@ impl Renderer for VelloPixmapRenderer {
         self.ctx.pop_layer();
     }
 
+    fn push_mask(&mut self, mask: &crate::scene::Mask) {
+        // The mask is a canvas-sized alpha bitmap applied when compositing the layer.
+        let m = self.build_mask(mask);
+        self.ctx.push_layer(None, None, None, Some(m), None);
+    }
+
+    fn pop_mask(&mut self) {
+        self.ctx.pop_layer();
+    }
+
     fn push_clip(&mut self, clip: &crate::scene::Clip) {
         // vello_cpu 的 clip 路径按当前 transform（clip_path_transform）应用；
         // 我们 push_transform 已设置 ctx transform，故 clip 与节点变换一致复合。
@@ -725,6 +691,77 @@ fn unpremultiply(c: u8, a: u8) -> u8 {
         c
     } else {
         (((c as u32 * 255) + (a as u32 / 2)) / a as u32).min(255) as u8
+    }
+}
+
+/// Convert a lievisual color to a vello color (channels used as-is; node / layer opacity is a
+/// separate compositing-layer concern, never baked into the color).
+fn vello_color(c: &Color) -> AlphaColor<vello_cpu::color::Srgb> {
+    AlphaColor::from_rgba8(c.r, c.g, c.b, c.a)
+}
+
+/// Build peniko color stops from lievisual gradient stops.
+fn peniko_stops(stops: &[GradientStop]) -> Vec<vello_cpu::peniko::ColorStop> {
+    stops
+        .iter()
+        .map(|s| vello_cpu::peniko::ColorStop {
+            offset: s.offset as f32,
+            color: vello_cpu::peniko::color::DynamicColor::from_alpha_color(vello_color(&s.color)),
+        })
+        .collect()
+}
+
+/// Set a gradient paint on `ctx`, keeping gradient coordinates in user space by cancelling the
+/// scene transform (mirrors SVG `gradientUnits="userSpaceOnUse"`). A singular scene transform
+/// (det = 0) has no meaningful inverse, so identity is used (the gradient follows the shape).
+fn set_gradient_paint(
+    ctx: &mut RenderContext,
+    scene_transform: vello_cpu::kurbo::Affine,
+    kind: vello_cpu::peniko::GradientKind,
+    stops: &[GradientStop],
+) {
+    use vello_cpu::peniko::{
+        ColorStops, Extend, Gradient, InterpolationAlphaSpace, color::ColorSpaceTag,
+        color::HueDirection,
+    };
+    let stops_vec = peniko_stops(stops);
+    let gradient = Gradient {
+        kind,
+        extend: Extend::Pad,
+        interpolation_cs: ColorSpaceTag::Srgb,
+        hue_direction: HueDirection::default(),
+        interpolation_alpha_space: InterpolationAlphaSpace::Premultiplied,
+        stops: ColorStops::from(stops_vec.as_slice()),
+    };
+    if scene_transform.determinant().abs() > 1e-12 {
+        ctx.set_paint_transform(scene_transform.inverse());
+    } else {
+        ctx.set_paint_transform(vello_cpu::kurbo::Affine::IDENTITY);
+    }
+    ctx.set_paint(gradient);
+}
+
+/// Set `fill` as the paint on `ctx` (solid / linear / radial gradient), with user-space gradient
+/// coordinates. Sketch fills degrade to their pen colour (they are drawn as strokes elsewhere).
+fn apply_fill(ctx: &mut RenderContext, scene_transform: vello_cpu::kurbo::Affine, fill: &Fill) {
+    use vello_cpu::peniko::{GradientKind, LinearGradientPosition, RadialGradientPosition};
+    match fill {
+        Fill::Solid(c) => ctx.set_paint(vello_color(c)),
+        Fill::LinearGradient(g) => {
+            let kind = GradientKind::Linear(LinearGradientPosition::new(
+                VPoint::new(g.start.x, g.start.y),
+                VPoint::new(g.end.x, g.end.y),
+            ));
+            set_gradient_paint(ctx, scene_transform, kind, &g.stops);
+        }
+        Fill::RadialGradient(g) => {
+            let kind = GradientKind::Radial(RadialGradientPosition::new(
+                VPoint::new(g.center.x, g.center.y),
+                g.radius as f32,
+            ));
+            set_gradient_paint(ctx, scene_transform, kind, &g.stops);
+        }
+        Fill::Sketch(sf) => ctx.set_paint(vello_color(&sf.color)),
     }
 }
 
@@ -828,7 +865,7 @@ mod tests {
     use super::*;
     use crate::geometry::{Color, Point, Rect, Transform};
     use crate::scene::{
-        BlendMode, Element, FillStrokeStyle, GradientStop, LinearGradient, Scene, SceneNode,
+        BlendMode, Clip, Element, FillStrokeStyle, GradientStop, LinearGradient, Scene, SceneNode,
         SketchFillStyle,
     };
 
@@ -1203,6 +1240,47 @@ mod tests {
         assert!(
             (60..=68).contains(&pr) && (60..=68).contains(&pg) && (60..=68).contains(&pb),
             "multiply 应使 128 灰变暗到 ~64, got ({pr},{pg},{pb})"
+        );
+    }
+
+    /// Mask：线性渐变遮罩（左不透明 → 右透明）在不透明红矩形上产生平滑淡出。
+    #[test]
+    fn gradient_mask_fades_alpha() {
+        let mask = crate::scene::Mask::new(Clip::Rect(Rect::new(0.0, 0.0, 20.0, 20.0))).with_fill(
+            LinearGradient {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(20.0, 0.0),
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: Color::WHITE,
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: Color::rgba(0xff, 0xff, 0xff, 0),
+                    },
+                ],
+            },
+        );
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+            ))
+            .with_mask(mask),
+        );
+        let mut r = VelloPixmapRenderer::new(20, 20).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let (lr, lg, lb, _) = pixel_at(&pix, 2, 10);
+        let (rr, rg, rb, _) = pixel_at(&pix, 18, 10);
+        assert!(
+            lr > 200 && lg < 90 && lb < 90,
+            "左侧应保留红色, got ({lr},{lg},{lb})"
+        );
+        assert!(
+            rr > 200 && rg > 200 && rb > 200,
+            "右侧应被遮罩淡出为白, got ({rr},{rg},{rb})"
         );
     }
 

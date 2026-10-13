@@ -67,7 +67,7 @@
 
 use crate::geometry::{Color, Point, Rect, Size, Transform, Vec2};
 use crate::scene::{
-    BlendMode, Clip, Element, Fill, FillStrokeStyle, Layer, SceneImage, SceneNode, Stroke,
+    BlendMode, Clip, Element, Fill, FillStrokeStyle, Layer, Mask, SceneImage, SceneNode, Stroke,
 };
 use crate::text::{RichSpan, TextMeasure, TextStyle, measure_text};
 use kurbo::{BezPath, Shape};
@@ -104,6 +104,8 @@ pub struct Ctx {
     /// Blend mode applied to every produced node (compositing onto the backdrop);
     /// default [`BlendMode::Normal`].
     pub blend_mode: BlendMode,
+    /// Alpha mask applied to every produced node's subtree.
+    pub mask: Option<Mask>,
     /// Optional name / id attached to every produced node (debugging, hit-testing, SVG `id`).
     pub name: Option<String>,
     /// z-order attached to every produced node.
@@ -120,6 +122,7 @@ impl Default for Ctx {
             alpha: 1.0,
             clip: None,
             blend_mode: BlendMode::Normal,
+            mask: None,
             name: None,
             z_index: 0,
         }
@@ -346,6 +349,13 @@ impl Ctx {
         self
     }
 
+    /// Apply an alpha mask to every produced node's subtree.
+    #[must_use]
+    pub fn with_mask(mut self, mask: Mask) -> Self {
+        self.mask = Some(mask);
+        self
+    }
+
     /// Attach a name / id to every produced node (debugging, hit-testing, SVG `id`).
     #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
@@ -415,6 +425,9 @@ impl Ctx {
         }
         if !self.blend_mode.is_normal() {
             n = n.with_blend_mode(self.blend_mode);
+        }
+        if let Some(m) = &self.mask {
+            n = n.with_mask(m.clone());
         }
         if let Some(name) = &self.name {
             n = n.with_name(name.clone());

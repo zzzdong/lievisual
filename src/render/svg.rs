@@ -53,6 +53,7 @@ pub struct SvgRenderer {
     background: Option<Color>,
     gradient_id: usize,
     clip_id: usize,
+    mask_id: usize,
     /// Hand-drawn fill patterns already emitted: index = `sk{n}` id, deduplicated by value so
     /// a hundred same-coloured cells share one `<pattern>`.
     patterns: Vec<SketchFill>,
@@ -79,6 +80,7 @@ impl SvgRenderer {
             background: None,
             gradient_id: 0,
             clip_id: 0,
+            mask_id: 0,
             patterns: Vec::new(),
             title: None,
             description: None,
@@ -660,6 +662,25 @@ impl Renderer for SvgRenderer {
         self.buf.push_str("</g>");
     }
 
+    fn push_mask(&mut self, mask: &crate::scene::Mask) {
+        let id = self.mask_id;
+        self.mask_id += 1;
+        let d = mask.shape.to_bezpath().to_svg();
+        // `mask_fill_attr` may push gradient `<defs>` into `buf`; `d` is already materialised, so
+        // the mask `<defs>` below is emitted after them (SVG allows multiple `<defs>`).
+        let fill_attr = self.mask_fill_attr(&mask.fill);
+        let defs = format!(
+            r#"<defs><mask id="mask{id}" maskContentUnits="userSpaceOnUse"><path d="{d}"{fill_attr}/></mask></defs>"#
+        );
+        self.buf.push_str(&defs);
+        let m = format!(r#"<g mask="url(#mask{id})">"#);
+        self.buf.push_str(&m);
+    }
+
+    fn pop_mask(&mut self) {
+        self.buf.push_str("</g>");
+    }
+
     fn push_name(&mut self, name: Option<&str>) {
         match name {
             Some(id) => self
@@ -736,6 +757,41 @@ impl Renderer for SvgRenderer {
 }
 
 impl SvgRenderer {
+    /// A `fill="…"` attribute for mask content, emitting gradient `<defs>` into `buf` as needed.
+    fn mask_fill_attr(&mut self, fill: &Fill) -> String {
+        match fill {
+            Fill::Solid(c) => color_attr_str("fill", *c),
+            Fill::Sketch(sf) => color_attr_str("fill", sf.color),
+            Fill::LinearGradient(g) => {
+                let gid = self.next_gradient_id();
+                let defs = format!(
+                    r#"<defs><linearGradient id="grad{}" gradientUnits="userSpaceOnUse" x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}">{}</linearGradient></defs>"#,
+                    gid,
+                    g.start.x,
+                    g.start.y,
+                    g.end.x,
+                    g.end.y,
+                    g.stops.iter().map(stop_svg).collect::<String>()
+                );
+                self.buf.push_str(&defs);
+                format!(r#" fill="url(#grad{gid})""#)
+            }
+            Fill::RadialGradient(g) => {
+                let gid = self.next_gradient_id();
+                let defs = format!(
+                    r#"<defs><radialGradient id="grad{}" gradientUnits="userSpaceOnUse" cx="{:.2}" cy="{:.2}" r="{:.2}">{}</radialGradient></defs>"#,
+                    gid,
+                    g.center.x,
+                    g.center.y,
+                    g.radius,
+                    g.stops.iter().map(stop_svg).collect::<String>()
+                );
+                self.buf.push_str(&defs);
+                format!(r#" fill="url(#grad{gid})""#)
+            }
+        }
+    }
+
     fn apply_fill_stroke(&mut self, el: &mut String, style: &FillStrokeStyle) {
         match &style.fill {
             Some(Fill::Solid(c)) => el.push_str(&color_attr_str("fill", *c)),
@@ -1162,6 +1218,24 @@ mod tests {
             FillStrokeStyle::fill(Color::BLACK),
         ));
         assert!(!render(&plain).contains("mix-blend-mode"));
+    }
+
+    /// Mask 输出 `<mask>` 定义 + `mask="url(#mask0)"`。
+    #[test]
+    fn mask_emits_svg_mask() {
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+            ))
+            .with_mask(crate::scene::Mask::new(crate::scene::Clip::Rect(
+                Rect::new(0.0, 0.0, 10.0, 20.0),
+            ))),
+        );
+        let out = render(&scene);
+        assert!(out.contains(r#"<mask id="mask0""#), "{out}");
+        assert!(out.contains(r#"mask="url(#mask0)""#), "{out}");
     }
 
     #[test]

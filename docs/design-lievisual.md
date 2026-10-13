@@ -12,10 +12,11 @@ SVG / vello_cpu 栅格 / GPU（规划中）/ PDF·DOCX（经 liepress）。
 2. **层级与节点属性提升**。`z_index` / `Transform` / `clip` / `opacity` / `blend_mode` / `name` /
    `visible` 是 `SceneNode`（及 `Layer`）的字段，而非每个图元重复携带。其中 `transform` 对 `Group`
    子树递归复合；`clip` 将整棵子树限制在形状内（SVG `<clipPath>` / vello `push_clip_path`）；
-   `visible = false` 整棵子树跳过。**`opacity` 与 `blend_mode` 是隔离合成语义**：作用于该作用域的
-   *合成结果*（离屏层），跨后端一致 —— SVG 端 `<g opacity>` / `<g style="mix-blend-mode">`，
-   vello 端 `RenderContext::push_layer`。后端在默认遍历 `render_scene_ordered` 里统一处理排序、
-   节点属性、`Group` 递归与局部变换。
+   `visible = false` 整棵子树跳过。**`opacity` / `blend_mode` / `mask` 是隔离合成语义**：作用于该
+   作用域的 *合成结果*（离屏层），跨后端一致 —— SVG 端 `<g opacity>` /
+   `<g style="mix-blend-mode">` / `<mask>`，vello 端 `RenderContext::push_layer(opacity / blend /
+   mask)`。三者中 `mask` 最外层（乘在最终 alpha 上）。后端在默认遍历 `render_scene_ordered` 里
+   统一处理排序、节点属性、`Group` 递归与局部变换。
    **容器是一等概念**：`Element::Group` 的节点即"容器"，通过 `SceneNode::is_group` /
    `children` / `children_mut`（以及 `visit` / `visit_mut`）访问，避免各处直接 `match
    Element::Group`；渲染用统一的 `Renderer::render_children` 递归（默认层 / `Layer` / `Group`

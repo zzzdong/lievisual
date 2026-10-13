@@ -70,7 +70,7 @@ Canvas 风格**便捷构造**层：纯函数返回 `Element`，不引入可变�
 ### 3.1 `Scene` / `SceneNode` / `Layer`
 
 - `Scene::new(w, h)`：可携带有序 `Layer`（从底到顶）；层内节点按 `z_index` 稳定排序；`nodes` 为默认层（最底）。
-- `SceneNode`：`Element` + 节点属性 `z_index` / `transform` / `opacity` / `name` / `visible` / `clip` / `blend_mode`（Group 子树递归生效）；`opacity` 与 `blend_mode` 为隔离合成（离屏层），跨后端一致。
+- `SceneNode`：`Element` + 节点属性 `z_index` / `transform` / `opacity` / `name` / `visible` / `clip` / `blend_mode` / `mask`（Group 子树递归生效）；`opacity` / `blend_mode` / `mask` 为隔离合成（离屏层），跨后端一致。
 - `Scene::push(node)`：`Element: From<Element> → SceneNode` 自动转换。
 
 ### 3.2 `Element` 图元枚举
