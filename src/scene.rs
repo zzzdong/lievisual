@@ -459,6 +459,8 @@ pub struct NodeScope<'a> {
     pub blend_mode: BlendMode,
     /// Alpha mask applied to the subtree's composited result.
     pub mask: Option<&'a Mask>,
+    /// Colour matrix baked into every paint of the subtree.
+    pub color_matrix: Option<ColorMatrix>,
     /// Optional scope name (the SVG backend emits it as an `id`).
     pub name: Option<&'a str>,
 }
@@ -473,6 +475,7 @@ impl NodeScope<'_> {
             && self.opacity == 1.0
             && self.blend_mode.is_normal()
             && self.mask.is_none()
+            && self.color_matrix.is_none()
             && self.name.is_none()
     }
 }
@@ -488,6 +491,7 @@ impl SceneNode {
             opacity: self.opacity,
             blend_mode: self.blend_mode,
             mask: self.mask.as_ref(),
+            color_matrix: self.color_matrix,
             name: self.name.as_deref(),
         }
     }
@@ -495,7 +499,7 @@ impl SceneNode {
 
 impl Layer {
     /// This layer's compositing scope. A layer is a named root group, so it carries no
-    /// clip / filter / mask.
+    /// clip / filter / mask / colour matrix.
     #[must_use]
     pub fn scope(&self) -> NodeScope<'_> {
         NodeScope {
@@ -505,6 +509,7 @@ impl Layer {
             opacity: self.opacity,
             blend_mode: self.blend_mode,
             mask: None,
+            color_matrix: None,
             name: (!self.name.is_empty()).then_some(self.name.as_str()),
         }
     }
@@ -558,6 +563,13 @@ pub struct SceneNode {
     pub mask: Option<Mask>,
     /// Optional post-processing filter applied to the subtree (blur / drop shadow).
     pub filter: Option<Filter>,
+    /// Optional colour matrix baked into every paint of this subtree (see [`ColorMatrix`]).
+    ///
+    /// Applied to solid fills / strokes / text and to every gradient stop when the paint is
+    /// emitted, on **both** backends — so the two agree exactly, at zero render cost. Images and
+    /// scope machinery (background / mask paint / a `Filter`'s colour) are unaffected; see
+    /// [`ColorMatrix`] for the rationale.
+    pub color_matrix: Option<ColorMatrix>,
 }
 
 impl SceneNode {
@@ -574,6 +586,7 @@ impl SceneNode {
             blend_mode: BlendMode::Normal,
             mask: None,
             filter: None,
+            color_matrix: None,
         }
     }
 
@@ -735,6 +748,13 @@ impl SceneNode {
     #[must_use]
     pub fn with_filter(mut self, filter: Filter) -> Self {
         self.filter = Some(filter);
+        self
+    }
+
+    /// Set a colour matrix baked into every paint of the subtree (see [`ColorMatrix`]).
+    #[must_use]
+    pub fn with_color_matrix(mut self, matrix: ColorMatrix) -> Self {
+        self.color_matrix = Some(matrix);
         self
     }
 }
@@ -1294,6 +1314,206 @@ fn lerp_color(a: Color, b: Color, t: f64) -> Color {
         v.round().clamp(0.0, 255.0) as u8
     };
     Color::rgba(ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b), ch(a.a, b.a))
+}
+
+/// A 4×5 colour matrix: CSS `filter: grayscale()/saturate()/hue-rotate()` /
+/// SVG `feColorMatrix type="matrix"` / Skia `ColorMatrix`.
+///
+/// Row-major, applied to **straight (non-premultiplied)** RGBA with channels in `0..1`; the fifth
+/// column is the constant term (so `0.1` means `+25.5/255`):
+///
+/// ```text
+/// r' = m0·r + m1·g + m2·b + m3·a + m4
+/// g' = m5·r + m6·g + m7·b + m8·a + m9
+/// b' = …
+/// a' = …
+/// ```
+///
+/// ## How the backends apply it
+///
+/// There is no colour-matrix primitive in `vello_cpu` / `peniko`, and vello does not expose a
+/// subtree's offscreen bitmap, so a faithful offscreen post-process is not available on the raster
+/// side. lievisual therefore **bakes the matrix into every paint colour** it emits (solid fills /
+/// strokes / text and every gradient stop) — on **both** backends, so the two agree pixel for
+/// pixel, and it costs nothing at render time.
+///
+/// Two documented consequences of "bake into paints" rather than "post-process":
+/// - **Images are not affected** (their pixels are a resource, not a paint colour);
+/// - **Scope machinery is not affected** either — the scene background, a mask's paint, a clip, a
+///   `blend_mode` and a `Filter`'s own drop-shadow colour are not content.
+///
+/// For the theming use cases (`grayscale`, `saturate`, `hue_rotate`, `tint`) this is exact.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColorMatrix(pub [f64; 20]);
+
+impl ColorMatrix {
+    /// The identity matrix (does nothing).
+    pub const IDENTITY: Self = Self([
+        1.0, 0.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0, 0.0,
+    ]);
+
+    /// From four rows of five coefficients (row-major).
+    #[must_use]
+    pub fn from_rows(rows: [[f64; 5]; 4]) -> Self {
+        let mut m = [0.0; 20];
+        for (i, row) in rows.iter().enumerate() {
+            m[i * 5..i * 5 + 5].copy_from_slice(row);
+        }
+        Self(m)
+    }
+
+    /// The raw row-major coefficients.
+    #[must_use]
+    pub fn values(&self) -> &[f64; 20] {
+        &self.0
+    }
+
+    /// Whether this matrix leaves every colour untouched.
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    /// Compose: apply `self` first, then `next` (i.e. `next ∘ self`).
+    ///
+    /// Used to accumulate a matrix down the tree: a child's matrix is applied to the raw paint
+    /// colours, then its ancestors'.
+    #[must_use]
+    pub fn then(self, next: Self) -> Self {
+        let (a, b) = (&self.0, &next.0);
+        let mut out = [0.0f64; 20];
+        for row in 0..4 {
+            for col in 0..5 {
+                let mut v = 0.0;
+                for k in 0..4 {
+                    v += b[row * 5 + k] * a[k * 5 + col];
+                }
+                if col == 4 {
+                    v += b[row * 5 + 4];
+                }
+                out[row * 5 + col] = v;
+            }
+        }
+        Self(out)
+    }
+
+    /// Transform one colour (channels clamped back into `0..=255`, rounded).
+    #[must_use]
+    pub fn apply(&self, c: Color) -> Color {
+        if self.is_identity() {
+            return c;
+        }
+        let m = &self.0;
+        let (r, g, b, a) = (
+            f64::from(c.r) / 255.0,
+            f64::from(c.g) / 255.0,
+            f64::from(c.b) / 255.0,
+            f64::from(c.a) / 255.0,
+        );
+        let ch = |row: usize| -> u8 {
+            let o = row * 5;
+            let v = m[o] * r + m[o + 1] * g + m[o + 2] * b + m[o + 3] * a + m[o + 4];
+            (v * 255.0).round().clamp(0.0, 255.0) as u8
+        };
+        Color::rgba(ch(0), ch(1), ch(2), ch(3))
+    }
+
+    /// Luminance-preserving desaturation — CSS `filter: grayscale(1)`, SVG `type="saturate"
+    /// values="0"`.
+    #[must_use]
+    pub fn grayscale() -> Self {
+        Self::saturate(0.0)
+    }
+
+    /// SVG `feColorMatrix type="saturate"`: `1.0` = unchanged, `0.0` = grayscale, `> 1` = more
+    /// saturated.
+    #[must_use]
+    pub fn saturate(amount: f64) -> Self {
+        let s = amount;
+        let (lr, lg, lb) = (0.213, 0.715, 0.072);
+        let k = 1.0 - s;
+        Self::from_rows([
+            [lr * k + s, lg * k, lb * k, 0.0, 0.0],
+            [lr * k, lg * k + s, lb * k, 0.0, 0.0],
+            [lr * k, lg * k, lb * k + s, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+        ])
+    }
+
+    /// CSS `filter: hue-rotate(<deg>)` (the angle is in degrees).
+    #[must_use]
+    pub fn hue_rotate(deg: f64) -> Self {
+        // `sin_cos` returns `(sin, cos)`.
+        let (s, c) = deg.to_radians().sin_cos();
+        Self::from_rows([
+            [
+                0.213 + c * 0.787 - s * 0.213,
+                0.715 - c * 0.715 - s * 0.715,
+                0.072 - c * 0.072 + s * 0.928,
+                0.0,
+                0.0,
+            ],
+            [
+                0.213 - c * 0.213 + s * 0.143,
+                0.715 + c * 0.285 + s * 0.140,
+                0.072 - c * 0.072 - s * 0.283,
+                0.0,
+                0.0,
+            ],
+            [
+                0.213 - c * 0.213 - s * 0.787,
+                0.715 - c * 0.715 + s * 0.715,
+                0.072 + c * 0.928 + s * 0.072,
+                0.0,
+                0.0,
+            ],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+        ])
+    }
+
+    /// `brightness(factor)`: scale the colour channels (`1.0` = unchanged).
+    #[must_use]
+    pub fn brightness(factor: f64) -> Self {
+        Self::from_rows([
+            [factor, 0.0, 0.0, 0.0, 0.0],
+            [0.0, factor, 0.0, 0.0, 0.0],
+            [0.0, 0.0, factor, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+        ])
+    }
+
+    /// `contrast(factor)`: scale about mid-grey (`1.0` = unchanged).
+    #[must_use]
+    pub fn contrast(factor: f64) -> Self {
+        let t = (1.0 - factor) * 0.5;
+        Self::from_rows([
+            [factor, 0.0, 0.0, 0.0, t],
+            [0.0, factor, 0.0, 0.0, t],
+            [0.0, 0.0, factor, 0.0, t],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+        ])
+    }
+
+    /// Blend every colour toward `color` by `amount` (`0..1`) — the usual "theme tint" helper.
+    #[must_use]
+    pub fn tint(color: Color, amount: f64) -> Self {
+        let a = amount.clamp(0.0, 1.0);
+        let keep = 1.0 - a;
+        let (tr, tg, tb) = (
+            f64::from(color.r) / 255.0,
+            f64::from(color.g) / 255.0,
+            f64::from(color.b) / 255.0,
+        );
+        Self::from_rows([
+            [keep, 0.0, 0.0, 0.0, tr * a],
+            [0.0, keep, 0.0, 0.0, tg * a],
+            [0.0, 0.0, keep, 0.0, tb * a],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+        ])
+    }
 }
 
 /// Stroke definition.
@@ -2260,6 +2480,72 @@ mod tests {
             let full = SweepGradient::full(Point::ZERO, 0.0, s);
             assert!((full.end_angle - TAU).abs() < 1e-12);
             assert!(matches!(Fill::from(full), Fill::SweepGradient(_)));
+        }
+    }
+
+    /// 色彩矩阵：预设、apply 与 compose。
+    mod color_matrix {
+        use super::*;
+
+        #[test]
+        fn presets_and_apply() {
+            let c = Color::rgba(0x20, 0x40, 0x60, 0xff);
+            assert_eq!(ColorMatrix::IDENTITY.apply(c), c);
+            assert!(ColorMatrix::IDENTITY.is_identity());
+            // 单位参数的两条预设也不改变颜色（apply 里按字节取整，浮点噪声不影响）。
+            assert!(ColorMatrix::saturate(1.0).is_identity());
+            assert_eq!(ColorMatrix::saturate(1.0).apply(c), c);
+            assert_eq!(ColorMatrix::hue_rotate(0.0).apply(c), c);
+
+            // 灰度：三通道相等且等于 Rec.601 亮度，alpha 不变。
+            let g = ColorMatrix::grayscale().apply(c);
+            assert_eq!(g.r, g.g);
+            assert_eq!(g.g, g.b);
+            let lum = 0.213 * 32.0 + 0.715 * 64.0 + 0.072 * 96.0;
+            assert!((f64::from(g.r) - lum).abs() <= 1.0, "got {}", g.r);
+            assert_eq!(g.a, 255, "alpha 不受影响");
+
+            // 亮度：逐通道 ×0.5。
+            let b = ColorMatrix::brightness(0.5).apply(Color::rgb(0xff, 0x80, 0x00));
+            assert_eq!((b.r, b.g, b.b), (128, 64, 0));
+        }
+
+        /// `then` 是「先 self 后 next」，且顺序不可交换。
+        #[test]
+        fn compose_in_order() {
+            let c = Color::rgb(0xff, 0x00, 0x00);
+            let tint_blue = ColorMatrix::tint(Color::rgb(0, 0, 255), 0.5);
+
+            // 先混蓝再灰度：先得到 (128,0,128)，灰化为 36。
+            let a = tint_blue.then(ColorMatrix::grayscale());
+            assert_eq!(a.apply(c).r, 36);
+            // 先灰度再混蓝：灰 54 → (27,27,155)。
+            let b = ColorMatrix::grayscale().then(tint_blue);
+            let out = b.apply(c);
+            assert_eq!((out.r, out.g), (27, 27));
+            assert_eq!(out.b, 155);
+
+            // 与逐个 apply 等价。
+            assert_eq!(
+                a.apply(c),
+                ColorMatrix::grayscale().apply(tint_blue.apply(c))
+            );
+        }
+
+        #[test]
+        fn tint_blends_toward_the_colour() {
+            let out =
+                ColorMatrix::tint(Color::rgb(0, 0, 255), 0.5).apply(Color::rgb(0xff, 0x00, 0x00));
+            assert_eq!((out.r, out.g, out.b), (128, 0, 128));
+            // amount = 0 恒等；amount = 1 全部变成目标色。
+            assert_eq!(
+                ColorMatrix::tint(Color::WHITE, 0.0).apply(Color::BLACK),
+                Color::BLACK
+            );
+            assert_eq!(
+                ColorMatrix::tint(Color::rgb(0x11, 0x22, 0x33), 1.0).apply(Color::BLACK),
+                Color::rgb(0x11, 0x22, 0x33)
+            );
         }
     }
 

@@ -241,6 +241,17 @@ pub trait Renderer {
     /// Exit the scope established by [`Renderer::push_clip`].
     fn pop_clip(&mut self) {}
 
+    /// Enter a colour-matrix scope: every **paint colour** emitted until
+    /// [`Renderer::pop_color_matrix`] is transformed by `matrix`.
+    ///
+    /// Empty by default (a backend without colour support simply ignores it). Backends that
+    /// implement it accumulate the matrix down the tree with [`ColorMatrix::then`] and apply it
+    /// where paint colours are built — this is deliberately *not* an offscreen post-process; see
+    /// [`crate::scene::ColorMatrix`].
+    fn push_color_matrix(&mut self, _matrix: crate::scene::ColorMatrix) {}
+    /// Exit the scope established by [`Renderer::push_color_matrix`].
+    fn pop_color_matrix(&mut self) {}
+
     /// Enter a compositing scope: stacks transform, clip, filter, opacity, blend, mask and name,
     /// in exactly that order.
     ///
@@ -253,6 +264,11 @@ pub trait Renderer {
         }
         if let Some(clip) = scope.clip {
             self.push_clip(clip);
+        }
+        // A colour matrix is *baked into the paints*, so it must be active before the subtree
+        // emits any colour — and before `filter`, which then sees the baked colours.
+        if let Some(matrix) = scope.color_matrix {
+            self.push_color_matrix(matrix);
         }
         // Filter is applied to the subtree's rendered content, before opacity / blend / mask
         // (mirrors CSS `filter` → opacity → `mix-blend-mode`).
@@ -293,6 +309,9 @@ pub trait Renderer {
         }
         if scope.filter.is_some() {
             self.pop_filter();
+        }
+        if scope.color_matrix.is_some() {
+            self.pop_color_matrix();
         }
         if scope.clip.is_some() {
             self.pop_clip();

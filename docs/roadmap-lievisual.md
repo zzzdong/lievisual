@@ -95,6 +95,16 @@
 > - **破坏性**：两个渐变结构体新增 `spread` 字段，字面量构造不再编译 —— 改用
 >   `LinearGradient::new(...)` / `RadialGradient::new(...)` + `with_spread(...)`；
 >   `Fill` 新增 `SweepGradient` 变体（穷举 `match` 需补分支）。
+>
+> **ColorFilter 已实现（2026-10-13）** —— `ColorMatrix`（4×5，含 `grayscale` / `saturate` /
+> `hue_rotate` / `brightness` / `contrast` / `tint` 预设 + `then` 组合 + `apply`），挂在
+> `SceneNode.color_matrix`（`with_color_matrix`），经 `Renderer::push_color_matrix` /
+> `pop_color_matrix` 落地（`NodeScope` 已纳入，子树逐层 compose）。
+> **实现口径（方案 B）**：`vello_cpu` / `peniko` **没有** color matrix，也不暴露子树离屏位图，
+> 所以**把矩阵烘进每一个 paint 颜色**（实心填充 / 描边 / 文本 / 每个渐变 stop / sketch 笔色），
+> **两个后端同法** —— 逐像素一致、渲染零额外开销。已文档化的代价：**图片不受影响**；作用域机械
+> （`Scene::background`、mask 的 paint、`Filter` 自身的投影色）同样不受影响——它是"内容着色"，
+> 不是后处理。
 
 ### P2 — 能力补齐
 
@@ -209,6 +219,6 @@
 
 1. **Step 1（容器收敛）** —— 纯重构、零行为变化，为后续铺路。
 2. **P0-1 + P0-2（隔离合成 + BlendMode）** —— 合并为同一个 `compositing` 设计；加跨后端一致性回归测试。
-3. **P1 低成本项**：Mask ✅、Sweep 渐变 ✅、渐变 spread ✅、**ColorFilter（待办）**。
-4. **P1 中成本项**：drop-shadow / blur 滤镜。
+3. **P1 低成本项**：Mask ✅、Sweep 渐变 ✅、渐变 spread ✅、ColorFilter ✅。
+4. **P1 中成本项**：drop-shadow / blur 滤镜 ✅。（**至此 §2 的 P1 全部落地。**）
 5. **P2 / P3** 按下游实际需求驱动，避免为"对齐 Skia"而过度设计。

@@ -18,7 +18,7 @@
 use crate::geometry::{Color, Point, Rect, Transform, Vec2};
 use crate::render::Renderer;
 use crate::scene::{
-    BlendMode, Fill, FillStrokeStyle, GradientSpread, GradientStop, LineCap, LineJoin,
+    BlendMode, ColorMatrix, Fill, FillStrokeStyle, GradientSpread, GradientStop, LineCap, LineJoin,
     LinearGradient, Scene, SketchFill, SketchFillStyle, Stroke, SweepGradient,
 };
 use crate::text::TextStyle;
@@ -56,9 +56,12 @@ pub struct SvgRenderer {
     clip_id: usize,
     mask_id: usize,
     filter_id: usize,
+    /// Composed colour-matrix stack: the last entry is baked into every paint colour emitted.
+    color_matrices: Vec<ColorMatrix>,
     /// Hand-drawn fill patterns already emitted: index = `sk{n}` id, deduplicated by value so
-    /// a hundred same-coloured cells share one `<pattern>`.
-    patterns: Vec<SketchFill>,
+    /// a hundred same-coloured cells share one `<pattern>`. Keyed by the active colour matrix too,
+    /// since the tile's ink is baked with it.
+    patterns: Vec<(SketchFill, ColorMatrix)>,
     title: Option<String>,
     description: Option<String>,
     /// `None` → fall back to [`Scene::scale`]; an explicit renderer value wins.
@@ -84,6 +87,7 @@ impl SvgRenderer {
             clip_id: 0,
             mask_id: 0,
             filter_id: 0,
+            color_matrices: Vec::new(),
             patterns: Vec::new(),
             title: None,
             description: None,
@@ -414,7 +418,8 @@ impl Renderer for SvgRenderer {
         let mut p = path.clone();
         p.close_path();
         let d = p.to_svg();
-        let fill = self.linear_gradient_fill(gradient);
+        let matrix = self.current_color_matrix();
+        let fill = self.linear_gradient_fill(gradient, matrix);
         let mut el = String::new();
         let _ = write!(el, r#"<path d="{d}""#);
         el.push_str(&fill);
@@ -559,7 +564,7 @@ impl Renderer for SvgRenderer {
                 w,
                 h
             );
-            bg_el.push_str(&color_attr_str("fill", bg));
+            bg_el.push_str(&self.color_attr("fill", bg));
             bg_el.push_str("/>\n");
             self.buf.push_str(&bg_el);
         }
@@ -576,7 +581,7 @@ impl Renderer for SvgRenderer {
             fstyle,
             style.font_weight.value(),
         );
-        el.push_str(&color_attr_str("fill", style.color));
+        el.push_str(&self.color_attr("fill", style.color));
         el.push_str(&fwidth);
         el.push_str(&letter);
         el.push_str(&deco);
@@ -794,9 +799,36 @@ impl Renderer for SvgRenderer {
     fn pop_clip(&mut self) {
         self.buf.push_str("</g>");
     }
+
+    fn push_color_matrix(&mut self, matrix: ColorMatrix) {
+        // Compose with the enclosing scope so a child's matrix is applied to the raw colours and
+        // its ancestors' afterwards.
+        let composed = match self.color_matrices.last() {
+            Some(outer) => matrix.then(*outer),
+            None => matrix,
+        };
+        self.color_matrices.push(composed);
+    }
+
+    fn pop_color_matrix(&mut self) {
+        self.color_matrices.pop();
+    }
 }
 
 impl SvgRenderer {
+    /// The colour matrix currently baked into paint colours (identity outside any such scope).
+    fn current_color_matrix(&self) -> ColorMatrix {
+        self.color_matrices
+            .last()
+            .copied()
+            .unwrap_or(ColorMatrix::IDENTITY)
+    }
+
+    /// A colour attribute fragment with the active colour matrix baked into `c`.
+    fn color_attr(&self, prefix: &str, c: Color) -> String {
+        color_attr_str(prefix, self.current_color_matrix().apply(c))
+    }
+
     /// A ` fill="…"` attribute for mask content (same emission as a normal fill).
     ///
     /// Two deviations, both deliberate: a sketch fill uses its flat pen colour (a mask only reads
@@ -805,11 +837,12 @@ impl SvgRenderer {
     /// fit for a `<mask>`).
     fn mask_fill_attr(&mut self, fill: &Fill) -> String {
         match fill {
+            // A mask's paint is *scope machinery*, not subtree content: it is never colour-filtered.
             Fill::Sketch(sf) => color_attr_str("fill", sf.color),
             Fill::SweepGradient(g) => {
                 color_attr_str("fill", g.sample(0.5 * (g.start_angle + g.end_angle)))
             }
-            other => self.fill_attr(other),
+            other => self.fill_attr(other, ColorMatrix::IDENTITY),
         }
     }
 
@@ -821,7 +854,10 @@ impl SvgRenderer {
                 self.emit_sweep_overlay(el, g, bbox);
                 let _ = write!(el, r#" fill="none""#);
             }
-            Some(fill) => el.push_str(&self.fill_attr(fill)),
+            Some(fill) => {
+                let matrix = self.current_color_matrix();
+                el.push_str(&self.fill_attr(fill, matrix));
+            }
             None => {
                 let _ = write!(el, r#" fill="none""#);
             }
@@ -832,16 +868,16 @@ impl SvgRenderer {
     }
 
     /// Emit a `<linearGradient>` `<defs>` into `buf` and return the matching ` fill="url(#…)"`.
-    fn linear_gradient_fill(&mut self, g: &LinearGradient) -> String {
+    fn linear_gradient_fill(&mut self, g: &LinearGradient, matrix: ColorMatrix) -> String {
         let gid = self.next_gradient_id();
+        let stops: String = g.stops.iter().map(|s| stop_svg(s, matrix)).collect();
         let defs = format!(
-            r#"<defs><linearGradient id="grad{gid}" gradientUnits="userSpaceOnUse" x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}"{}>{}</linearGradient></defs>"#,
+            r#"<defs><linearGradient id="grad{gid}" gradientUnits="userSpaceOnUse" x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}"{}>{stops}</linearGradient></defs>"#,
             g.start.x,
             g.start.y,
             g.end.x,
             g.end.y,
             spread_attr(g.spread),
-            g.stops.iter().map(stop_svg).collect::<String>()
         );
         self.buf.push_str(&defs);
         format!(r#" fill="url(#grad{gid})""#)
@@ -853,23 +889,23 @@ impl SvgRenderer {
     /// Sweep gradients are **not** painted here — SVG (and the browsers) have no conic paint. See
     /// [`SvgRenderer::emit_sweep_overlay`], which bakes the ramp into clipped geometry and returns
     /// `fill="none"`.
-    fn fill_attr(&mut self, fill: &Fill) -> String {
+    fn fill_attr(&mut self, fill: &Fill, matrix: ColorMatrix) -> String {
         match fill {
-            Fill::Solid(c) => color_attr_str("fill", *c),
+            Fill::Solid(c) => color_attr_str("fill", matrix.apply(*c)),
             Fill::Sketch(sf) => {
-                let pid = self.sketch_pattern(sf);
+                let pid = self.sketch_pattern(sf, matrix);
                 format!(r#" fill="url(#sk{pid})""#)
             }
-            Fill::LinearGradient(g) => self.linear_gradient_fill(g),
+            Fill::LinearGradient(g) => self.linear_gradient_fill(g, matrix),
             Fill::RadialGradient(g) => {
                 let gid = self.next_gradient_id();
+                let stops: String = g.stops.iter().map(|s| stop_svg(s, matrix)).collect();
                 let defs = format!(
-                    r#"<defs><radialGradient id="grad{gid}" gradientUnits="userSpaceOnUse" cx="{:.2}" cy="{:.2}" r="{:.2}"{}>{}</radialGradient></defs>"#,
+                    r#"<defs><radialGradient id="grad{gid}" gradientUnits="userSpaceOnUse" cx="{:.2}" cy="{:.2}" r="{:.2}"{}>{stops}</radialGradient></defs>"#,
                     g.center.x,
                     g.center.y,
                     g.radius,
                     spread_attr(g.spread),
-                    g.stops.iter().map(stop_svg).collect::<String>()
                 );
                 self.buf.push_str(&defs);
                 format!(r#" fill="url(#grad{gid})""#)
@@ -906,10 +942,11 @@ impl SvgRenderer {
         // `start_angle..end_angle` look like), so `Pad` clamps and `Repeat` / `Reflect` tile.
         let step = std::f64::consts::TAU / SWEEP_WEDGES as f64;
         let large = u8::from(step > std::f64::consts::PI);
+        let matrix = self.current_color_matrix();
         for i in 0..SWEEP_WEDGES {
             let a0 = g.start_angle + step * i as f64;
             let a1 = a0 + step;
-            let color = g.sample(0.5 * (a0 + a1));
+            let color = matrix.apply(g.sample(0.5 * (a0 + a1)));
             let (p0x, p0y) = (cx + r * a0.cos(), cy + r * a0.sin());
             let (p1x, p1y) = (cx + r * a1.cos(), cy + r * a1.sin());
             let fill = color_attr_str("fill", color);
@@ -931,14 +968,19 @@ impl SvgRenderer {
     ///   line sitting exactly at `x = 0` would survive at half weight with a matching gap in the
     ///   neighbour tile.
     ///
-    /// The pool is keyed by the whole [`SketchFill`] (colour, style, angle, gap, weight), so N
-    /// identical shapes still cost exactly one `<pattern>`.
-    fn sketch_pattern(&mut self, sf: &SketchFill) -> usize {
-        if let Some(id) = self.patterns.iter().position(|p| p == sf) {
+    /// The pool is keyed by the whole [`SketchFill`] (colour, style, angle, gap, weight) **and the
+    /// active colour matrix** — the tile's ink is baked with it — so N identical shapes still cost
+    /// exactly one `<pattern>`.
+    fn sketch_pattern(&mut self, sf: &SketchFill, matrix: ColorMatrix) -> usize {
+        if let Some(id) = self
+            .patterns
+            .iter()
+            .position(|(f, m)| f == sf && *m == matrix)
+        {
             return id;
         }
         let id = self.patterns.len();
-        self.patterns.push(sf.clone());
+        self.patterns.push((sf.clone(), matrix));
 
         let gap = sf.gap();
         let w = sf.weight();
@@ -955,23 +997,23 @@ impl SvgRenderer {
         let content = match sf.style {
             SketchFillStyle::Hachure => format!(
                 r#"<line x1="{mid:.2}" y1="0" x2="{mid:.2}" y2="{gap:.2}"{stroke} stroke-width="{w:.2}"/>"#,
-                stroke = color_attr_str("stroke", sf.color)
+                stroke = color_attr_str("stroke", matrix.apply(sf.color))
             ),
             SketchFillStyle::CrossHatch => format!(
                 r#"<line x1="{mid:.2}" y1="0" x2="{mid:.2}" y2="{gap:.2}"{stroke} stroke-width="{w:.2}"/><line x1="0" y1="{mid:.2}" x2="{gap:.2}" y2="{mid:.2}"{stroke} stroke-width="{w:.2}"/>"#,
-                stroke = color_attr_str("stroke", sf.color)
+                stroke = color_attr_str("stroke", matrix.apply(sf.color))
             ),
             SketchFillStyle::Zigzag => format!(
                 r#"<polyline fill="none" points="{a:.2},0 {b:.2},{q:.2} {a:.2},{m:.2} {b:.2},{t:.2} {a:.2},{gap:.2}"{stroke} stroke-width="{w:.2}"/>"#,
                 q = gap * 0.25,
                 m = gap * 0.5,
                 t = gap * 0.75,
-                stroke = color_attr_str("stroke", sf.color)
+                stroke = color_attr_str("stroke", matrix.apply(sf.color))
             ),
             SketchFillStyle::Dots => format!(
                 r#"<circle cx="{mid:.2}" cy="{mid:.2}" r="{r:.2}"{fill}/>"#,
                 r = crate::sketch::fill::dot_radius(sf),
-                fill = color_attr_str("fill", sf.color)
+                fill = color_attr_str("fill", matrix.apply(sf.color))
             ),
         };
         let defs = format!(
@@ -989,7 +1031,7 @@ impl SvgRenderer {
     }
 
     fn append_stroke(&self, el: &mut String, s: &Stroke) {
-        el.push_str(&color_attr_str("stroke", s.color));
+        el.push_str(&self.color_attr("stroke", s.color));
         let _ = write!(
             el,
             r#" stroke-width="{:.2}" stroke-miterlimit="{:.2}""#,
@@ -1095,7 +1137,7 @@ impl SvgRenderer {
             let _ = write!(attrs, r#" font-size="{:.2}""#, span.font_size);
         }
         if span.color != base.color {
-            attrs.push_str(&color_attr_str("fill", span.color));
+            attrs.push_str(&self.color_attr("fill", span.color));
         }
         if span.font_weight != base.font_weight {
             let _ = write!(attrs, r#" font-weight="{:.0}""#, span.font_weight.value());
@@ -1192,18 +1234,19 @@ fn spread_attr(spread: GradientSpread) -> &'static str {
     }
 }
 
-/// A gradient stop: `stop-color` always uses the 6-digit form; a translucent stop carries its
-/// alpha through `stop-opacity`. 8-digit hex is CSS Color 4 / SVG 2 only and is rejected by
-/// many SVG -> PDF / SVG 1.1 consumers.
-fn stop_svg(s: &GradientStop) -> String {
-    let opacity = if s.color.a == 255 {
+/// A gradient stop, with `matrix` baked into its colour. `stop-color` always uses the 6-digit
+/// form; a translucent stop carries its alpha through `stop-opacity`. 8-digit hex is CSS Color 4 /
+/// SVG 2 only and is rejected by many SVG -> PDF / SVG 1.1 consumers.
+fn stop_svg(s: &GradientStop, matrix: ColorMatrix) -> String {
+    let color = matrix.apply(s.color);
+    let opacity = if color.a == 255 {
         String::new()
     } else {
-        format!(r#" stop-opacity="{:.3}""#, s.color.a as f64 / 255.0)
+        format!(r#" stop-opacity="{:.3}""#, f64::from(color.a) / 255.0)
     };
     format!(
         r##"<stop offset="{:.3}" stop-color="#{:02x}{:02x}{:02x}"{} />"##,
-        s.offset, s.color.r, s.color.g, s.color.b, opacity
+        s.offset, color.r, color.g, color.b, opacity
     )
 }
 
@@ -1593,6 +1636,39 @@ mod tests {
             out.contains(r#"fill="none""#),
             "形状自身不再填充（由 wedge 着色）"
         );
+    }
+
+    /// 色彩矩阵烘进 paint（方案 B）：灰度后输出的是灰 hex，而不是原色。
+    #[test]
+    fn color_matrix_is_baked_into_paints() {
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+            ))
+            .with_color_matrix(crate::scene::ColorMatrix::grayscale()),
+        );
+        let out = render(&scene);
+        // 0.213 × 255 ≈ 54 = 0x36。
+        assert!(out.contains(r##"fill="#363636""##), "灰化后的填充: {out}");
+        assert!(!out.contains(r##"fill="#ff0000""##), "不应保留原色: {out}");
+    }
+
+    /// 嵌套色彩矩阵：子节点灰化 + 父容器增亮 0.5 → 54 × 0.5 = 27 = 0x1b。
+    #[test]
+    fn nested_color_matrices_compose() {
+        let child = SceneNode::new(Element::rect(
+            Rect::new(0.0, 0.0, 20.0, 20.0),
+            FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+        ))
+        .with_color_matrix(crate::scene::ColorMatrix::grayscale());
+        let group = SceneNode::group(vec![child])
+            .with_color_matrix(crate::scene::ColorMatrix::brightness(0.5));
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(group);
+        let out = render(&scene);
+        assert!(out.contains(r##"fill="#1b1b1b""##), "组合后的填充: {out}");
     }
 
     #[test]

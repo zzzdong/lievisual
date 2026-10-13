@@ -66,6 +66,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scene::sample_stops` (ramp sampling: clamp outside, linear interpolation inside),
   `SweepGradient::ramp_t` / `SweepGradient::sample` — the shared sampling used by the SVG wedge
   approximation.
+- **`ColorMatrix`** (colour filters — grayscale / tint / colour-matrix, the usual chart-theming
+  tool) as a node attribute: `SceneNode::color_matrix` + `SceneNode::with_color_matrix`, carried by
+  `NodeScope` and applied through `Renderer::push_color_matrix` / `pop_color_matrix` (default
+  no-op). Presets: `IDENTITY`, `grayscale()`, `saturate()`, `hue_rotate()`, `brightness()`,
+  `contrast()`, `tint()`, plus `from_rows()` / `values()` / `then()` (composition) / `apply()`.
+  Nested matrices compose down the tree (a child's matrix applies to the raw colours, its
+  ancestors' afterwards).
+  **How it is applied:** there is no colour-matrix primitive in `vello_cpu` / `peniko`, and vello
+  does not expose a subtree's offscreen bitmap, so lievisual **bakes the matrix into every paint
+  colour it emits** (solid fills / strokes / text, every gradient stop, sketch pen colours) — on
+  **both** backends, so they agree pixel for pixel, at zero render cost. Two documented
+  consequences of baking rather than post-processing: **images are not affected**, and scope
+  machinery is not content (the scene background, a mask's paint and a `Filter`'s own drop-shadow
+  colour are not colour-filtered).
 
 ### Changed
 
@@ -73,6 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer compile — construct with `LinearGradient::new(...)` / `RadialGradient::new(...)` (then
   `.with_spread(...)`). `Fill` gained a `SweepGradient` variant, so exhaustive matches need a new
   arm. Downstream adaptations: `liecharts` 1 literal, `liemermaid` 1 literal.
+- **BREAKING:** `SceneNode` gained a `color_matrix` field (struct literals no longer compile — use
+  `SceneNode::new(...)` / `SceneNode::group(...)` + `with_color_matrix(...)`). No downstream change
+  was needed this time (all three consumers already build nodes through the constructors).
 
 
 - **BREAKING — container vs. drawing content is now modelled by `NodeKind`.** `SceneNode.element`

@@ -25,7 +25,7 @@ use crate::geometry::{Color, Point, Rect, Transform};
 use crate::pixmap::Pixmap;
 use crate::render::Renderer;
 use crate::scene::{
-    BlendMode, Fill, FillStrokeStyle, GradientSpread, GradientStop, LineCap, LineJoin,
+    BlendMode, ColorMatrix, Fill, FillStrokeStyle, GradientSpread, GradientStop, LineCap, LineJoin,
     LinearGradient, Scene, SketchFill, Stroke,
 };
 use crate::text::TextStyle;
@@ -40,6 +40,8 @@ pub struct VelloPixmapRenderer {
     background: Option<Color>,
     /// Transform stack: top is the currently active composed transform.
     transform_stack: Vec<vello_cpu::kurbo::Affine>,
+    /// Colour-matrix stack: the top (composed) matrix is baked into every paint colour.
+    color_matrices: Vec<ColorMatrix>,
 }
 
 /// Clamp a canvas dimension (in device pixels) into vello_cpu's `1..=u16::MAX` range.
@@ -77,6 +79,7 @@ impl VelloPixmapRenderer {
             height: h,
             background: None,
             transform_stack: Vec::new(),
+            color_matrices: Vec::new(),
         }
     }
 
@@ -120,6 +123,7 @@ impl VelloPixmapRenderer {
             self.ctx.reset();
         }
         self.transform_stack.clear();
+        self.color_matrices.clear();
 
         // Background: fall back to the scene's background (the Scene is the authoritative IR);
         // skip painting an alpha-0 background so a transparent canvas stays possible.
@@ -127,7 +131,8 @@ impl VelloPixmapRenderer {
         if bg.a > 0 {
             self.ctx.set_transform(vello_cpu::kurbo::Affine::IDENTITY);
             let rect = VRect::new(0.0, 0.0, out_w as f64, out_h as f64);
-            self.ctx.set_paint(self.to_vello(&bg));
+            // The scene background is not subtree content: never colour-filtered.
+            self.ctx.set_paint(vello_color(&bg));
             self.ctx.fill_rect(&rect);
         }
 
@@ -184,13 +189,15 @@ impl VelloPixmapRenderer {
         self.render_scene_to_pixmap(scene).to_png()
     }
 
-    /// Convert a lievisual color to a vello color (channels are used as-is).
+    /// Convert a lievisual color to a vello color, with the **active colour matrix baked in**.
     ///
     /// Node / layer opacity is deliberately **not** baked into the color: it is applied as an
     /// isolated compositing layer (see [`Renderer::push_opacity`]) so a scope's sub-shapes
-    /// composite before the alpha is scaled — matching the SVG backend's `<g opacity>`.
+    /// composite before the alpha is scaled — matching the SVG backend's `<g opacity>`. A colour
+    /// matrix *is* baked (the SVG backend does the same), so both agree pixel for pixel; see
+    /// [`crate::scene::ColorMatrix`].
     fn to_vello(&self, color: &Color) -> AlphaColor<vello_cpu::color::Srgb> {
-        vello_color(color)
+        vello_color(&self.current_color_matrix().apply(*color))
     }
 
     fn kurbo_stroke(stroke: &Stroke) -> KurboStroke {
@@ -228,6 +235,14 @@ impl VelloPixmapRenderer {
             .unwrap_or(vello_cpu::kurbo::Affine::IDENTITY)
     }
 
+    /// The colour matrix currently baked into paint colours (identity outside such a scope).
+    fn current_color_matrix(&self) -> ColorMatrix {
+        self.color_matrices
+            .last()
+            .copied()
+            .unwrap_or(ColorMatrix::IDENTITY)
+    }
+
     /// Set the current brush according to `Fill` (Solid / linear / radial gradient).
     ///
     /// [`Fill::Sketch`] is *not* painted here — a hand-drawn fill is pen strokes, not a brush;
@@ -235,7 +250,8 @@ impl VelloPixmapRenderer {
     /// call degrades to the pen colour instead of doing nothing.
     fn set_fill(&mut self, fill: &Fill) {
         let scene_transform = self.current_transform();
-        apply_fill(&mut self.ctx, scene_transform, fill);
+        let matrix = self.current_color_matrix();
+        apply_fill(&mut self.ctx, scene_transform, fill, matrix);
     }
 
     /// Rasterize a mask into a canvas-sized [`vello_cpu::Mask`] (device space).
@@ -248,7 +264,8 @@ impl VelloPixmapRenderer {
         let scene_transform = self.current_transform();
         let mut ctx = RenderContext::new(w, h);
         ctx.set_transform(scene_transform);
-        apply_fill(&mut ctx, scene_transform, &mask.fill);
+        // A mask's paint is *scope machinery*, not subtree content: never colour-filtered.
+        apply_fill(&mut ctx, scene_transform, &mask.fill, ColorMatrix::IDENTITY);
         ctx.fill_path(&mask.shape.to_bezpath());
         let mut pm = VelloPixmap::new(w, h);
         let mut resources = Resources::new();
@@ -387,12 +404,14 @@ impl Renderer for VelloPixmapRenderer {
             VPoint::new(gradient.end.x, gradient.end.y),
         ));
         let scene_transform = self.current_transform();
+        let matrix = self.current_color_matrix();
         set_gradient_paint(
             &mut self.ctx,
             scene_transform,
             kind,
             &gradient.stops,
             gradient.spread,
+            matrix,
         );
         self.ctx.fill_path(path);
         // 渐变 fill 设置了 user-space paint transform，绘制后复位。
@@ -682,6 +701,20 @@ impl Renderer for VelloPixmapRenderer {
         self.ctx.pop_layer();
     }
 
+    fn push_color_matrix(&mut self, matrix: ColorMatrix) {
+        // Compose with the enclosing scope: a child's matrix is applied to the raw colours, its
+        // ancestors' afterwards (matching the SVG backend).
+        let composed = match self.color_matrices.last() {
+            Some(outer) => matrix.then(*outer),
+            None => matrix,
+        };
+        self.color_matrices.push(composed);
+    }
+
+    fn pop_color_matrix(&mut self) {
+        self.color_matrices.pop();
+    }
+
     fn push_clip(&mut self, clip: &crate::scene::Clip) {
         // vello_cpu 的 clip 路径按当前 transform（clip_path_transform）应用；
         // 我们 push_transform 已设置 ctx transform，故 clip 与节点变换一致复合。
@@ -715,13 +748,15 @@ fn vello_color(c: &Color) -> AlphaColor<vello_cpu::color::Srgb> {
     AlphaColor::from_rgba8(c.r, c.g, c.b, c.a)
 }
 
-/// Build peniko color stops from lievisual gradient stops.
-fn peniko_stops(stops: &[GradientStop]) -> Vec<vello_cpu::peniko::ColorStop> {
+/// Build peniko color stops from lievisual gradient stops, baking `matrix` into each stop.
+fn peniko_stops(stops: &[GradientStop], matrix: ColorMatrix) -> Vec<vello_cpu::peniko::ColorStop> {
     stops
         .iter()
         .map(|s| vello_cpu::peniko::ColorStop {
             offset: s.offset as f32,
-            color: vello_cpu::peniko::color::DynamicColor::from_alpha_color(vello_color(&s.color)),
+            color: vello_cpu::peniko::color::DynamicColor::from_alpha_color(vello_color(
+                &matrix.apply(s.color),
+            )),
         })
         .collect()
 }
@@ -745,11 +780,12 @@ fn set_gradient_paint(
     kind: vello_cpu::peniko::GradientKind,
     stops: &[GradientStop],
     spread: GradientSpread,
+    matrix: ColorMatrix,
 ) {
     use vello_cpu::peniko::{
         ColorStops, Gradient, InterpolationAlphaSpace, color::ColorSpaceTag, color::HueDirection,
     };
-    let stops_vec = peniko_stops(stops);
+    let stops_vec = peniko_stops(stops, matrix);
     let gradient = Gradient {
         kind,
         extend: to_peniko_extend(spread),
@@ -769,25 +805,30 @@ fn set_gradient_paint(
 /// Set `fill` as the paint on `ctx` (solid / linear / radial / sweep gradient), with user-space
 /// gradient coordinates. Sketch fills degrade to their pen colour (they are drawn as strokes
 /// elsewhere).
-fn apply_fill(ctx: &mut RenderContext, scene_transform: vello_cpu::kurbo::Affine, fill: &Fill) {
+fn apply_fill(
+    ctx: &mut RenderContext,
+    scene_transform: vello_cpu::kurbo::Affine,
+    fill: &Fill,
+    matrix: ColorMatrix,
+) {
     use vello_cpu::peniko::{
         GradientKind, LinearGradientPosition, RadialGradientPosition, SweepGradientPosition,
     };
     match fill {
-        Fill::Solid(c) => ctx.set_paint(vello_color(c)),
+        Fill::Solid(c) => ctx.set_paint(vello_color(&matrix.apply(*c))),
         Fill::LinearGradient(g) => {
             let kind = GradientKind::Linear(LinearGradientPosition::new(
                 VPoint::new(g.start.x, g.start.y),
                 VPoint::new(g.end.x, g.end.y),
             ));
-            set_gradient_paint(ctx, scene_transform, kind, &g.stops, g.spread);
+            set_gradient_paint(ctx, scene_transform, kind, &g.stops, g.spread, matrix);
         }
         Fill::RadialGradient(g) => {
             let kind = GradientKind::Radial(RadialGradientPosition::new(
                 VPoint::new(g.center.x, g.center.y),
                 g.radius as f32,
             ));
-            set_gradient_paint(ctx, scene_transform, kind, &g.stops, g.spread);
+            set_gradient_paint(ctx, scene_transform, kind, &g.stops, g.spread, matrix);
         }
         Fill::SweepGradient(g) => {
             let kind = GradientKind::Sweep(SweepGradientPosition::new(
@@ -795,9 +836,9 @@ fn apply_fill(ctx: &mut RenderContext, scene_transform: vello_cpu::kurbo::Affine
                 g.start_angle as f32,
                 g.end_angle as f32,
             ));
-            set_gradient_paint(ctx, scene_transform, kind, &g.stops, g.spread);
+            set_gradient_paint(ctx, scene_transform, kind, &g.stops, g.spread, matrix);
         }
-        Fill::Sketch(sf) => ctx.set_paint(vello_color(&sf.color)),
+        Fill::Sketch(sf) => ctx.set_paint(vello_color(&matrix.apply(sf.color))),
     }
 }
 
@@ -942,8 +983,8 @@ mod tests {
     use super::*;
     use crate::geometry::{Color, Point, Rect, Transform};
     use crate::scene::{
-        BlendMode, Clip, Element, FillStrokeStyle, Filter, GradientSpread, GradientStop,
-        LinearGradient, Scene, SceneNode, SketchFillStyle, SweepGradient,
+        BlendMode, Clip, ColorMatrix, Element, FillStrokeStyle, Filter, GradientSpread,
+        GradientStop, LinearGradient, Scene, SceneNode, SketchFillStyle, SweepGradient,
     };
 
     /// 提取 pixmap 像素为 RGBA u8 数组（非预乘，用于比较）。
@@ -1366,6 +1407,46 @@ mod tests {
         let pad = rp.render_scene_to_pixmap(&make(GradientSpread::Pad));
         let (c, d) = (pixel_at(&pad, 5, 10), pixel_at(&pad, 25, 10));
         assert!(c.0 < 200 && d.0 > 240, "Pad 应夹到端色: {c:?} vs {d:?}");
+    }
+
+    /// 色彩矩阵（方案 B：烘进 paint）：灰度把红填充变成等亮度灰（0.213 × 255 ≈ 54）。
+    #[test]
+    fn color_matrix_bakes_into_paints() {
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+            ))
+            .with_color_matrix(ColorMatrix::grayscale()),
+        );
+        let mut r = VelloPixmapRenderer::new(20, 20);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let (pr, pg, pb, _) = pixel_at(&pix, 10, 10);
+        assert!(
+            pr.abs_diff(54) <= 1 && pr == pg && pg == pb,
+            "灰度应为 ~54, got ({pr},{pg},{pb})"
+        );
+    }
+
+    /// 嵌套色彩矩阵：子节点灰化 + 父容器增亮 0.5 → 54 × 0.5 = 27（与 SVG 后端一致）。
+    #[test]
+    fn nested_color_matrices_compose() {
+        let child = SceneNode::new(Element::rect(
+            Rect::new(0.0, 0.0, 20.0, 20.0),
+            FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+        ))
+        .with_color_matrix(ColorMatrix::grayscale());
+        let group = SceneNode::group(vec![child]).with_color_matrix(ColorMatrix::brightness(0.5));
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(group);
+        let mut r = VelloPixmapRenderer::new(20, 20);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let (pr, pg, pb, _) = pixel_at(&pix, 10, 10);
+        assert!(
+            pr.abs_diff(27) <= 1 && pr == pg && pg == pb,
+            "组合后应为 ~27, got ({pr},{pg},{pb})"
+        );
     }
 
     /// BlendMode：Multiply 把不透明灰 (128) 叠在不透明灰 (128) 上 ≈ 64（Normal 则为 128）。
