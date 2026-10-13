@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **First-class container / traversal API on the scene tree** (pure refactor, no behaviour change):
+  - `SceneNode::{is_group, children, children_mut}` — inspect a `Group` container without matching
+    `Element::Group` directly.
+  - `SceneNode::{visit, visit_mut}` — pre-order traversal of a node and its whole subtree.
+  - `Scene::{visit_nodes, visit_nodes_mut}` — document-order traversal over the default node list
+    and all layers.
+  - `Scene::{root_lists, root_lists_mut}` — the scene's top-level node lists (the default list plus
+    each visible layer with its `transform`), shared by bounds / effects / rendering.
+  - `Renderer::render_children` — the single recursion used by the default list, layers and groups.
+  Internally this collapses the ad-hoc `match Element::Group` in the sketch / fit / render passes
+  onto the shared accessors.
+
 ## [0.3.0] — 2026-10-13
 
 Breaking release aligned with `vello_cpu` 0.3 / `parley` 0.12. Downstream can now depend on

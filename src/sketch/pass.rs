@@ -90,14 +90,10 @@ fn roughen_scene_where(
         Some(seed) => Rng::new(seed),
         None => Rng::from_entropy(),
     };
-    // Document order (default nodes, then layers bottom-to-top) so the same seed always yields
-    // the same randomness per element.
-    walk(&mut scene.nodes, &mut rng, opts, filter);
-    for layer in &mut scene.layers {
-        if !layer.visible {
-            continue;
-        }
-        walk(&mut layer.nodes, &mut rng, opts, filter);
+    // Document order (default nodes, then visible layers bottom-to-top) so the same seed always
+    // yields the same randomness per element. `root_lists_mut` is the shared root traversal.
+    for nodes in scene.root_lists_mut() {
+        walk(nodes, &mut rng, opts, filter);
     }
 }
 
@@ -116,10 +112,10 @@ fn walk(
         {
             continue;
         }
-        if matches!(node.element, Element::Group { .. }) {
-            if let Element::Group { children } = &mut node.element {
-                walk(children, rng, opts, filter);
-            }
+        // Containers: recurse into the group's children (a container is never itself sketched).
+        // Uses the shared container accessor instead of matching `Element::Group` directly.
+        if let Some(children) = node.children_mut() {
+            walk(children, rng, opts, filter);
             continue;
         }
         let Some(kind) = SketchKind::of(&node.element) else {

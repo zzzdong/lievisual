@@ -14,6 +14,10 @@ SVG / vello_cpu 栅格 / GPU（规划中）/ PDF·DOCX（经 liepress）。
    子树递归复合（`opacity` 逐层相乘），`clip` 将整棵子树限制在形状内（SVG `<clipPath>` /
    vello `push_clip_path`），`visible = false` 整棵子树跳过。后端在默认遍历
    `render_scene_ordered` 里统一处理排序、节点属性、`Group` 递归与局部变换。
+   **容器是一等概念**：`Element::Group` 的节点即"容器"，通过 `SceneNode::is_group` /
+   `children` / `children_mut`（以及 `visit` / `visit_mut`）访问，避免各处直接 `match
+   Element::Group`；渲染用统一的 `Renderer::render_children` 递归（默认层 / `Layer` / `Group`
+   共用同一路径），根级遍历用 `Scene::root_lists` / `root_lists_mut`（默认层 + 可见 layer）。
 3. **图元丰富**。`Element` 覆盖：矩形、圆、椭圆（可旋转）、圆角矩形、线、折线、多边形、
    圆弧（开放描边）、扇形（闭合、适合饼图）、路径、渐变路径、文本（双形态）、组合 Group。
 4. **图层（Layer）**。`Scene` 可携带一组有序 [`Layer`]（从底到顶），整层控制

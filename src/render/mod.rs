@@ -261,13 +261,22 @@ pub trait Renderer {
         self.render_scene_ordered(scene);
     }
 
+    /// Draw a slice of nodes in stable ascending `z_index` order.
+    ///
+    /// The single recursion shared by the default node list, [`Layer`]s and [`Element::Group`]
+    /// containers: each level is sorted by `z_index`, then every node goes through
+    /// [`Renderer::render_node`] (which applies the node scope and recurses into nested groups).
+    fn render_children(&mut self, nodes: &[SceneNode]) {
+        for node in SceneNode::ordered(nodes) {
+            self.render_node(node);
+        }
+    }
+
     /// Default traversal: draws the default `nodes` layer first (bottommost, sorted
     /// stably by ascending `z_index`), then each [`Layer`] in array order from bottom to
     /// top.
     fn render_scene_ordered(&mut self, scene: &Scene) {
-        for node in scene.iter_ordered() {
-            self.render_node(node);
-        }
+        self.render_children(&scene.nodes);
         for layer in &scene.layers {
             self.render_layer(layer);
         }
@@ -290,9 +299,7 @@ pub trait Renderer {
             self.push_name(Some(&layer.name));
         }
 
-        for node in layer.iter_ordered() {
-            self.render_node(node);
-        }
+        self.render_children(&layer.nodes);
 
         if !layer.name.is_empty() {
             self.pop_name();
@@ -317,11 +324,9 @@ pub trait Renderer {
 
         match &node.element {
             Element::Group { children } => {
-                // Children inside a Group are drawn stably by ascending z_index
-                // (reusing SceneNode::ordered).
-                for child in SceneNode::ordered(children) {
-                    self.render_node(child);
-                }
+                // Children inside a Group are drawn stably by ascending z_index (the same
+                // recursion used by layers / the default node list).
+                self.render_children(children);
             }
             Element::Rect { rect, style } => self.draw_rect(*rect, style),
             Element::Circle {

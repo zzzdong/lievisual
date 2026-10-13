@@ -311,16 +311,18 @@ pub fn nodes_bounds(nodes: &[SceneNode]) -> Option<Rect> {
     union_all(nodes.iter().filter_map(node_bounds))
 }
 
-/// Bounding box of a whole scene: the default `nodes` layer **and** every named layer.
+/// Bounding box of a whole scene: the default `nodes` layer **and** every visible named layer.
+///
+/// Uses [`Scene::root_lists`] so the default list and layers share one traversal (a layer's
+/// `transform` is applied to its union).
 pub fn scene_bounds(scene: &Scene) -> Option<Rect> {
-    let layers = scene.layers.iter().filter(|l| l.visible).filter_map(|l| {
-        let b = nodes_bounds(&l.nodes)?;
-        Some(match l.transform.as_ref() {
-            Some(t) => transform_box(t, b),
+    union_all(scene.root_lists().filter_map(|(nodes, t)| {
+        let b = nodes_bounds(nodes)?;
+        Some(match t {
+            Some(t) => transform_box(&t, b),
             None => b,
         })
-    });
-    union_all(nodes_bounds(&scene.nodes).into_iter().chain(layers))
+    }))
 }
 
 /// Map an axis-aligned box through an affine transform: transform the four corners, then re-fit.

@@ -19,6 +19,12 @@
 //!   order (preserving insertion order within the same level), and [`Scene::iter_ordered`] is a
 //!   convenience entry for the top-level collection; rendering and callers share the same
 //!   traversal logic.
+//! - Container abstraction: a node whose element is [`Element::Group`] is a **container**. Use
+//!   [`SceneNode::is_group`] / [`SceneNode::children`] / [`SceneNode::children_mut`] (and
+//!   [`SceneNode::visit`] / [`SceneNode::visit_mut`]) instead of matching `Element::Group`
+//!   directly, so rendering / bounds / effects / hit-testing share one recursion over the tree.
+//!   [`Scene::root_lists`] / [`Scene::root_lists_mut`] likewise unify "default nodes + layers"
+//!   for root-level traversals.
 
 use crate::geometry::{Color, Point, Rect, Transform, Vec2};
 use crate::render::Renderer;
@@ -276,6 +282,62 @@ impl Scene {
     pub fn iter_ordered(&self) -> impl Iterator<Item = &SceneNode> {
         SceneNode::ordered(&self.nodes)
     }
+
+    /// Visit every node in **document order** — the default [`Scene::nodes`] first, then each
+    /// [`Layer`] bottom-to-top — recursing into [`Element::Group`] containers (a container before
+    /// its children). `z_index` is *not* applied (this is structural order, not draw order).
+    ///
+    /// Layer-level attributes (`visible` / `opacity` / `transform`) are **not** applied, and no
+    /// node is skipped for `visible = false`; the callback decides. Use this for hit-testing /
+    /// inspection over the whole tree.
+    pub fn visit_nodes(&self, f: &mut impl FnMut(&SceneNode)) {
+        for node in &self.nodes {
+            node.visit(f);
+        }
+        for layer in &self.layers {
+            for node in &layer.nodes {
+                node.visit(f);
+            }
+        }
+    }
+
+    /// Mutable variant of [`Scene::visit_nodes`] (same order).
+    pub fn visit_nodes_mut(&mut self, f: &mut impl FnMut(&mut SceneNode)) {
+        for node in &mut self.nodes {
+            node.visit_mut(f);
+        }
+        for layer in &mut self.layers {
+            for node in &mut layer.nodes {
+                node.visit_mut(f);
+            }
+        }
+    }
+
+    /// The scene's **root node lists** in draw order — the default [`Scene::nodes`] first
+    /// (`transform = None`), then each **visible** [`Layer`]'s nodes bottom-to-top paired with the
+    /// layer's `transform`.
+    ///
+    /// Single source of "what are the scene's top-level lists", shared by bounds / effects /
+    /// rendering so the default layer and named layers are no longer handled separately.
+    pub fn root_lists(&self) -> impl Iterator<Item = (&[SceneNode], Option<Transform>)> {
+        std::iter::once((self.nodes.as_slice(), None)).chain(
+            self.layers
+                .iter()
+                .filter(|l| l.visible)
+                .map(|l| (l.nodes.as_slice(), l.transform)),
+        )
+    }
+
+    /// Mutable counterpart of [`Scene::root_lists`] (visible layers only), for passes that rewrite
+    /// elements (e.g. the sketch pass).
+    pub fn root_lists_mut(&mut self) -> impl Iterator<Item = &mut Vec<SceneNode>> {
+        std::iter::once(&mut self.nodes).chain(
+            self.layers
+                .iter_mut()
+                .filter(|l| l.visible)
+                .map(|l| &mut l.nodes),
+        )
+    }
 }
 
 /// A named layer: a set of nodes plus layer-wide attributes.
@@ -417,6 +479,57 @@ impl SceneNode {
         // Stable sort: `sort_by_key` preserves relative order for equal `z_index`.
         order.sort_by_key(|&i| nodes[i].z_index);
         order.into_iter().map(move |i| &nodes[i])
+    }
+
+    /// Whether this node is a **container** (its element is [`Element::Group`]).
+    ///
+    /// Containers hold child nodes; every other element is a drawable leaf. Prefer this plus
+    /// [`SceneNode::children`] over matching on [`Element::Group`] directly, so every pass
+    /// (rendering / bounds / effects / hit-testing) shares one notion of "the tree".
+    #[must_use]
+    pub fn is_group(&self) -> bool {
+        matches!(self.element, Element::Group { .. })
+    }
+
+    /// Child nodes of a container, or `None` for a leaf (drawable) node.
+    #[must_use]
+    pub fn children(&self) -> Option<&[SceneNode]> {
+        match &self.element {
+            Element::Group { children } => Some(children),
+            _ => None,
+        }
+    }
+
+    /// Mutable child nodes of a container, or `None` for a leaf node.
+    pub fn children_mut(&mut self) -> Option<&mut Vec<SceneNode>> {
+        match &mut self.element {
+            Element::Group { children } => Some(children),
+            _ => None,
+        }
+    }
+
+    /// Pre-order visit over this node and its whole subtree: `self` first, then each child in
+    /// stored order, recursing into nested containers (order is independent of `z_index`).
+    pub fn visit(&self, f: &mut impl FnMut(&SceneNode)) {
+        f(self);
+        if let Some(children) = self.children() {
+            for child in children {
+                child.visit(f);
+            }
+        }
+    }
+
+    /// Mutable pre-order visit over this node and its subtree (same order as [`SceneNode::visit`]).
+    ///
+    /// A container's children are re-read after `f` runs, so a callback that turns a container
+    /// into a leaf (or vice versa) is honoured.
+    pub fn visit_mut(&mut self, f: &mut impl FnMut(&mut SceneNode)) {
+        f(self);
+        if let Some(children) = self.children_mut() {
+            for child in children.iter_mut() {
+                child.visit_mut(f);
+            }
+        }
     }
 
     #[must_use]
@@ -1420,6 +1533,71 @@ mod tests {
             let mut scene = Scene::new(10.0, 10.0);
             scene.push_group(vec![rect_node(0.0, 0)]);
             assert!(matches!(&scene.nodes[0].element, Element::Group { .. }));
+        }
+
+        /// 容器访问器（`is_group` / `children` / `children_mut`）与前后序遍历。
+        #[test]
+        fn container_accessors_and_traversal() {
+            // group( leafA, group( leafB ) )
+            let outer = SceneNode::group(vec![
+                rect_node(0.0, 0),
+                SceneNode::group(vec![rect_node(5.0, 0)]),
+            ]);
+            assert!(outer.is_group());
+            assert_eq!(outer.children().map(|c| c.len()), Some(2));
+            assert!(!outer.children().unwrap()[0].is_group());
+            assert!(outer.children().unwrap()[1].is_group());
+            // A leaf has no children.
+            assert!(rect_node(0.0, 0).children().is_none());
+
+            // Pre-order: outer, leafA, inner, leafB → 4 nodes.
+            let mut visited = 0usize;
+            outer.visit(&mut |_| visited += 1);
+            assert_eq!(visited, 4);
+
+            // Mutable access reaches nested containers.
+            let mut outer = outer;
+            outer.children_mut().unwrap()[1]
+                .children_mut()
+                .unwrap()
+                .push(rect_node(9.0, 0));
+            assert_eq!(outer.children().unwrap()[1].children().unwrap().len(), 2);
+        }
+
+        /// `visit_mut` 覆盖整棵子树（根容器 + 每个子节点）。
+        #[test]
+        fn visit_mut_reaches_every_node() {
+            let mut outer = SceneNode::group(vec![rect_node(0.0, 0)]);
+            let mut seen = 0usize;
+            outer.visit_mut(&mut |_| seen += 1);
+            assert_eq!(seen, 2, "根容器 + 1 个子节点");
+        }
+
+        /// `Scene::visit_nodes` 覆盖默认层与各 layer 的全部节点（含 Group 递归）。
+        #[test]
+        fn scene_visit_nodes_covers_default_and_layers() {
+            let mut scene = Scene::new(20.0, 20.0);
+            scene.push(rect_node(0.0, 0)); // 默认层：叶子
+            scene.push_group(vec![rect_node(0.0, 0)]); // 默认层：Group + 子节点
+            scene.push_layer(Layer::new("L").with_nodes(vec![rect_node(0.0, 0)]));
+            let mut seen = 0usize;
+            scene.visit_nodes(&mut |_| seen += 1);
+            assert_eq!(seen, 1 + 1 + 1 + 1);
+        }
+
+        /// `Scene::root_lists` = 默认层 + 可见 layer（隐藏 layer 跳过），顺序与绘制一致。
+        #[test]
+        fn scene_root_lists_skip_hidden_layers() {
+            let mut scene = Scene::new(20.0, 20.0);
+            scene.push(rect_node(0.0, 0));
+            scene.push_layer(Layer::new("a").with_nodes(vec![rect_node(0.0, 0)]));
+            scene.push_layer(
+                Layer::new("b")
+                    .with_nodes(vec![rect_node(0.0, 0), rect_node(1.0, 0)])
+                    .with_visible(false),
+            );
+            let sizes: Vec<usize> = scene.root_lists().map(|(n, _)| n.len()).collect();
+            assert_eq!(sizes, vec![1, 1], "默认层 + 可见层 a；隐藏层 b 被跳过");
         }
 
         #[test]
