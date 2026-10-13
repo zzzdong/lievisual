@@ -705,8 +705,11 @@ impl Renderer for SvgRenderer {
         // `mask_fill_attr` may push gradient `<defs>` into `buf`; `d` is already materialised, so
         // the mask `<defs>` below is emitted after them (SVG allows multiple `<defs>`).
         let fill_attr = self.mask_fill_attr(&mask.fill);
+        // `mask-type="alpha"` 是关键：SVG `<mask>` 默认按 **luminance** 取值，而 IR 合同
+        // （`scene::Mask`）与 vello 端（`Mask::new_alpha`）都是 **alpha** 遮罩——不声明的话，
+        // 不透明黑遮罩在 SVG 端亮度为 0（全隐藏）、vello 端 alpha=255（全显示）。
         let defs = format!(
-            r#"<defs><mask id="mask{id}" maskContentUnits="userSpaceOnUse"><path d="{d}"{fill_attr}/></mask></defs>"#
+            r#"<defs><mask id="mask{id}" mask-type="alpha" maskContentUnits="userSpaceOnUse"><path d="{d}"{fill_attr}/></mask></defs>"#
         );
         self.buf.push_str(&defs);
         let m = format!(r#"<g mask="url(#mask{id})">"#);
@@ -1009,7 +1012,15 @@ impl SvgRenderer {
         for i in 0..SWEEP_WEDGES {
             let a0 = g.start_angle + step * i as f64;
             let a1 = a0 + step;
-            let color = matrix.apply(g.sample(0.5 * (a0 + a1)));
+            // Sample at the wedge's angle **mod 2π**: the raster backend evaluates the ramp at the
+            // per-pixel unit angle in `[0, 2π)`, so a partial ramp's out-of-range behaviour is
+            // decided by the *wrapped* position — angles just below `start_angle` take the start
+            // colour (Pad) / mirrored colours (Reflect), while only angles past `end_angle` (but
+            // before a full turn) take the end colour. Sampling the unwrapped angle instead would
+            // paint the whole `[end_angle, start_angle)` gap with the end colour, creating a
+            // visible seam mismatch against vello whenever `start_angle ≠ 0`.
+            let mid = (0.5 * (a0 + a1)).rem_euclid(std::f64::consts::TAU);
+            let color = matrix.apply(g.sample(mid));
             let (p0x, p0y) = (cx + r * a0.cos(), cy + r * a0.sin());
             let (p1x, p1y) = (cx + r * a1.cos(), cy + r * a1.sin());
             let fill = color_attr_str("fill", color);
@@ -1704,6 +1715,49 @@ mod tests {
         assert!(
             out.contains(r#"fill="none""#),
             "形状自身不再填充（由 wedge 着色）"
+        );
+    }
+
+    /// sweep（部分角度 + Pad）：`[0, start_angle)` 的回卷扇区应取**起始色**——与栅格后端
+    /// （逐像素按 mod-2π 角度取值，ramp 之前 Pad 钳到起始色）对齐；此前整段
+    /// `[end_angle, start_angle)` gap 都被涂成结束色，在 start_angle ≠ 0 时产生可见接缝。
+    #[test]
+    fn sweep_partial_wrapped_wedges_take_start_color() {
+        let mut scene = Scene::new(100.0, 100.0);
+        let g = crate::scene::SweepGradient::new(
+            Point::new(50.0, 50.0),
+            std::f64::consts::FRAC_PI_2,
+            std::f64::consts::PI,
+            vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Color::rgb(0xff, 0x00, 0x00),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: Color::rgb(0x00, 0x00, 0xff),
+                },
+            ],
+        );
+        scene.push(Element::circle(
+            Point::new(50.0, 50.0),
+            40.0,
+            FillStrokeStyle::fill_gradient(g),
+        ));
+        let out = render(&scene);
+        // 角度位置 0 处的 wedge：弧起点 (cx+R, cy)，R = bbox 最远角距 = 40√2 ≈ 56.57；
+        // 该 wedge 的角度回卷后位于 ramp 之前 → 起始色红（修复前被钳到结束色蓝）。
+        let anchor = out
+            .find(r#"L 106.57 50.00"#)
+            .expect("应存在弧起点在角度 0 位置的 wedge");
+        let close = out[anchor..]
+            .find("/>")
+            .map(|i| anchor + i + 2)
+            .expect("wedge path 元素应闭合");
+        let elem = &out[anchor..close];
+        assert!(
+            elem.contains(r##"fill="#ff0000""##),
+            "角度 0（回卷到 ramp 之前）应为起始色红: {elem}"
         );
     }
 

@@ -917,7 +917,8 @@ impl Clip {
 /// gradient gives a smooth fade.
 ///
 /// Backends: vello builds a canvas-sized mask bitmap and uses `RenderContext::push_layer`; SVG
-/// emits `<mask>` (`maskContentUnits="userSpaceOnUse"`).
+/// emits `<mask mask-type="alpha">` (`maskContentUnits="userSpaceOnUse"`) — the explicit
+/// `mask-type` is required because SVG masks default to *luminance*, not alpha.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mask {
     /// Shape the mask paint fills (reuses the [`Clip`] geometry vocabulary).

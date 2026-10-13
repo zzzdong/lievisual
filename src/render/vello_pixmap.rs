@@ -9,8 +9,8 @@
 //!
 //! Notes:
 //! - Filling uniformly goes through [`paint_path`](VelloPixmapRenderer::paint_path), supporting
-//!   `Solid` / linear gradient / radial gradient; strokes support dashes (`dash_pattern`) and
-//!   `miter_limit`.
+//!   `Solid` / linear / radial / **sweep (conic)** gradient (native `peniko` `Sweep`, exact);
+//!   strokes support dashes (`dash_pattern`) and `miter_limit`.
 //! - Transforms are maintained with an independent stack (`push_transform` composes with the
 //!   parent transform, `pop_transform` restores it), supporting nested Groups.
 //! - Node / layer opacity is applied as an **isolated compositing layer** (`RenderContext::
@@ -184,8 +184,14 @@ impl VelloPixmapRenderer {
         // vello 的 Pixmap 是**预乘** RGBA8；对外统一返回 lievisual 自有的**非预乘** RGBA8
         // [`crate::Pixmap`]（与 PNG / SVG 内嵌及其它后端同语义），使下游无需依赖 vello_cpu。
         let data = pixmap_to_rgba8(&vello_pixmap);
-        Pixmap::from_rgba8(u32::from(out_w), u32::from(out_h), data)
-            .expect("渲染输出尺寸与像素缓冲区长度不一致")
+        // 长度由 `pixmap_to_rgba8`（每像素恒 4 字节）与上方 `VelloPixmap::new(out_w, out_h)`
+        // 构造保证，release 下不设 panic 路径：debug 断言不变式，异常时防御性回退透明底。
+        let expected = u32::from(out_w) as usize * u32::from(out_h) as usize * 4;
+        debug_assert_eq!(data.len(), expected, "渲染输出尺寸与像素缓冲区长度不一致");
+        Pixmap::from_rgba8(u32::from(out_w), u32::from(out_h), data).unwrap_or_else(|| {
+            Pixmap::from_rgba8(u32::from(out_w), u32::from(out_h), vec![0u8; expected])
+                .expect("固定尺寸零缓冲区长度必然匹配")
+        })
     }
 
     /// Render the scene and export PNG bytes (depends on the permanent `png` encoder).
@@ -538,7 +544,8 @@ impl Renderer for VelloPixmapRenderer {
             dest_pixels,
             frame_w as u16,
             frame_h as u16,
-            PixelMetadata::default(),
+            // 显式声明预乘 + 可能含透明，不信任上游 default 的变动（此处位图由上方手工预乘）。
+            PixelMetadata::new(vello_cpu::peniko::ImageAlphaType::AlphaPremultiplied, true),
         );
         let brush = vello_cpu::Image {
             image: vello_cpu::ImageSource::Pixmap(std::sync::Arc::new(dest_pixmap)),
@@ -799,7 +806,9 @@ fn set_gradient_paint(
         extend: to_peniko_extend(spread),
         interpolation_cs: ColorSpaceTag::Srgb,
         hue_direction: HueDirection::default(),
-        interpolation_alpha_space: InterpolationAlphaSpace::Premultiplied,
+        // 直通（非预乘）alpha 插值：与 SVG `<stop>` 的规范语义及 `scene::sample_stops`（IR 端
+        // sweep 楔形采样）一致。默认的 `Premultiplied` 会让半透明 stop 在两后端产生色差。
+        interpolation_alpha_space: InterpolationAlphaSpace::Unpremultiplied,
         stops: ColorStops::from(stops_vec.as_slice()),
     };
     if scene_transform.determinant().abs() > 1e-12 {
@@ -985,7 +994,8 @@ fn pixmap_to_premul(pm: &crate::Pixmap) -> VelloPixmap {
         bytes,
         pm.width().min(u32::from(u16::MAX)) as u16,
         pm.height().min(u32::from(u16::MAX)) as u16,
-        PixelMetadata::default(),
+        // 显式声明预乘 + 可能含透明（上方逐像素 `premul` 过）。
+        PixelMetadata::new(vello_cpu::peniko::ImageAlphaType::AlphaPremultiplied, true),
     )
 }
 
@@ -1508,6 +1518,48 @@ mod tests {
         );
     }
 
+    /// sweep（部分角度 + Pad）：逐像素按 mod-2π 角度取值——ramp（π/2..π）之前的回卷区域
+    /// 取**起始色**，ramp 之后的区域取**结束色**。锁定该语义，与 SVG 楔形近似对齐。
+    #[test]
+    fn sweep_partial_pad_clamps_wrapped_region_to_start_color() {
+        let mut scene = Scene::new(100.0, 100.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            FillStrokeStyle::fill_gradient(SweepGradient::new(
+                Point::new(50.0, 50.0),
+                std::f64::consts::FRAC_PI_2,
+                std::f64::consts::PI,
+                vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: Color::rgb(0xff, 0x00, 0x00),
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: Color::rgb(0x00, 0x00, 0xff),
+                    },
+                ],
+            )),
+        ));
+        let mut r = VelloPixmapRenderer::new(100, 100);
+        let pix = r.render_scene_to_pixmap(&scene);
+        // 角度 0（中心正右）：位于 ramp 之前 → 起始色红。
+        let (r0, g0, b0, _) = pixel_at(&pix, 90, 50);
+        assert!(
+            r0 > 240 && g0 < 15 && b0 < 15,
+            "角度 0 应为起始色红: ({r0},{g0},{b0})"
+        );
+        // 角度 π（正左）：ramp 终点 → 结束色蓝。
+        let (r1, g1, b1, _) = pixel_at(&pix, 10, 50);
+        assert!(r1 < 15 && b1 > 240, "角度 π 应为结束色蓝: ({r1},{g1},{b1})");
+        // 角度 3π/2（正上，y-down）：ramp 之后的 gap → 结束色蓝。
+        let (r2, g2, b2, _) = pixel_at(&pix, 50, 10);
+        assert!(
+            r2 < 15 && b2 > 240,
+            "角度 3π/2 应为结束色蓝: ({r2},{g2},{b2})"
+        );
+    }
+
     /// spread：`Repeat` 按 ramp 长度平铺（同一相位颜色相同），`Pad` 则夹到端色。
     #[test]
     fn linear_gradient_spread_repeat_tiles() {
@@ -1567,6 +1619,41 @@ mod tests {
         let (tr, tg2, _, _) = pixel_at(&pix, 38, 1);
         assert!(tl > 240 && tg > 240, "左上应被圆角切掉: ({tl},{tg})");
         assert!(tr > 200 && tg2 < 60, "右上应是直角红: ({tr},{tg2})");
+    }
+
+    /// 每角圆角（四角遍历）：只给某一角圆角时，仅该角被切掉，其余三角保持直角。
+    #[test]
+    fn per_corner_radii_round_each_corner_independently() {
+        use crate::scene::CornerRadii;
+        // 顺时针各角的角落探针（40×40 矩形、半径 20 → 角落探针必在圆角弧线之外）。
+        let probes: [(u32, u32); 4] = [(1, 1), (38, 1), (38, 38), (1, 38)];
+        for i in 0..4 {
+            let mut radii = [0.0f64; 4];
+            radii[i] = 20.0;
+            let radii = CornerRadii::new(radii[0], radii[1], radii[2], radii[3]);
+            let mut scene = Scene::new(40.0, 40.0);
+            scene.push(Element::rounded_rect(
+                Rect::new(0.0, 0.0, 40.0, 40.0),
+                radii,
+                FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+            ));
+            let mut r = VelloPixmapRenderer::new(40, 40).with_background(Color::WHITE);
+            let pix = r.render_scene_to_pixmap(&scene);
+            for (j, &(x, y)) in probes.iter().enumerate() {
+                let (pr, pg, pb, _) = pixel_at(&pix, x, y);
+                if j == i {
+                    assert!(
+                        pr > 240 && pg > 240 && pb > 240,
+                        "角 {i} 应被圆角切掉: ({pr},{pg},{pb})"
+                    );
+                } else {
+                    assert!(
+                        pr > 200 && pg < 60 && pb < 60,
+                        "角 {i} 圆角时角 {j} 应保持直角红: ({pr},{pg},{pb})"
+                    );
+                }
+            }
+        }
     }
 
     /// 4×4 测试图：四个 2×2 象限（左上红 / 右上绿 / 左下蓝 / 右下白）。
