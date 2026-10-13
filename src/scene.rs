@@ -1087,6 +1087,33 @@ pub enum BlendMode {
     Saturation,
     Color,
     Luminosity,
+    // ---- Porter-Duff compositing ops (no CSS `mix-blend-mode` equivalent; raster-only) ----
+    /// Clear the destination (transparent where the scope covers).
+    Clear,
+    /// Replace the destination with the source (Porter-Duff *Src*).
+    Copy,
+    /// Keep only the destination.
+    Dest,
+    /// Destination placed over the source.
+    DestOver,
+    /// Source ∩ destination.
+    SrcIn,
+    /// Destination ∩ source.
+    DestIn,
+    /// Source outside the destination.
+    SrcOut,
+    /// Destination outside the source.
+    DestOut,
+    /// Source over the destination, both clipped to the source.
+    SrcAtop,
+    /// Destination over the source, both clipped to the destination.
+    DestAtop,
+    /// The non-overlapping regions of source and destination.
+    Xor,
+    /// Additive: source + destination (clamped).
+    Plus,
+    /// Additive with a lighter weight (`Plus`, non-premultiplied sum).
+    PlusLighter,
 }
 
 impl BlendMode {
@@ -1117,7 +1144,34 @@ impl BlendMode {
             BlendMode::Saturation => "saturation",
             BlendMode::Color => "color",
             BlendMode::Luminosity => "luminosity",
+            // Porter-Duff ops (`Clear` … `PlusLighter`) have no `mix-blend-mode` equivalent.
+            _ => return None,
         })
+    }
+
+    /// Whether this is a **Porter-Duff compositing op** (`Clear` … `PlusLighter`) rather than a
+    /// CSS `mix-blend-mode`.
+    ///
+    /// Porter-Duff ops are **raster-only**: SVG (and the browser) expose no per-element equivalent,
+    /// so the SVG backend degrades them to [`BlendMode::Normal`].
+    #[must_use]
+    pub fn is_porter_duff(self) -> bool {
+        matches!(
+            self,
+            BlendMode::Clear
+                | BlendMode::Copy
+                | BlendMode::Dest
+                | BlendMode::DestOver
+                | BlendMode::SrcIn
+                | BlendMode::DestIn
+                | BlendMode::SrcOut
+                | BlendMode::DestOut
+                | BlendMode::SrcAtop
+                | BlendMode::DestAtop
+                | BlendMode::Xor
+                | BlendMode::Plus
+                | BlendMode::PlusLighter
+        )
     }
 }
 

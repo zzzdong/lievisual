@@ -817,8 +817,26 @@ fn to_peniko_blend(mode: BlendMode) -> vello_cpu::peniko::BlendMode {
         BlendMode::Saturation => Mix::Saturation,
         BlendMode::Color => Mix::Color,
         BlendMode::Luminosity => Mix::Luminosity,
+        // Porter-Duff ops use the identity mix (`Normal`) plus a compose function.
+        _ => Mix::Normal,
     };
-    PenikoBlend::new(mix, Compose::SrcOver)
+    let compose = match mode {
+        BlendMode::Clear => Compose::Clear,
+        BlendMode::Copy => Compose::Copy,
+        BlendMode::Dest => Compose::Dest,
+        BlendMode::DestOver => Compose::DestOver,
+        BlendMode::SrcIn => Compose::SrcIn,
+        BlendMode::DestIn => Compose::DestIn,
+        BlendMode::SrcOut => Compose::SrcOut,
+        BlendMode::DestOut => Compose::DestOut,
+        BlendMode::SrcAtop => Compose::SrcAtop,
+        BlendMode::DestAtop => Compose::DestAtop,
+        BlendMode::Xor => Compose::Xor,
+        BlendMode::Plus => Compose::Plus,
+        BlendMode::PlusLighter => Compose::PlusLighter,
+        _ => Compose::SrcOver,
+    };
+    PenikoBlend::new(mix, compose)
 }
 
 /// vello 预乘 Pixmap → 非预乘 RGBA8 字节。
@@ -1273,6 +1291,47 @@ mod tests {
             (60..=68).contains(&pr) && (60..=68).contains(&pg) && (60..=68).contains(&pb),
             "multiply 应使 128 灰变暗到 ~64, got ({pr},{pg},{pb})"
         );
+    }
+
+    /// Porter-Duff：`DestOut` 在源覆盖处擦除目标、其余保留（raster-only）。
+    #[test]
+    fn porter_duff_dest_out_erases_within_source() {
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 10.0, 20.0),
+                FillStrokeStyle::fill(Color::rgb(0xff, 0x00, 0x00)),
+            ))
+            .with_blend_mode(BlendMode::DestOut),
+        );
+        let mut r = VelloPixmapRenderer::new(20, 20).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let (_, _, _, ca) = pixel_at(&pix, 5, 10);
+        let (wr, _, _, wa) = pixel_at(&pix, 15, 10);
+        assert_eq!(ca, 0, "DestOut 应在源覆盖处擦除目标");
+        assert!(wa == 255 && wr == 255, "源之外应保留白底, a={wa} r={wr}");
+    }
+
+    /// Porter-Duff：`Plus` 为可加混合（源 + 目标，饱和到白）。
+    #[test]
+    fn porter_duff_plus_adds() {
+        let gray = Color::rgb(0x80, 0x80, 0x80);
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push(Element::rect(
+            Rect::new(0.0, 0.0, 20.0, 20.0),
+            FillStrokeStyle::fill(gray),
+        ));
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                FillStrokeStyle::fill(gray),
+            ))
+            .with_blend_mode(BlendMode::Plus),
+        );
+        let mut r = VelloPixmapRenderer::new(20, 20).with_background(Color::WHITE);
+        let pix = r.render_scene_to_pixmap(&scene);
+        let (pr, _, _, _) = pixel_at(&pix, 10, 10);
+        assert!(pr > 250, "Plus 应叠加 128+128 到白, got {pr}");
     }
 
     /// Mask：线性渐变遮罩（左不透明 → 右透明）在不透明红矩形上产生平滑淡出。

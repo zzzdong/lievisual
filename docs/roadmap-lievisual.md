@@ -58,9 +58,10 @@
 - 无法表达 multiply / screen / overlay / darken / lighten / Porter-Duff 等。
 - 后端已具备：vello_cpu `push_layer(..., blend_mode, ...)`；SVG 可输出 `mix-blend-mode` + `isolation: isolate`。
 
-  > **状态：已实现 mix 模式（2026-10-13）** —— 新增 `BlendMode`（16 种，对应 CSS `mix-blend-mode`），
-  > 挂在 `SceneNode` / `Layer` / `builder::Ctx`，经 `Renderer::push_blend` 由 vello（`peniko::BlendMode`）
-  > 与 SVG（`mix-blend-mode`）落地。**Porter-Duff（`Compose`）暂未暴露**（vello 已具备，属后续增量）。
+  > **状态：已实现（2026-10-13）** —— 新增 `BlendMode`：16 种 mix 模式（CSS `mix-blend-mode`）+ 13 种
+  > Porter-Duff 合成算子（`peniko::Compose`）。挂在 `SceneNode` / `Layer` / `builder::Ctx`，经
+  > `Renderer::push_blend` 由 vello / SVG 落地。**局限**：Porter-Duff 为 **raster-only**（SVG 无逐元素
+  > 等价物，退化为 `Normal`），可用 `BlendMode::is_porter_duff()` 判断。
 
 > P0-1 与 P0-2 共用"隔离层（layer/group compositing）"这一抽象，建议一并设计：
 > 给节点引入 `compositing` 语义（见 §3 Step 2）。

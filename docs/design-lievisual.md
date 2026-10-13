@@ -17,7 +17,9 @@ SVG / vello_cpu 栅格 / GPU（规划中）/ PDF·DOCX（经 liepress）。
    `<g style="mix-blend-mode">` / `<mask>`，vello 端 `RenderContext::push_layer(filter / opacity /
    blend / mask)`。作用域由内到外为 `clip → filter → opacity → blend → mask`（对应 CSS
    `filter → opacity → mix-blend-mode`，`mask` 乘在最终 alpha 上）。后端在默认遍历
-   `render_scene_ordered` 里统一处理排序、节点属性、`Group` 递归与局部变换。
+   `render_scene_ordered` 里统一处理排序、节点属性、`Group` 递归与局部变换。`blend_mode` 含 16 种
+   CSS mix 模式与 13 种 Porter-Duff 合成算子；后者为 raster-only（SVG 无逐元素等价物，退化为
+   `Normal`）。
    **容器是一等概念**：`Element::Group` 的节点即"容器"，通过 `SceneNode::is_group` /
    `children` / `children_mut`（以及 `visit` / `visit_mut`）访问，避免各处直接 `match
    Element::Group`；渲染用统一的 `Renderer::render_children` 递归（默认层 / `Layer` / `Group`

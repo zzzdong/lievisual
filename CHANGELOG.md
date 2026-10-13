@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   FilterPrimitive::DropShadow}`; SVG emits `<filter>` with `feGaussianBlur` / `feDropShadow`.
   Note: vello's filter support is single-primitive and panics under multi-threaded rendering
   (which lievisual does not enable).
+- **Porter-Duff compositing ops** on `BlendMode` — `Clear`, `Copy`, `Dest`, `DestOver`, `SrcIn`,
+  `DestIn`, `SrcOut`, `DestOut`, `SrcAtop`, `DestAtop`, `Xor`, `Plus`, `PlusLighter` — mapped to
+  peniko's `Compose` (with the identity mix). `BlendMode::is_porter_duff()` distinguishes them.
+  They are **raster-only**: SVG (and the browser) expose no per-element equivalent, so the SVG
+  backend degrades them to `Normal` (rendered without a `mix-blend-mode` group).
 
 ### Fixed
 

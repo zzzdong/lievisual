@@ -654,10 +654,15 @@ impl Renderer for SvgRenderer {
     }
 
     fn push_blend(&mut self, mode: BlendMode) {
-        // `Normal` never reaches here (the traversal skips it); stay defensive with a fallback.
-        let kw = mode.css_keyword().unwrap_or("normal");
-        let m = format!(r#"<g style="mix-blend-mode:{kw}">"#);
-        self.buf.push_str(&m);
+        match mode.css_keyword() {
+            Some(kw) => {
+                let m = format!(r#"<g style="mix-blend-mode:{kw}">"#);
+                self.buf.push_str(&m);
+            }
+            // Porter-Duff ops have no `mix-blend-mode` equivalent: emit a plain group so push/pop
+            // stay balanced (the op is raster-only; SVG degrades to `Normal`).
+            None => self.buf.push_str("<g>"),
+        }
     }
 
     fn pop_blend(&mut self) {
@@ -1257,6 +1262,23 @@ mod tests {
             FillStrokeStyle::fill(Color::BLACK),
         ));
         assert!(!render(&plain).contains("mix-blend-mode"));
+    }
+
+    /// Porter-Duff 无法用 `mix-blend-mode` 表达：SVG 端退化为普通 `<g>`（不输出 blend）。
+    #[test]
+    fn porter_duff_degrades_without_mix_blend_mode() {
+        let mut scene = Scene::new(20.0, 20.0);
+        scene.push_node(
+            SceneNode::new(Element::rect(
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+                FillStrokeStyle::fill(Color::BLACK),
+            ))
+            .with_blend_mode(BlendMode::Clear),
+        );
+        let out = render(&scene);
+        assert!(!out.contains("mix-blend-mode"), "{out}");
+        assert!(BlendMode::Clear.is_porter_duff());
+        assert!(!BlendMode::Multiply.is_porter_duff());
     }
 
     /// Mask 输出 `<mask>` 定义 + `mask="url(#mask0)"`。
