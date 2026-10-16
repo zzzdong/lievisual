@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-10-16
+
+Patch release: cross-backend consistency fix for rotated text on the raster backend, plus a
+regression test and a minimal repro example.
+
+### Fixed
+
+- **Rotated text on the raster (PNG) backend now rotates the whole run, matching SVG.**
+  `VelloPixmapRenderer::draw_text` passed the text block transform (rotation around the anchor +
+  `align` / `baseline` anchor offset) to glifo's `glyph_transform` — a **per-glyph** transform
+  applied *after* glyph positioning (its documented use is skew for fake italics; glyph positions
+  only receive the run transform's linear part). Every character therefore rotated around its own
+  laid-out position while inter-character positions stayed unrotated — the "single character
+  rotation" artifact — whereas the SVG backend's `<text transform="rotate(...)">` rotates the
+  whole block. The block transform is now applied as the **glyph run's scene transform**
+  (`ctx.set_transform`, composed with the parent transform on the same stack `push_transform`
+  uses, restored by `pop_transform` afterwards); the misused `glyph_transform` call is removed.
+  The inline background rectangle is still drawn before the push (its corners are pre-transformed,
+  so pushing first would double-apply).
+  Regression test: `render::vello_pixmap::tests::text_rotation_rotates_whole_run`;
+  cross-backend repro: `examples/rot_text.rs`.
+
 ## [0.3.0] — 2026-10-13
 
 Breaking release aligned with `vello_cpu` 0.3 / `parley` 0.12: scene-tree containers, the full
