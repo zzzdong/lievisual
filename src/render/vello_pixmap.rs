@@ -598,7 +598,9 @@ impl Renderer for VelloPixmapRenderer {
             * Affine::translate((dx, dy));
 
         // 文本背景（行内高亮）：在 layout 局部坐标 [0,0]×[w,h] 画矩形，经 transform
-        // 映射到节点坐标，与 glyph 精确定位一致。
+        // 映射到节点坐标，与 glyph 精确定位一致。注意：背景在 push 文本变换**之前**
+        // 绘制——bg_rect 已手工变换到场景坐标，且 draw_rect 内部还会应用当前 ctx
+        // transform，提前 push 会双重施加。
         if let Some(bg) = style.background_color {
             // kurbo Affine 不支持直接乘 Rect，手动变换对角点得 AABB。
             let p0 = transform * VPoint::new(0.0, 0.0);
@@ -607,6 +609,23 @@ impl Renderer for VelloPixmapRenderer {
             let style = crate::scene::FillStrokeStyle::fill(bg);
             self.draw_rect(bg_rect, &style);
         }
+
+        // 文本块变换（旋转绕锚点 + align/baseline 锚点平移）必须作为**整个 glyph run
+        // 的 scene transform**经 `set_transform` 生效，与 Group 的 push_transform
+        // 同构（与父变换复合后入栈，画完 pop 恢复）。
+        //
+        // 历史坑：曾把该变换传给 glifo 的 `glyph_transform`——那是**逐字形**、在
+        // glyph 定位之后才施加的 transform（官方用途仅为 skew 伪造斜体，见
+        // `DrawProps::positioned_transform`：位置只过 run transform 的线性部分，
+        // 轮廓过 run*glyph 全量）。于是每个字符绕**自身**位置旋转、字符间的相对
+        // 位置却不旋转，表现为"PNG 里单个字符旋转"，而 SVG 的
+        // `<text transform="rotate(...)">` 是整体旋转——两端不一致。
+        let combined = match self.transform_stack.last() {
+            Some(parent) => *parent * transform,
+            None => transform,
+        };
+        self.ctx.set_transform(combined);
+        self.transform_stack.push(combined);
 
         for line in &layout.lines {
             for run in &line.runs {
@@ -635,10 +654,11 @@ impl Renderer for VelloPixmapRenderer {
                     .ctx
                     .glyph_run(&mut self.resources, &font_data)
                     .font_size(run.font_size)
-                    .glyph_transform(transform)
                     .fill_glyphs(glyphs.into_iter());
             }
         }
+
+        self.pop_transform();
     }
 
     fn push_transform(&mut self, t: Transform) {
@@ -2068,6 +2088,60 @@ mod tests {
             .filter(|p| p[0] < 250 || p[1] < 250 || p[2] < 250)
             .count();
         assert!(non_white > 20, "字形应产生非白像素, got {non_white}");
+    }
+
+    /// 文本旋转回归：块变换必须作用于**整个 glyph run**（scene transform），
+    /// 而非逐字形的 `glyph_transform`。
+    ///
+    /// 表现：旋转 90° 的宽字符串，墨迹包围盒应呈"竖窄"（绕锚点整体旋转）；
+    /// 修复前每个字符绕自身位置旋转、字符间相对位置不旋转，墨迹仍是"横宽"，
+    /// 与 SVG `<text transform="rotate(...)">` 的整体旋转不一致。
+    #[test]
+    fn text_rotation_rotates_whole_run() {
+        use crate::text::TextAlign;
+        use crate::text::TextBaseline;
+
+        /// 非白像素的墨迹包围盒 (min_x, min_y, max_x, max_y)；无墨迹返回 None。
+        fn ink_bbox(pix: &Pixmap) -> Option<(f64, f64, f64, f64)> {
+            let (w, h) = (pix.width(), pix.height());
+            let mut bbox: Option<(u32, u32, u32, u32)> = None;
+            for y in 0..h {
+                for x in 0..w {
+                    let p = pixel_at(pix, x, y);
+                    if p.0 < 250 || p.1 < 250 || p.2 < 250 {
+                        bbox = Some(match bbox {
+                            None => (x, y, x, y),
+                            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                        });
+                    }
+                }
+            }
+            bbox.map(|(x0, y0, x1, y1)| {
+                (f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1))
+            })
+        }
+
+        let anchor = Point::new(40.0, 160.0);
+        let style = TextStyle::new(Color::BLACK, 24.0, "sans-serif")
+            .with_align(TextAlign::Left)
+            .with_baseline(TextBaseline::Top)
+            .with_rotation(std::f64::consts::FRAC_PI_2);
+        let mut scene = Scene::new(200.0, 200.0);
+        scene.push(Element::text("MMMMM", anchor, style));
+        let mut r = VelloPixmapRenderer::new(200, 200).with_background(Color::WHITE);
+        let bbox = ink_bbox(&r.render_scene_to_pixmap(&scene)).expect("旋转文本应产生墨迹");
+        let (w, h) = (bbox.2 - bbox.0, bbox.3 - bbox.1);
+        assert!(
+            h > w,
+            "90° 旋转的宽字符串墨迹应为竖窄（整体旋转），got bbox w={w} h={h}"
+        );
+        // 绕锚点旋转：墨迹应贴近锚点列（x≈40），而非沿基线横向铺开。
+        assert!(
+            (bbox.0 + bbox.2) / 2.0 - anchor.x < 24.0,
+            "墨迹应贴近锚点 x={}，got center_x={}",
+            anchor.x,
+            (bbox.0 + bbox.2) / 2.0
+        );
     }
 
     /// 预排版 layout 与自动排版渲染结果一致（同一 TLS 上下文）。
